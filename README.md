@@ -2,7 +2,7 @@
 
 Headless WebRTC transport for the Bolt Protocol.
 
-## Current State: Phase 3B (LAN-only + browser interop)
+## Current State: Phase 3D (LAN-only + browser interop + two-machine E2E verified)
 
 Minimal Rust daemon that establishes a WebRTC DataChannel via
 [libdatachannel](https://github.com/paullouisageneau/libdatachannel)
@@ -12,8 +12,9 @@ LAN-only by default: ICE candidates are filtered to private/link-local IPs.
 
 ### What This Proves
 
-- libdatachannel compiles and links on macOS arm64 via the `datachannel` Rust crate
+- libdatachannel compiles and links on macOS arm64 and x86_64 via the `datachannel` Rust crate
 - WebRTC DataChannel establishes between two local headless peers
+- WebRTC DataChannel establishes between two physical machines on the same LAN
 - Ordered, reliable message delivery works (aligns with `TRANSPORT_CONTRACT.md` §1)
 - LAN-only ICE policy enforced at candidate level (`TRANSPORT_CONTRACT.md` §5)
 - Browser-to-daemon DataChannel interop via file-based signaling
@@ -184,6 +185,8 @@ bolt-daemon/
 ├── interop/
 │   └── browser/
 │       └── index.html   # Browser interop test page
+├── docs/
+│   └── E2E_LAN_TEST.md  # Two-machine LAN test procedure + troubleshooting
 └── README.md
 ```
 
@@ -196,7 +199,7 @@ Key dependencies:
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.3-lanonly`
+Current: `daemon-v0.0.4-timeout5m`
 
 ## License
 

@@ -2,7 +2,7 @@
 
 Headless WebRTC transport for the Bolt Protocol.
 
-## Current State: Phase 3E-B (rendezvous signaling + network scope policy)
+## Current State: Phase 3F (overlay network scope for Tailscale)
 
 Minimal Rust daemon that establishes a WebRTC DataChannel via
 [libdatachannel](https://github.com/paullouisageneau/libdatachannel)
@@ -12,8 +12,9 @@ Two signaling modes:
 - **File** (default) — exchange offer/answer via JSON files on disk
 - **Rendezvous** — exchange offer/answer via bolt-rendezvous WebSocket server
 
-Two network scope policies:
+Three network scope policies:
 - **LAN** (default) — ICE candidates filtered to private/link-local IPs (LocalBolt)
+- **Overlay** — LAN + CGNAT 100.64.0.0/10 (LocalBolt over Tailscale)
 - **Global** — all valid IPs accepted including public and CGNAT (ByteBolt)
 
 ### What This Proves
@@ -31,7 +32,7 @@ Two network scope policies:
 
 - No Bolt protocol encryption (NaCl box is in bolt-core-sdk, not here)
 - No identity persistence or TOFU
-- No TURN integration yet (Phase 3F)
+- No TURN integration yet
 
 ## Reproducible Builds
 
@@ -52,7 +53,7 @@ bolt-daemon --role offerer|answerer [options]
 
 Common flags:
   --role <offerer|answerer>       Required. Peer role.
-  --network-scope <lan|global>    ICE filter policy (default: lan)
+  --network-scope <lan|overlay|global>  ICE filter policy (default: lan)
   --phase-timeout-secs <int>      Timeout per phase in seconds (default: 30)
 
 File mode flags:
@@ -163,6 +164,21 @@ and on inbound remote candidate application.
 
 Rejected: public IPs, CGNAT (`100.64.0.0/10`), mDNS (`.local`), any non-IP address.
 
+### Overlay mode (`--network-scope overlay`)
+
+Everything LAN accepts, plus:
+
+| Range | Type |
+|-------|------|
+| `100.64.0.0/10` | CGNAT (Tailscale, other overlay networks) |
+
+Rejected: public IPs, mDNS (`.local`), any non-IP address.
+
+Use this for LocalBolt over Tailscale:
+```bash
+cargo run -- --role offerer --network-scope overlay
+```
+
 ### Global mode (`--network-scope global`)
 
 Accepts all valid IP addresses (private + public + CGNAT).
@@ -237,7 +253,7 @@ Both the daemon and the browser page use the same JSON format:
 cargo test
 ```
 
-43 unit tests: 26 ICE filter (LAN + Global scope), 7 transport/signaling, 10 rendezvous protocol.
+50 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 10 rendezvous protocol.
 
 ## Lint
 
@@ -256,7 +272,7 @@ bolt-daemon/
 ├── Cargo.lock           # pinned (committed for reproducible builds)
 ├── src/
 │   ├── main.rs          # CLI + handlers + signaling + E2E flow + file mode
-│   ├── ice_filter.rs    # NetworkScope policy + candidate filter + 26 tests
+│   ├── ice_filter.rs    # NetworkScope policy + candidate filter + 33 tests
 │   └── rendezvous.rs    # WebSocket signaling via bolt-rendezvous + 10 tests
 ├── interop/
 │   └── browser/
@@ -276,7 +292,7 @@ Key dependencies:
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.7-network-scope`
+Current: `daemon-v0.0.8-overlay-scope`
 
 ## License
 

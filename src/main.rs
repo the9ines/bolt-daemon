@@ -37,7 +37,7 @@ const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";
 const DC_LABEL: &str = "bolt";
 
 /// Timeout for each signaling/data exchange phase.
-const PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+const PHASE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Poll interval when waiting for a signaling file.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);

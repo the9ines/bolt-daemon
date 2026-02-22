@@ -1,8 +1,9 @@
 //! ICE candidate filter with network scope policy.
 //!
 //! LAN mode: accept only private/link-local IPs (RFC 1918, RFC 4193, loopback).
+//! Overlay mode: LAN + CGNAT 100.64.0.0/10 (e.g. Tailscale).
 //! Global mode: accept all valid IPs (private + public + CGNAT).
-//! Both modes reject mDNS (.local) and malformed candidates.
+//! All modes reject mDNS (.local) and malformed candidates.
 //!
 //! Reference: TRANSPORT_CONTRACT.md §5 (LAN-Only Mode).
 
@@ -13,6 +14,8 @@ use std::net::IpAddr;
 pub enum NetworkScope {
     /// LocalBolt: only private/link-local/loopback IPs.
     Lan,
+    /// LocalBolt over Tailscale: LAN + CGNAT 100.64.0.0/10.
+    Overlay,
     /// ByteBolt: all valid IPs including public and CGNAT.
     Global,
 }
@@ -47,6 +50,7 @@ pub fn is_allowed_candidate(candidate_str: &str, scope: NetworkScope) -> bool {
     match addr_str.parse::<IpAddr>() {
         Ok(ip) => match scope {
             NetworkScope::Lan => is_private_or_link_local(&ip),
+            NetworkScope::Overlay => is_private_or_link_local(&ip) || is_cgnat(&ip),
             NetworkScope::Global => true,
         },
         // Not a valid IP and not mDNS → reject
@@ -104,6 +108,18 @@ fn is_private_or_link_local(ip: &IpAddr) -> bool {
             }
             false
         }
+    }
+}
+
+/// Returns `true` if the IP is in the CGNAT range 100.64.0.0/10.
+fn is_cgnat(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 100.64.0.0/10: first octet 100, second octet 64..127
+            octets[0] == 100 && (64..=127).contains(&octets[1])
+        }
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -312,6 +328,71 @@ mod tests {
         assert!(
             is_allowed_candidate(c, NetworkScope::Global),
             "global must accept private IPv4 (superset)"
+        );
+    }
+
+    // ── Overlay scope — LAN + CGNAT 100.64/10 ────────────────
+
+    #[test]
+    fn overlay_accepts_cgnat_10064_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 100.74.48.28 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must accept CGNAT 100.64/10 (Tailscale)"
+        );
+    }
+
+    #[test]
+    fn overlay_accepts_private_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 192.168.1.1 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must accept private IPv4 (superset of LAN)"
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_public_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 203.0.113.5 12345 typ srflx";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must reject public IPv4"
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_mdns() {
+        let c = "candidate:1 1 UDP 2130706431 abc123.local 12345 typ host";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must reject mDNS"
+        );
+    }
+
+    #[test]
+    fn overlay_accepts_cgnat_boundary_low() {
+        let c = "candidate:1 1 UDP 2130706431 100.64.0.1 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must accept 100.64.0.1 (low boundary)"
+        );
+    }
+
+    #[test]
+    fn overlay_accepts_cgnat_boundary_high() {
+        let c = "candidate:1 1 UDP 2130706431 100.127.255.254 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must accept 100.127.255.254 (high boundary)"
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_outside_cgnat() {
+        let c = "candidate:1 1 UDP 2130706431 100.128.0.1 12345 typ host";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Overlay),
+            "overlay must reject 100.128.0.1 (outside 100.64/10)"
         );
     }
 }

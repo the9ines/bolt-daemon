@@ -4,8 +4,9 @@
 //! deterministic "hello" payload between two peers. No browser required.
 //!
 //! Network scope policy:
-//!   lan    — LAN-only: ICE candidates filtered to private/link-local IPs (default)
-//!   global — all valid IPs accepted (public, CGNAT, private)
+//!   lan     — LAN-only: ICE candidates filtered to private/link-local IPs (default)
+//!   overlay — LAN + CGNAT 100.64/10 (e.g. Tailscale)
+//!   global  — all valid IPs accepted (public, CGNAT, private)
 //!
 //! Signal modes:
 //!   file        — exchange offer/answer via JSON files (default, backward compat)
@@ -212,9 +213,13 @@ fn parse_args() -> Args {
                 i += 1;
                 network_scope = Some(match argv.get(i).map(|s| s.as_str()) {
                     Some("lan") => NetworkScope::Lan,
+                    Some("overlay") => NetworkScope::Overlay,
                     Some("global") => NetworkScope::Global,
                     other => {
-                        eprintln!("--network-scope must be 'lan' or 'global', got {:?}", other);
+                        eprintln!(
+                            "--network-scope must be 'lan', 'overlay', or 'global', got {:?}",
+                            other
+                        );
                         std::process::exit(1);
                     }
                 });

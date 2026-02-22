@@ -1,0 +1,22 @@
+[package]
+name = "bolt-daemon"
+version = "0.0.1"
+edition = "2021"
+description = "Headless WebRTC transport spike for the Bolt Protocol"
+license = "MIT"
+
+[[bin]]
+name = "bolt-daemon"
+path = "src/main.rs"
+
+[dependencies]
+datachannel = { version = "0.16", features = ["vendored"] }
+webrtc-sdp = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 2

@@ -1,39 +1,134 @@
 # Bolt Daemon
 
-Background Rust service for Bolt Protocol applications.
+Headless WebRTC transport for the Bolt Protocol.
 
-## What This Is
+## Current State: Transport Spike (Phase 3A)
 
-A minimal, event-driven daemon that provides identity persistence, session orchestration, and transfer management for native Bolt applications.
+Minimal Rust daemon that establishes a WebRTC DataChannel via
+[libdatachannel](https://github.com/paullouisageneau/libdatachannel)
+(headless, no browser) and exchanges a deterministic payload between two peers.
 
-## Role in the Ecosystem
+### What This Proves
 
-- Maintains device identity key storage and TOFU pinned peer store.
-- Orchestrates peer sessions and transfer lifecycle.
-- Provides a local IPC API for applications to initiate and manage transfers.
-- Enforces resource limits and policy defaults.
+- libdatachannel compiles and links on macOS arm64 via the `datachannel` Rust crate
+- WebRTC DataChannel establishes between two local headless peers
+- Ordered, reliable message delivery works (aligns with `TRANSPORT_CONTRACT.md` §1)
+- File-based signaling exchange (SDP + ICE candidates as JSON)
 
-The daemon does not implement UI, protocol changes, or network routing.
+### What This Does NOT Do
 
-## Dependencies
+- No Bolt protocol encryption (NaCl box is in bolt-core-sdk, not here)
+- No identity persistence or TOFU
+- No signaling server integration (uses file-based exchange)
+- No LAN-only ICE filtering beyond omitting STUN/TURN servers (see Limitations)
 
-- [bolt-core-sdk](https://github.com/the9ines/bolt-core-sdk) — Protocol implementation
+## Build
 
-## Included In
+Requires: Rust 1.70+, CMake, Xcode Command Line Tools (macOS).
 
-- [localbolt-app](https://github.com/the9ines/localbolt-app) — Native multi-platform app
-- [bytebolt-app](https://github.com/the9ines/bytebolt-app) — Commercial global app
+```
+cargo build
+```
 
-## Not Included In
+First build compiles libdatachannel + OpenSSL from source (~1 min).
 
-- [localbolt-v3](https://github.com/the9ines/localbolt-v3) — Web app, daemon not applicable
+## Run
 
-## Design Constraints
+Open two terminals:
 
-- Low memory footprint
-- Event-driven, no busy polling
-- Crash-safe with supervised restarts
-- Graceful shutdown with connection draining
+```bash
+# Terminal 1 (offerer):
+rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike
+cargo run -- --role offerer
+
+# Terminal 2 (answerer — start after offerer writes offer.json):
+cargo run -- --role answerer
+```
+
+Default signal paths: `/tmp/bolt-spike/offer.json`, `/tmp/bolt-spike/answer.json`.
+
+Custom paths:
+
+```bash
+cargo run -- --role offerer --offer /tmp/my-offer.json --answer /tmp/my-answer.json
+cargo run -- --role answerer --offer /tmp/my-offer.json --answer /tmp/my-answer.json
+```
+
+Use `-` for stdin/stdout (copy-paste mode):
+
+```bash
+cargo run -- --role offerer --offer - --answer -
+```
+
+### Expected Output
+
+Both peers print `SUCCESS` and exit 0:
+
+```
+[offerer] SUCCESS — received matching payload
+[bolt-daemon] exit 0
+```
+
+```
+[answerer] SUCCESS — echoed matching payload
+[bolt-daemon] exit 0
+```
+
+## Test
+
+```
+cargo test
+```
+
+5 unit tests: payload determinism, signaling JSON roundtrip, type mappings.
+
+## Lint
+
+```
+cargo fmt
+cargo clippy -- -W clippy::all
+```
+
+Both must be clean (0 warnings).
+
+## Architecture
+
+```
+bolt-daemon
+├── Cargo.toml       # datachannel (vendored), webrtc-sdp, serde
+├── src/main.rs      # CLI + handlers + signaling + E2E flow
+└── README.md
+```
+
+Key dependencies:
+- [`datachannel`](https://crates.io/crates/datachannel) v0.16.0 — Rust bindings for libdatachannel
+- `vendored` feature — compiles libdatachannel + OpenSSL from source (no system deps)
+- [`webrtc-sdp`](https://crates.io/crates/webrtc-sdp) v0.3 — SDP parsing for signaling exchange
+
+## Limitations
+
+### LAN-Only ICE Filtering
+
+The spike omits all ICE servers (no STUN, no TURN), which means only host candidates
+(local network IPs) are gathered. This effectively provides LAN-only connectivity.
+
+However, proper LAN-only enforcement per `TRANSPORT_CONTRACT.md` §5 requires:
+- Explicit candidate filtering (reject non-private IPs)
+- mDNS candidate support for browser interop
+
+These are **not implemented** in the spike. They require ICE candidate inspection
+at the `on_candidate` callback level. Marked as TODO for Phase 3B.
+
+### Signaling
+
+File-based SDP exchange (no signaling server). Production integration with
+`bolt-rendezvous` is out of scope for this spike.
+
+## Tag Convention
+
+Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
+
+Current: `daemon-v0.0.2-spike`
 
 ## License
 

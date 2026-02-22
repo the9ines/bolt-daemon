@@ -57,8 +57,9 @@ echo "=== Starting rendezvous server ==="
 RV_PID=$!
 
 # Wait for server to be ready (listen on port 3001)
+# Uses bash /dev/tcp for portability across macOS and Linux.
 for i in $(seq 1 10); do
-    if lsof -i :3001 -sTCP:LISTEN >/dev/null 2>&1; then
+    if (echo >/dev/tcp/127.0.0.1/3001) 2>/dev/null; then
         echo "Rendezvous server ready (PID $RV_PID)"
         break
     fi

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bolt-daemon
+        uses: actions/checkout@v4
+        with:
+          path: bolt-daemon
+
+      - name: Checkout bolt-rendezvous (sibling for E2E)
+        uses: actions/checkout@v4
+        with:
+          repository: the9ines/bolt-rendezvous
+          path: bolt-rendezvous
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        working-directory: bolt-daemon
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: bolt-daemon
+        run: cargo clippy -- -W clippy::all
+
+      - name: cargo test
+        working-directory: bolt-daemon
+        run: cargo test
+
+      - name: E2E rendezvous harness
+        working-directory: bolt-daemon
+        run: bash scripts/e2e_rendezvous_local.sh

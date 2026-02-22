@@ -285,7 +285,7 @@ Both the daemon and the browser page use the same JSON format:
 cargo test
 ```
 
-55 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 15 rendezvous protocol.
+58 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 18 rendezvous protocol.
 
 ## Lint
 
@@ -326,7 +326,7 @@ Key dependencies:
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.9-rendezvous-session`
+Current: `daemon-v0.0.9-rendezvous-hello-retry`
 
 ## License
 

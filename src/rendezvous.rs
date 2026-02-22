@@ -318,7 +318,7 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     let mut ws = connect_and_register(&args.rendezvous_url, &peer_id)?;
 
     // Create PeerConnection + DataChannel → triggers SDP + ICE gathering
-    let (mut pc, ch) = create_peer_connection()?;
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
 
     let (dc_open_tx, dc_open_rx) = mpsc::channel();
     let (dc_msg_tx, dc_msg_rx) = mpsc::channel();
@@ -331,7 +331,7 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     let mut dc = pc.create_data_channel(DC_LABEL, dc_handler)?;
     eprintln!("[offerer] DataChannel '{}' created", DC_LABEL);
 
-    // Collect offer bundle (reuses existing LAN-filtered logic)
+    // Collect offer bundle (reuses scope-filtered logic)
     let offer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
 
     // Send offer to target peer via rendezvous
@@ -345,8 +345,8 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     // Wait for answer from target peer (deadline-respecting, filtered)
     let answer_bundle = wait_for_signal(&mut ws, deadline, to_peer, room, "answer")?;
 
-    // Apply answer (reuses existing LAN-filtered logic)
-    apply_remote_signal(&mut pc, &answer_bundle)?;
+    // Apply answer (reuses scope-filtered logic)
+    apply_remote_signal(&mut pc, &answer_bundle, args.network_scope)?;
 
     // Wait for DataChannel to open
     let remaining = deadline
@@ -409,12 +409,12 @@ pub fn run_answerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Er
     let offer_bundle = wait_for_signal(&mut ws, deadline, expect_peer, room, "offer")?;
 
     // Create PeerConnection
-    let (mut pc, ch) = create_peer_connection()?;
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
 
-    // Apply offer (reuses existing LAN-filtered logic)
-    apply_remote_signal(&mut pc, &offer_bundle)?;
+    // Apply offer (reuses scope-filtered logic)
+    apply_remote_signal(&mut pc, &offer_bundle, args.network_scope)?;
 
-    // Collect answer bundle (reuses existing LAN-filtered logic)
+    // Collect answer bundle (reuses scope-filtered logic)
     let answer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
 
     // Send answer to expected peer via rendezvous

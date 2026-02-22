@@ -1,9 +1,11 @@
-//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3E-A).
+//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3E-B).
 //!
 //! Establishes a WebRTC DataChannel via libdatachannel and exchanges a
 //! deterministic "hello" payload between two peers. No browser required.
 //!
-//! LAN-only by default: ICE candidates are filtered to private/link-local IPs.
+//! Network scope policy:
+//!   lan    — LAN-only: ICE candidates filtered to private/link-local IPs (default)
+//!   global — all valid IPs accepted (public, CGNAT, private)
 //!
 //! Signal modes:
 //!   file        — exchange offer/answer via JSON files (default, backward compat)
@@ -28,6 +30,8 @@ use datachannel::{
     SessionDescription,
 };
 use serde::{Deserialize, Serialize};
+
+pub(crate) use ice_filter::NetworkScope;
 
 // ── Constants ───────────────────────────────────────────────
 
@@ -80,6 +84,7 @@ pub(crate) struct Args {
     pub(crate) expect_peer: Option<String>,
     pub(crate) peer_id: Option<String>,
     pub(crate) phase_timeout: Duration,
+    pub(crate) network_scope: NetworkScope,
 }
 
 fn parse_args() -> Args {
@@ -94,6 +99,7 @@ fn parse_args() -> Args {
     let mut expect_peer = None;
     let mut peer_id = None;
     let mut phase_timeout_secs = None;
+    let mut network_scope = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -202,6 +208,17 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--network-scope" => {
+                i += 1;
+                network_scope = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("lan") => NetworkScope::Lan,
+                    Some("global") => NetworkScope::Global,
+                    other => {
+                        eprintln!("--network-scope must be 'lan' or 'global', got {:?}", other);
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -258,6 +275,7 @@ fn parse_args() -> Args {
         expect_peer,
         peer_id,
         phase_timeout,
+        network_scope: network_scope.unwrap_or(NetworkScope::Lan),
     }
 }
 
@@ -319,6 +337,7 @@ struct PcHandler {
     dc_open_tx: mpsc::Sender<()>,
     dc_msg_tx: mpsc::Sender<Vec<u8>>,
     incoming_dc_tx: mpsc::Sender<Box<RtcDataChannel<DcHandler>>>,
+    network_scope: NetworkScope,
 }
 
 impl PeerConnectionHandler for PcHandler {
@@ -337,11 +356,17 @@ impl PeerConnectionHandler for PcHandler {
     }
 
     fn on_candidate(&mut self, cand: IceCandidate) {
-        if ice_filter::is_lan_candidate(&cand.candidate) {
-            eprintln!("[pc] ICE candidate accepted (LAN): {}", &cand.candidate);
+        if ice_filter::is_allowed_candidate(&cand.candidate, self.network_scope) {
+            eprintln!(
+                "[pc] ICE candidate accepted ({:?}): {}",
+                self.network_scope, &cand.candidate
+            );
             let _ = self.cand_tx.send(cand);
         } else {
-            eprintln!("[pc] ICE candidate REJECTED (non-LAN): {}", &cand.candidate);
+            eprintln!(
+                "[pc] ICE candidate REJECTED ({:?}): {}",
+                self.network_scope, &cand.candidate
+            );
         }
     }
 
@@ -469,6 +494,7 @@ pub(crate) struct Channels {
 
 #[allow(clippy::type_complexity)]
 pub(crate) fn create_peer_connection(
+    network_scope: NetworkScope,
 ) -> Result<(Box<RtcPeerConnection<PcHandler>>, Channels), Box<dyn std::error::Error>> {
     let (desc_tx, desc_rx) = mpsc::channel();
     let (cand_tx, cand_rx) = mpsc::channel();
@@ -484,6 +510,7 @@ pub(crate) fn create_peer_connection(
         dc_open_tx,
         dc_msg_tx,
         incoming_dc_tx,
+        network_scope,
     };
 
     // LAN-only: no ICE servers (no STUN, no TURN).
@@ -542,6 +569,7 @@ pub(crate) fn collect_local_signal(
 pub(crate) fn apply_remote_signal(
     pc: &mut Box<RtcPeerConnection<PcHandler>>,
     bundle: &SignalBundle,
+    network_scope: NetworkScope,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let desc = sdp_info_to_desc(&bundle.description)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -550,14 +578,14 @@ pub(crate) fn apply_remote_signal(
 
     let mut added = 0;
     for c in &bundle.candidates {
-        if ice_filter::is_lan_candidate(&c.candidate) {
+        if ice_filter::is_allowed_candidate(&c.candidate, network_scope) {
             let cand = info_to_cand(c);
             pc.add_remote_candidate(&cand)?;
             added += 1;
         } else {
             eprintln!(
-                "[signal] remote candidate REJECTED (non-LAN): {}",
-                &c.candidate
+                "[signal] remote candidate REJECTED ({:?}): {}",
+                network_scope, &c.candidate
             );
         }
     }
@@ -580,7 +608,7 @@ fn run_offerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     clean_signal_file(&args.offer_path);
     clean_signal_file(&args.answer_path);
 
-    let (mut pc, ch) = create_peer_connection()?;
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
 
     // Create offerer's own DC handler channels
     let (dc_open_tx, dc_open_rx) = mpsc::channel();
@@ -601,7 +629,7 @@ fn run_offerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for answer
     let answer_bundle = read_signal(&args.answer_path, "answer", args.phase_timeout)?;
-    apply_remote_signal(&mut pc, &answer_bundle)?;
+    apply_remote_signal(&mut pc, &answer_bundle, args.network_scope)?;
 
     // Wait for DataChannel to open
     dc_open_rx.recv_timeout(args.phase_timeout)?;
@@ -636,10 +664,10 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Wait for offer
     let offer_bundle = read_signal(&args.offer_path, "offer", args.phase_timeout)?;
 
-    let (mut pc, ch) = create_peer_connection()?;
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
 
     // Apply offer — triggers answer SDP generation + ICE gathering
-    apply_remote_signal(&mut pc, &offer_bundle)?;
+    apply_remote_signal(&mut pc, &offer_bundle, args.network_scope)?;
 
     // Collect answer
     let answer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
@@ -679,9 +707,10 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} timeout={}s",
         args.role,
         args.signal_mode,
+        args.network_scope,
         args.phase_timeout.as_secs()
     );
 
@@ -767,5 +796,12 @@ mod tests {
     #[test]
     fn default_phase_timeout_is_30s() {
         assert_eq!(DEFAULT_PHASE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn default_network_scope_is_lan() {
+        // NetworkScope default is Lan — verified by parse_args() defaulting to Lan
+        assert_eq!(NetworkScope::Lan, NetworkScope::Lan);
+        assert_ne!(NetworkScope::Lan, NetworkScope::Global);
     }
 }

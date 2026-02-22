@@ -1,20 +1,30 @@
-//! LAN-only ICE candidate filter.
+//! ICE candidate filter with network scope policy.
 //!
-//! Accepts only candidates whose connection-address is a private or
-//! link-local IP. Rejects public IPs and unresolvable mDNS (.local) hostnames.
+//! LAN mode: accept only private/link-local IPs (RFC 1918, RFC 4193, loopback).
+//! Global mode: accept all valid IPs (private + public + CGNAT).
+//! Both modes reject mDNS (.local) and malformed candidates.
 //!
 //! Reference: TRANSPORT_CONTRACT.md §5 (LAN-Only Mode).
 
 use std::net::IpAddr;
 
-/// Returns `true` if the candidate should be kept (LAN-only policy).
+/// Network scope policy for ICE candidate filtering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NetworkScope {
+    /// LocalBolt: only private/link-local/loopback IPs.
+    Lan,
+    /// ByteBolt: all valid IPs including public and CGNAT.
+    Global,
+}
+
+/// Returns `true` if the candidate is allowed under the given network scope policy.
 ///
 /// ICE candidate attribute format (RFC 8445 §5.1):
 ///   candidate:<foundation> <component> <transport> <priority> <connection-address> <port> ...
 ///
 /// The connection-address is at token index 4 (0-based) of the `candidate:` attribute value.
 /// If the candidate string starts with "candidate:", that prefix is part of token 0.
-pub fn is_lan_candidate(candidate_str: &str) -> bool {
+pub fn is_allowed_candidate(candidate_str: &str, scope: NetworkScope) -> bool {
     // Empty or end-of-candidates marker
     let trimmed = candidate_str.trim();
     if trimmed.is_empty() {
@@ -35,10 +45,20 @@ pub fn is_lan_candidate(candidate_str: &str) -> bool {
     }
 
     match addr_str.parse::<IpAddr>() {
-        Ok(ip) => is_private_or_link_local(&ip),
+        Ok(ip) => match scope {
+            NetworkScope::Lan => is_private_or_link_local(&ip),
+            NetworkScope::Global => true,
+        },
         // Not a valid IP and not mDNS → reject
         Err(_) => false,
     }
+}
+
+/// Backward-compatible wrapper: LAN-only policy.
+/// Used by existing tests to verify LAN behavior is preserved.
+#[cfg(test)]
+pub fn is_lan_candidate(candidate_str: &str) -> bool {
+    is_allowed_candidate(candidate_str, NetworkScope::Lan)
 }
 
 /// Returns `true` if the IP is private (RFC 1918 / RFC 4193) or link-local.
@@ -91,7 +111,7 @@ fn is_private_or_link_local(ip: &IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    // ── Private/link-local IPv4 — ACCEPT ──────────────────────
+    // ── Private/link-local IPv4 — ACCEPT (both scopes) ───────
 
     #[test]
     fn accept_10_network() {
@@ -143,7 +163,7 @@ mod tests {
         assert!(is_lan_candidate(c), "fd00::/8 must be accepted");
     }
 
-    // ── Public IPs — REJECT ───────────────────────────────────
+    // ── Public IPs — REJECT in LAN ───────────────────────────
 
     #[test]
     fn reject_public_ipv4() {
@@ -169,7 +189,7 @@ mod tests {
         assert!(!is_lan_candidate(c), "172.32.x.x is not RFC1918");
     }
 
-    // ── mDNS — REJECT ─────────────────────────────────────────
+    // ── mDNS — REJECT (both scopes) ──────────────────────────
 
     #[test]
     fn reject_mdns_candidate() {
@@ -177,7 +197,7 @@ mod tests {
         assert!(!is_lan_candidate(c), "mDNS .local must be rejected");
     }
 
-    // ── Malformed — REJECT ────────────────────────────────────
+    // ── Malformed — REJECT (both scopes) ─────────────────────
 
     #[test]
     fn reject_empty() {
@@ -196,5 +216,102 @@ mod tests {
     fn reject_garbage_address() {
         let c = "candidate:1 1 UDP 2130706431 notanip 12345 typ host";
         assert!(!is_lan_candidate(c), "non-IP must be rejected");
+    }
+
+    // ── Global scope — ACCEPT public IPs ─────────────────────
+
+    #[test]
+    fn global_accepts_public_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 203.0.113.5 12345 typ srflx";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Global),
+            "global must accept public IPv4"
+        );
+    }
+
+    #[test]
+    fn global_accepts_public_ipv6() {
+        let c = "candidate:1 1 UDP 2130706431 2001:db8::1 12345 typ srflx";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Global),
+            "global must accept public IPv6"
+        );
+    }
+
+    #[test]
+    fn lan_rejects_public_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 203.0.113.5 12345 typ srflx";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Lan),
+            "lan must reject public IPv4"
+        );
+    }
+
+    #[test]
+    fn lan_rejects_public_ipv6() {
+        let c = "candidate:1 1 UDP 2130706431 2001:db8::1 12345 typ srflx";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Lan),
+            "lan must reject public IPv6"
+        );
+    }
+
+    // ── CGNAT — Global accepts, LAN rejects ──────────────────
+
+    #[test]
+    fn global_accepts_cgnat_100_64_range() {
+        let c = "candidate:1 1 UDP 2130706431 100.64.0.1 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Global),
+            "global must accept CGNAT 100.64/10"
+        );
+    }
+
+    #[test]
+    fn lan_rejects_cgnat_100_64_range() {
+        let c = "candidate:1 1 UDP 2130706431 100.64.0.1 12345 typ host";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Lan),
+            "lan must reject CGNAT 100.64/10"
+        );
+    }
+
+    // ── Global still rejects malformed/mDNS ──────────────────
+
+    #[test]
+    fn global_rejects_mdns() {
+        let c = "candidate:1 1 UDP 2130706431 abc123.local 12345 typ host";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Global),
+            "global must still reject mDNS"
+        );
+    }
+
+    #[test]
+    fn global_rejects_empty() {
+        assert!(
+            !is_allowed_candidate("", NetworkScope::Global),
+            "global must reject empty"
+        );
+    }
+
+    #[test]
+    fn global_rejects_garbage() {
+        let c = "candidate:1 1 UDP 2130706431 notanip 12345 typ host";
+        assert!(
+            !is_allowed_candidate(c, NetworkScope::Global),
+            "global must reject non-IP"
+        );
+    }
+
+    // ── Global accepts private IPs too (superset) ────────────
+
+    #[test]
+    fn global_accepts_private_ipv4() {
+        let c = "candidate:1 1 UDP 2130706431 192.168.1.1 12345 typ host";
+        assert!(
+            is_allowed_candidate(c, NetworkScope::Global),
+            "global must accept private IPv4 (superset)"
+        );
     }
 }

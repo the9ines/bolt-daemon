@@ -21,4 +21,5 @@ Pairs bolt-daemon releases with the minimum compatible bolt-rendezvous tag.
 - Entries marked `—` for rendezvous tag use file-mode signaling only and do not
   require a rendezvous server.
 
+For the canonical operator surface contract, see [docs/DAEMON_CONTRACT.md](DAEMON_CONTRACT.md).
 For two-machine operator instructions, see [docs/TWO_MACHINE_SMOKE.md](TWO_MACHINE_SMOKE.md).

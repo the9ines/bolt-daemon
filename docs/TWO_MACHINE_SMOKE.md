@@ -2,6 +2,7 @@
 
 Reproduce the bolt-daemon WebRTC DataChannel exchange between two physical
 machines using rendezvous signaling via bolt-rendezvous.
+This procedure assumes the [DAEMON_CONTRACT.md](DAEMON_CONTRACT.md) surface.
 
 ## Prerequisites
 

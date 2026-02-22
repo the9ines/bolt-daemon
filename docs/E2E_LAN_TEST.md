@@ -66,7 +66,7 @@ codesign -s - target/release/bolt-daemon
 
 Ad-hoc signing (`-s -`) is sufficient for the application firewall.
 
-## Test Procedure
+## Option A: File-Based Signaling (manual scp)
 
 File-based signaling via `/tmp/bolt-spike/`. The offerer writes `offer.json`,
 the answerer reads it, writes `answer.json`, and the offerer reads the answer
@@ -81,11 +81,9 @@ rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike
 ### Step 2: Start the offerer
 
 ```bash
-# On the offerer machine:
-./target/release/bolt-daemon --role offerer
+# On the offerer machine (use extended timeout for manual scp):
+./target/release/bolt-daemon --role offerer --phase-timeout-secs 300
 ```
-
-Waits up to 5 minutes for `answer.json`.
 
 ### Step 3: Copy offer to the answerer machine
 
@@ -98,7 +96,7 @@ scp /tmp/bolt-spike/offer.json <user>@<answerer-ip>:/tmp/bolt-spike/offer.json
 
 ```bash
 # On the answerer machine:
-./target/release/bolt-daemon --role answerer
+./target/release/bolt-daemon --role answerer --phase-timeout-secs 300
 ```
 
 Reads `offer.json`, writes `answer.json`.
@@ -128,7 +126,49 @@ Both sides should print:
 [bolt-daemon] exit 0
 ```
 
-## Automated Script (via SSH)
+## Option B: Rendezvous Signaling (no scp needed)
+
+Uses bolt-rendezvous WebSocket server to relay signaling. No manual file
+copying between machines. Requires the rendezvous server to be reachable
+from both machines.
+
+### Step 1: Start rendezvous server
+
+On one of the machines (or a shared server):
+
+```bash
+cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-rendezvous
+cargo run
+```
+
+Default listen address: `ws://0.0.0.0:3001`
+
+### Step 2: Start the offerer
+
+```bash
+# On Machine A:
+./target/release/bolt-daemon --role offerer --signal rendezvous \
+  --rendezvous-url ws://<rendezvous-ip>:3001 \
+  --room lan-test --peer-id alice --to bob
+```
+
+### Step 3: Start the answerer
+
+```bash
+# On Machine B:
+./target/release/bolt-daemon --role answerer --signal rendezvous \
+  --rendezvous-url ws://<rendezvous-ip>:3001 \
+  --room lan-test --peer-id bob --expect-peer alice
+```
+
+### Step 4: Verify
+
+Same success output as file mode. Both exit 0.
+
+**Note:** Default timeout is 30 seconds. For manual multi-terminal setup,
+add `--phase-timeout-secs 300` if needed.
+
+## Automated Script (via SSH, file mode)
 
 If Machine A has SSH access to Machine B, the entire exchange can be scripted.
 This example uses Machine B as offerer, Machine A as answerer:
@@ -143,7 +183,7 @@ rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike
 ssh $MACHINE_B "rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike"
 
 # Start offerer on B (detached)
-ssh $MACHINE_B "nohup $MACHINE_B_DAEMON --role offerer </dev/null >/dev/null 2>/tmp/bolt-spike/offerer.log &
+ssh $MACHINE_B "nohup $MACHINE_B_DAEMON --role offerer --phase-timeout-secs 300 </dev/null >/dev/null 2>/tmp/bolt-spike/offerer.log &
 for i in \$(seq 1 15); do
   [ -f /tmp/bolt-spike/offer.json ] && [ -s /tmp/bolt-spike/offer.json ] && exit 0
   sleep 1
@@ -154,7 +194,7 @@ exit 1"
 scp -q $MACHINE_B:/tmp/bolt-spike/offer.json /tmp/bolt-spike/offer.json
 
 # Start answerer on A
-$MACHINE_A_DAEMON --role answerer 2>/tmp/bolt-spike/answerer.log &
+$MACHINE_A_DAEMON --role answerer --phase-timeout-secs 300 2>/tmp/bolt-spike/answerer.log &
 for i in $(seq 1 15); do
   [ -f /tmp/bolt-spike/answer.json ] && [ -s /tmp/bolt-spike/answer.json ] && break
   sleep 1
@@ -174,12 +214,15 @@ echo "=== Machine B ===" && ssh $MACHINE_B "tail -5 /tmp/bolt-spike/offerer.log"
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `connection state: Failed` after ~40s | Firewall blocking STUN UDP | Re-add firewall rule (see above) |
-| `FATAL: timed out waiting for answer.json` | Signaling file not delivered in time | Use automated script or increase `PHASE_TIMEOUT` |
-| `ICE candidate REJECTED (non-LAN)` | Tailscale/VPN active | Disable VPN during test |
+| `FATAL: timed out waiting for answer.json` | Signaling file not delivered in time | Use `--phase-timeout-secs 300` or rendezvous mode |
+| `ICE candidate REJECTED (Lan)` | Tailscale/VPN active | Disable VPN during test |
 | `bad CPU type in executable` | Wrong architecture binary | Build locally on each machine, do not scp binaries |
+| `rendezvous server unreachable` | bolt-rendezvous not running | Start it, or use file mode |
+| `FATAL: --signal rendezvous requires --room` | Missing required flag | Add `--room`, `--to`/`--expect-peer` |
 
 ## Known Limitations
 
 - macOS firewall rules go stale on binary rebuild (silent block, no prompt)
 - libjuice ICE connectivity timer is ~40 seconds (not configurable via RtcConfig)
 - mDNS `.local` candidates are rejected (cannot verify they resolve to LAN)
+- Default timeout is 30 seconds; use `--phase-timeout-secs 300` for manual two-machine tests

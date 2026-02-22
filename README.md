@@ -2,13 +2,19 @@
 
 Headless WebRTC transport for the Bolt Protocol.
 
-## Current State: Phase 3D (LAN-only + browser interop + two-machine E2E verified)
+## Current State: Phase 3E-B (rendezvous signaling + network scope policy)
 
 Minimal Rust daemon that establishes a WebRTC DataChannel via
 [libdatachannel](https://github.com/paullouisageneau/libdatachannel)
 (headless, no browser) and exchanges a deterministic payload between two peers.
 
-LAN-only by default: ICE candidates are filtered to private/link-local IPs.
+Two signaling modes:
+- **File** (default) — exchange offer/answer via JSON files on disk
+- **Rendezvous** — exchange offer/answer via bolt-rendezvous WebSocket server
+
+Two network scope policies:
+- **LAN** (default) — ICE candidates filtered to private/link-local IPs (LocalBolt)
+- **Global** — all valid IPs accepted including public and CGNAT (ByteBolt)
 
 ### What This Proves
 
@@ -18,12 +24,14 @@ LAN-only by default: ICE candidates are filtered to private/link-local IPs.
 - Ordered, reliable message delivery works (aligns with `TRANSPORT_CONTRACT.md` §1)
 - LAN-only ICE policy enforced at candidate level (`TRANSPORT_CONTRACT.md` §5)
 - Browser-to-daemon DataChannel interop via file-based signaling
+- Rendezvous signaling via bolt-rendezvous WebSocket server (no manual `scp`)
+- Network scope policy cleanly separates LAN (LocalBolt) from Global (ByteBolt)
 
 ### What This Does NOT Do
 
 - No Bolt protocol encryption (NaCl box is in bolt-core-sdk, not here)
 - No identity persistence or TOFU
-- No signaling server integration (uses file-based exchange)
+- No TURN integration yet (Phase 3F)
 
 ## Reproducible Builds
 
@@ -37,7 +45,30 @@ cargo build
 First build compiles libdatachannel + OpenSSL from source (~1 min).
 Requires: Rust 1.70+, CMake, Xcode Command Line Tools (macOS).
 
-## Run (headless-to-headless)
+## CLI Reference
+
+```
+bolt-daemon --role offerer|answerer [options]
+
+Common flags:
+  --role <offerer|answerer>       Required. Peer role.
+  --network-scope <lan|global>    ICE filter policy (default: lan)
+  --phase-timeout-secs <int>      Timeout per phase in seconds (default: 30)
+
+File mode flags:
+  --offer <path|->                Offer signal path (default: /tmp/bolt-spike/offer.json)
+  --answer <path|->               Answer signal path (default: /tmp/bolt-spike/answer.json)
+
+Rendezvous mode flags:
+  --signal <file|rendezvous>      Signal mode (default: file)
+  --rendezvous-url <url>          WebSocket URL (default: ws://127.0.0.1:3001)
+  --room <string>                 Session discriminator (REQUIRED for rendezvous)
+  --to <peer_code>                Target peer (REQUIRED for offerer + rendezvous)
+  --expect-peer <peer_code>       Expected peer (REQUIRED for answerer + rendezvous)
+  --peer-id <string>              Own peer code (optional, auto-generated)
+```
+
+## Run — File Mode (headless-to-headless)
 
 Open two terminals:
 
@@ -65,16 +96,80 @@ Use `-` for stdin/stdout (copy-paste mode):
 cargo run -- --role offerer --offer - --answer -
 ```
 
+## Run — Rendezvous Mode
+
+Requires a running bolt-rendezvous server.
+
+```bash
+# Terminal 0: start rendezvous server
+cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-rendezvous
+cargo run
+
+# Terminal 1 (offerer):
+cargo run -- --role offerer --signal rendezvous --room test1 \
+  --peer-id alice --to bob
+
+# Terminal 2 (answerer):
+cargo run -- --role answerer --signal rendezvous --room test1 \
+  --peer-id bob --expect-peer alice
+```
+
+For two-machine tests with manual setup time:
+
+```bash
+cargo run -- --role offerer --signal rendezvous --room test1 \
+  --peer-id alice --to bob --phase-timeout-secs 300
+```
+
+### Rendezvous Fail-Closed Rules
+
+Rendezvous mode is **opt-in only**. There is no fallback to file mode.
+
+- `--signal rendezvous` without `--room` → exit 1
+- `--signal rendezvous --role offerer` without `--to` → exit 1
+- `--signal rendezvous --role answerer` without `--expect-peer` → exit 1
+- Rendezvous server unreachable → exit 1 (no silent behavior change)
+
 ### Expected Output
 
-Both peers print `SUCCESS` and exit 0. Non-LAN candidates are explicitly rejected:
+Both peers print `SUCCESS` and exit 0. Non-LAN candidates are explicitly rejected
+(in LAN mode):
 
 ```
-[pc] ICE candidate accepted (LAN): candidate:1 1 UDP ... 192.168.4.210 ...
-[pc] ICE candidate REJECTED (non-LAN): candidate:4 1 UDP ... 100.74.48.28 ...
+[bolt-daemon] role=Offerer signal=File scope=Lan timeout=30s
+[pc] ICE candidate accepted (Lan): candidate:1 1 UDP ... 192.168.4.210 ...
+[pc] ICE candidate REJECTED (Lan): candidate:4 1 UDP ... 100.74.48.28 ...
 [offerer] SUCCESS — received matching payload
 [bolt-daemon] exit 0
 ```
+
+## Network Scope Policy
+
+Controls which ICE candidates are accepted at the `on_candidate` callback
+and on inbound remote candidate application.
+
+### LAN mode (`--network-scope lan`, default)
+
+| Range | Type |
+|-------|------|
+| `10.0.0.0/8` | RFC 1918 private |
+| `172.16.0.0/12` | RFC 1918 private |
+| `192.168.0.0/16` | RFC 1918 private |
+| `169.254.0.0/16` | IPv4 link-local |
+| `127.0.0.0/8` | Loopback |
+| `fe80::/10` | IPv6 link-local |
+| `fc00::/7` | IPv6 unique local |
+| `::1` | IPv6 loopback |
+
+Rejected: public IPs, CGNAT (`100.64.0.0/10`), mDNS (`.local`), any non-IP address.
+
+### Global mode (`--network-scope global`)
+
+Accepts all valid IP addresses (private + public + CGNAT).
+
+Still rejected: mDNS (`.local`), malformed candidates, empty IPs.
+
+No STUN or TURN servers are configured by default.
 
 ## Browser Interop
 
@@ -142,7 +237,7 @@ Both the daemon and the browser page use the same JSON format:
 cargo test
 ```
 
-21 unit tests: 16 ICE filter (accept/reject table), 5 transport/signaling.
+43 unit tests: 26 ICE filter (LAN + Global scope), 7 transport/signaling, 10 rendezvous protocol.
 
 ## Lint
 
@@ -153,35 +248,16 @@ cargo clippy -- -W clippy::all
 
 Both must be clean (0 warnings).
 
-## LAN-Only ICE Policy
-
-All ICE candidates are filtered at the `on_candidate` callback and on inbound
-remote candidate application. The policy accepts:
-
-| Range | Type |
-|-------|------|
-| `10.0.0.0/8` | RFC 1918 private |
-| `172.16.0.0/12` | RFC 1918 private |
-| `192.168.0.0/16` | RFC 1918 private |
-| `169.254.0.0/16` | IPv4 link-local |
-| `127.0.0.0/8` | Loopback |
-| `fe80::/10` | IPv6 link-local |
-| `fc00::/7` | IPv6 unique local |
-| `::1` | IPv6 loopback |
-
-Rejected: public IPs, mDNS (`.local`), any non-IP address.
-
-No STUN or TURN servers are configured by default.
-
 ## Architecture
 
 ```
 bolt-daemon/
-├── Cargo.toml           # datachannel (vendored), webrtc-sdp, serde
+├── Cargo.toml           # datachannel (vendored), webrtc-sdp, serde, tungstenite
 ├── Cargo.lock           # pinned (committed for reproducible builds)
 ├── src/
-│   ├── main.rs          # CLI + handlers + signaling + E2E flow
-│   └── ice_filter.rs    # LAN-only candidate filter + 16 tests
+│   ├── main.rs          # CLI + handlers + signaling + E2E flow + file mode
+│   ├── ice_filter.rs    # NetworkScope policy + candidate filter + 26 tests
+│   └── rendezvous.rs    # WebSocket signaling via bolt-rendezvous + 10 tests
 ├── interop/
 │   └── browser/
 │       └── index.html   # Browser interop test page
@@ -194,12 +270,13 @@ Key dependencies:
 - [`datachannel`](https://crates.io/crates/datachannel) v0.16.0 — Rust bindings for libdatachannel
 - `vendored` feature — compiles libdatachannel + OpenSSL from source (no system deps)
 - [`webrtc-sdp`](https://crates.io/crates/webrtc-sdp) v0.3 — SDP parsing for signaling exchange
+- [`tungstenite`](https://crates.io/crates/tungstenite) v0.24 — sync WebSocket client for rendezvous signaling
 
 ## Tag Convention
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.4-timeout5m`
+Current: `daemon-v0.0.7-network-scope`
 
 ## License
 

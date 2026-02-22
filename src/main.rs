@@ -1,13 +1,17 @@
-//! Bolt Daemon — Headless WebRTC DataChannel transport spike (Phase 3A).
+//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3B).
 //!
 //! Establishes a WebRTC DataChannel via libdatachannel and exchanges a
 //! deterministic "hello" payload between two peers. No browser required.
+//!
+//! LAN-only by default: ICE candidates are filtered to private/link-local IPs.
 //!
 //! Usage:
 //!   bolt-daemon --role offerer  [--offer <path|->] [--answer <path|->]
 //!   bolt-daemon --role answerer [--offer <path|->] [--answer <path|->]
 //!
 //! Default signal paths: /tmp/bolt-spike/offer.json, /tmp/bolt-spike/answer.json
+
+mod ice_filter;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -207,8 +211,12 @@ impl PeerConnectionHandler for PcHandler {
     }
 
     fn on_candidate(&mut self, cand: IceCandidate) {
-        eprintln!("[pc] ICE candidate gathered");
-        let _ = self.cand_tx.send(cand);
+        if ice_filter::is_lan_candidate(&cand.candidate) {
+            eprintln!("[pc] ICE candidate accepted (LAN): {}", &cand.candidate);
+            let _ = self.cand_tx.send(cand);
+        } else {
+            eprintln!("[pc] ICE candidate REJECTED (non-LAN): {}", &cand.candidate);
+        }
     }
 
     fn on_connection_state_change(&mut self, state: ConnectionState) {
@@ -407,14 +415,20 @@ fn apply_remote_signal(
     pc.set_remote_description(&desc)?;
     eprintln!("[signal] remote description applied");
 
+    let mut added = 0;
     for c in &bundle.candidates {
-        let cand = info_to_cand(c);
-        pc.add_remote_candidate(&cand)?;
+        if ice_filter::is_lan_candidate(&c.candidate) {
+            let cand = info_to_cand(c);
+            pc.add_remote_candidate(&cand)?;
+            added += 1;
+        } else {
+            eprintln!(
+                "[signal] remote candidate REJECTED (non-LAN): {}",
+                &c.candidate
+            );
+        }
     }
-    eprintln!(
-        "[signal] added {} remote ICE candidate(s)",
-        bundle.candidates.len()
-    );
+    eprintln!("[signal] added {} remote ICE candidate(s)", added);
 
     Ok(())
 }

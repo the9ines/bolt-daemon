@@ -20,3 +20,5 @@ Pairs bolt-daemon releases with the minimum compatible bolt-rendezvous tag.
   session isolation. Daemon peers ignore signals with non-matching sessions.
 - Entries marked `—` for rendezvous tag use file-mode signaling only and do not
   require a rendezvous server.
+
+For two-machine operator instructions, see [docs/TWO_MACHINE_SMOKE.md](TWO_MACHINE_SMOKE.md).

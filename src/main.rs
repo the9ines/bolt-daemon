@@ -1,17 +1,19 @@
-//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3B).
+//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3E-A).
 //!
 //! Establishes a WebRTC DataChannel via libdatachannel and exchanges a
 //! deterministic "hello" payload between two peers. No browser required.
 //!
 //! LAN-only by default: ICE candidates are filtered to private/link-local IPs.
 //!
-//! Usage:
-//!   bolt-daemon --role offerer  [--offer <path|->] [--answer <path|->]
-//!   bolt-daemon --role answerer [--offer <path|->] [--answer <path|->]
+//! Signal modes:
+//!   file        — exchange offer/answer via JSON files (default, backward compat)
+//!   rendezvous  — exchange offer/answer via bolt-rendezvous WebSocket server
 //!
-//! Default signal paths: /tmp/bolt-spike/offer.json, /tmp/bolt-spike/answer.json
+//! Usage:
+//!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
 
 mod ice_filter;
+mod rendezvous;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -31,13 +33,14 @@ use serde::{Deserialize, Serialize};
 
 /// Deterministic payload exchanged during the spike.
 /// Both peers send and verify this exact byte sequence.
-const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";
+pub(crate) const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";
 
 /// DataChannel label.
-const DC_LABEL: &str = "bolt";
+pub(crate) const DC_LABEL: &str = "bolt";
 
-/// Timeout for each signaling/data exchange phase.
-const PHASE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default timeout for each signaling/data exchange phase (30 seconds).
+/// Override via `--phase-timeout-secs <int>`.
+const DEFAULT_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll interval when waiting for a signaling file.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -48,7 +51,7 @@ const DEFAULT_SIGNAL_DIR: &str = "/tmp/bolt-spike";
 // ── CLI ─────────────────────────────────────────────────────
 
 #[derive(Debug)]
-enum Role {
+pub(crate) enum Role {
     Offerer,
     Answerer,
 }
@@ -59,11 +62,24 @@ enum SignalPath {
     File(String),
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum SignalMode {
+    File,
+    Rendezvous,
+}
+
 #[derive(Debug)]
-struct Args {
-    role: Role,
+pub(crate) struct Args {
+    pub(crate) role: Role,
     offer_path: SignalPath,
     answer_path: SignalPath,
+    pub(crate) signal_mode: SignalMode,
+    pub(crate) rendezvous_url: String,
+    pub(crate) room: Option<String>,
+    pub(crate) to_peer: Option<String>,
+    pub(crate) expect_peer: Option<String>,
+    pub(crate) peer_id: Option<String>,
+    pub(crate) phase_timeout: Duration,
 }
 
 fn parse_args() -> Args {
@@ -71,6 +87,13 @@ fn parse_args() -> Args {
     let mut role = None;
     let mut offer = None;
     let mut answer = None;
+    let mut signal_mode = None;
+    let mut rendezvous_url = None;
+    let mut room = None;
+    let mut to_peer = None;
+    let mut expect_peer = None;
+    let mut peer_id = None;
+    let mut phase_timeout_secs = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -108,6 +131,77 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--signal" => {
+                i += 1;
+                signal_mode = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("file") => SignalMode::File,
+                    Some("rendezvous") => SignalMode::Rendezvous,
+                    other => {
+                        eprintln!("--signal must be 'file' or 'rendezvous', got {:?}", other);
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--rendezvous-url" => {
+                i += 1;
+                rendezvous_url = Some(match argv.get(i) {
+                    Some(u) => u.clone(),
+                    None => {
+                        eprintln!("--rendezvous-url requires a URL");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--room" => {
+                i += 1;
+                room = Some(match argv.get(i) {
+                    Some(r) => r.clone(),
+                    None => {
+                        eprintln!("--room requires a value");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--to" => {
+                i += 1;
+                to_peer = Some(match argv.get(i) {
+                    Some(t) => t.clone(),
+                    None => {
+                        eprintln!("--to requires a peer code");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--expect-peer" => {
+                i += 1;
+                expect_peer = Some(match argv.get(i) {
+                    Some(e) => e.clone(),
+                    None => {
+                        eprintln!("--expect-peer requires a peer code");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--peer-id" => {
+                i += 1;
+                peer_id = Some(match argv.get(i) {
+                    Some(p) => p.clone(),
+                    None => {
+                        eprintln!("--peer-id requires a value");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--phase-timeout-secs" => {
+                i += 1;
+                phase_timeout_secs = Some(match argv.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(s) if s > 0 => s,
+                    _ => {
+                        eprintln!("--phase-timeout-secs requires a positive integer");
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -118,10 +212,35 @@ fn parse_args() -> Args {
 
     let role = role.unwrap_or_else(|| {
         eprintln!(
-            "Usage: bolt-daemon --role offerer|answerer [--offer <path|->] [--answer <path|->]"
+            "Usage: bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]"
         );
         std::process::exit(1);
     });
+
+    let signal_mode = signal_mode.unwrap_or(SignalMode::File);
+    let phase_timeout = phase_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PHASE_TIMEOUT);
+
+    // ── Fail-closed validation for rendezvous mode ──────────
+    // Rendezvous mode is opt-in only. No fallback to file mode.
+    // If misconfigured, exit 1 with clear error.
+    if signal_mode == SignalMode::Rendezvous {
+        if room.is_none() {
+            eprintln!("FATAL: --signal rendezvous requires --room");
+            std::process::exit(1);
+        }
+        if matches!(role, Role::Offerer) && to_peer.is_none() {
+            eprintln!("FATAL: --signal rendezvous --role offerer requires --to <peer_code>");
+            std::process::exit(1);
+        }
+        if matches!(role, Role::Answerer) && expect_peer.is_none() {
+            eprintln!(
+                "FATAL: --signal rendezvous --role answerer requires --expect-peer <peer_code>"
+            );
+            std::process::exit(1);
+        }
+    }
 
     let offer =
         offer.unwrap_or_else(|| SignalPath::File(format!("{}/offer.json", DEFAULT_SIGNAL_DIR)));
@@ -132,34 +251,41 @@ fn parse_args() -> Args {
         role,
         offer_path: offer,
         answer_path: answer,
+        signal_mode,
+        rendezvous_url: rendezvous_url.unwrap_or_else(|| "ws://127.0.0.1:3001".to_string()),
+        room,
+        to_peer,
+        expect_peer,
+        peer_id,
+        phase_timeout,
     }
 }
 
 // ── Signaling JSON ──────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
-struct SignalBundle {
-    description: SdpInfo,
-    candidates: Vec<CandidateInfo>,
+pub(crate) struct SignalBundle {
+    pub(crate) description: SdpInfo,
+    pub(crate) candidates: Vec<CandidateInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct SdpInfo {
-    sdp_type: String,
-    sdp: String,
+pub(crate) struct SdpInfo {
+    pub(crate) sdp_type: String,
+    pub(crate) sdp: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct CandidateInfo {
-    candidate: String,
-    mid: String,
+pub(crate) struct CandidateInfo {
+    pub(crate) candidate: String,
+    pub(crate) mid: String,
 }
 
 // ── Handlers ────────────────────────────────────────────────
 
-struct DcHandler {
-    open_tx: mpsc::Sender<()>,
-    msg_tx: mpsc::Sender<Vec<u8>>,
+pub(crate) struct DcHandler {
+    pub(crate) open_tx: mpsc::Sender<()>,
+    pub(crate) msg_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl DataChannelHandler for DcHandler {
@@ -255,7 +381,11 @@ fn write_signal(path: &SignalPath, bundle: &SignalBundle) -> io::Result<()> {
     Ok(())
 }
 
-fn read_signal(path: &SignalPath, label: &str) -> io::Result<SignalBundle> {
+fn read_signal(
+    path: &SignalPath,
+    label: &str,
+    phase_timeout: Duration,
+) -> io::Result<SignalBundle> {
     let json = match path {
         SignalPath::Stdio => {
             eprintln!("[signal] paste {} JSON and press Enter:", label);
@@ -271,7 +401,7 @@ fn read_signal(path: &SignalPath, label: &str) -> io::Result<SignalBundle> {
                     thread::sleep(Duration::from_millis(100));
                     break fs::read_to_string(p)?;
                 }
-                if start.elapsed() > PHASE_TIMEOUT {
+                if start.elapsed() > phase_timeout {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("timed out waiting for {}", p),
@@ -328,17 +458,17 @@ fn info_to_cand(info: &CandidateInfo) -> IceCandidate {
 
 // ── Core logic ──────────────────────────────────────────────
 
-struct Channels {
-    desc_rx: mpsc::Receiver<SessionDescription>,
-    cand_rx: mpsc::Receiver<IceCandidate>,
-    gather_rx: mpsc::Receiver<GatheringState>,
-    dc_open_rx: mpsc::Receiver<()>,
-    dc_msg_rx: mpsc::Receiver<Vec<u8>>,
-    incoming_dc_rx: mpsc::Receiver<Box<RtcDataChannel<DcHandler>>>,
+pub(crate) struct Channels {
+    pub(crate) desc_rx: mpsc::Receiver<SessionDescription>,
+    pub(crate) cand_rx: mpsc::Receiver<IceCandidate>,
+    pub(crate) gather_rx: mpsc::Receiver<GatheringState>,
+    pub(crate) dc_open_rx: mpsc::Receiver<()>,
+    pub(crate) dc_msg_rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) incoming_dc_rx: mpsc::Receiver<Box<RtcDataChannel<DcHandler>>>,
 }
 
 #[allow(clippy::type_complexity)]
-fn create_peer_connection(
+pub(crate) fn create_peer_connection(
 ) -> Result<(Box<RtcPeerConnection<PcHandler>>, Channels), Box<dyn std::error::Error>> {
     let (desc_tx, desc_rx) = mpsc::channel();
     let (cand_tx, cand_rx) = mpsc::channel();
@@ -375,8 +505,11 @@ fn create_peer_connection(
 }
 
 /// Wait for local description + all ICE candidates (gathering complete).
-fn collect_local_signal(ch: &Channels) -> Result<SignalBundle, Box<dyn std::error::Error>> {
-    let desc = ch.desc_rx.recv_timeout(PHASE_TIMEOUT)?;
+pub(crate) fn collect_local_signal(
+    ch: &Channels,
+    phase_timeout: Duration,
+) -> Result<SignalBundle, Box<dyn std::error::Error>> {
+    let desc = ch.desc_rx.recv_timeout(phase_timeout)?;
     eprintln!("[signal] local description ready");
 
     let mut candidates = Vec::new();
@@ -393,7 +526,7 @@ fn collect_local_signal(ch: &Channels) -> Result<SignalBundle, Box<dyn std::erro
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(e) => return Err(e.into()),
         }
-        if start.elapsed() > PHASE_TIMEOUT {
+        if start.elapsed() > phase_timeout {
             return Err("timed out waiting for ICE gathering".into());
         }
     }
@@ -406,7 +539,7 @@ fn collect_local_signal(ch: &Channels) -> Result<SignalBundle, Box<dyn std::erro
 }
 
 /// Apply remote signal bundle to local peer connection.
-fn apply_remote_signal(
+pub(crate) fn apply_remote_signal(
     pc: &mut Box<RtcPeerConnection<PcHandler>>,
     bundle: &SignalBundle,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -463,15 +596,15 @@ fn run_offerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[offerer] DataChannel '{}' created", DC_LABEL);
 
     // Collect offer
-    let offer_bundle = collect_local_signal(&ch)?;
+    let offer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
     write_signal(&args.offer_path, &offer_bundle)?;
 
     // Wait for answer
-    let answer_bundle = read_signal(&args.answer_path, "answer")?;
+    let answer_bundle = read_signal(&args.answer_path, "answer", args.phase_timeout)?;
     apply_remote_signal(&mut pc, &answer_bundle)?;
 
     // Wait for DataChannel to open
-    dc_open_rx.recv_timeout(PHASE_TIMEOUT)?;
+    dc_open_rx.recv_timeout(args.phase_timeout)?;
     eprintln!("[offerer] DataChannel open");
 
     // Send hello payload
@@ -482,7 +615,7 @@ fn run_offerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Wait for echo
-    let response = dc_msg_rx.recv_timeout(PHASE_TIMEOUT)?;
+    let response = dc_msg_rx.recv_timeout(args.phase_timeout)?;
     if response == HELLO_PAYLOAD {
         eprintln!("[offerer] SUCCESS — received matching payload");
         Ok(())
@@ -501,7 +634,7 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[answerer] starting...");
 
     // Wait for offer
-    let offer_bundle = read_signal(&args.offer_path, "offer")?;
+    let offer_bundle = read_signal(&args.offer_path, "offer", args.phase_timeout)?;
 
     let (mut pc, ch) = create_peer_connection()?;
 
@@ -509,19 +642,19 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     apply_remote_signal(&mut pc, &offer_bundle)?;
 
     // Collect answer
-    let answer_bundle = collect_local_signal(&ch)?;
+    let answer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
     write_signal(&args.answer_path, &answer_bundle)?;
 
     // Wait for incoming DataChannel
-    let mut dc = ch.incoming_dc_rx.recv_timeout(PHASE_TIMEOUT)?;
+    let mut dc = ch.incoming_dc_rx.recv_timeout(args.phase_timeout)?;
     eprintln!("[answerer] DataChannel received");
 
     // Wait for DC to open
-    ch.dc_open_rx.recv_timeout(PHASE_TIMEOUT)?;
+    ch.dc_open_rx.recv_timeout(args.phase_timeout)?;
     eprintln!("[answerer] DataChannel open");
 
     // Wait for hello payload
-    let msg = ch.dc_msg_rx.recv_timeout(PHASE_TIMEOUT)?;
+    let msg = ch.dc_msg_rx.recv_timeout(args.phase_timeout)?;
     eprintln!(
         "[answerer] received: {:?}",
         std::str::from_utf8(&msg).unwrap_or("<binary>")
@@ -545,11 +678,18 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     let args = parse_args();
-    eprintln!("[bolt-daemon] role={:?}", args.role);
+    eprintln!(
+        "[bolt-daemon] role={:?} signal={:?} timeout={}s",
+        args.role,
+        args.signal_mode,
+        args.phase_timeout.as_secs()
+    );
 
-    let result = match args.role {
-        Role::Offerer => run_offerer(&args),
-        Role::Answerer => run_answerer(&args),
+    let result = match (&args.role, &args.signal_mode) {
+        (Role::Offerer, SignalMode::File) => run_offerer(&args),
+        (Role::Answerer, SignalMode::File) => run_answerer(&args),
+        (Role::Offerer, SignalMode::Rendezvous) => rendezvous::run_offerer_rendezvous(&args),
+        (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(&args),
     };
 
     match result {
@@ -622,5 +762,10 @@ mod tests {
         let back = cand_to_info(&cand);
         assert_eq!(back.candidate, info.candidate);
         assert_eq!(back.mid, info.mid);
+    }
+
+    #[test]
+    fn default_phase_timeout_is_30s() {
+        assert_eq!(DEFAULT_PHASE_TIMEOUT, Duration::from_secs(30));
     }
 }

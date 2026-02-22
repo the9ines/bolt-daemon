@@ -2,7 +2,7 @@
 
 Headless WebRTC transport for the Bolt Protocol.
 
-## Current State: Phase 3F (overlay network scope for Tailscale)
+## Current State: Phase 3G (rendezvous session + handshake)
 
 Minimal Rust daemon that establishes a WebRTC DataChannel via
 [libdatachannel](https://github.com/paullouisageneau/libdatachannel)
@@ -26,6 +26,7 @@ Three network scope policies:
 - LAN-only ICE policy enforced at candidate level (`TRANSPORT_CONTRACT.md` §5)
 - Browser-to-daemon DataChannel interop via file-based signaling
 - Rendezvous signaling via bolt-rendezvous WebSocket server (no manual `scp`)
+- Rendezvous hello/ack handshake validates peer identity, session, scope before offer
 - Network scope policy cleanly separates LAN (LocalBolt) from Global (ByteBolt)
 
 ### What This Does NOT Do
@@ -63,7 +64,8 @@ File mode flags:
 Rendezvous mode flags:
   --signal <file|rendezvous>      Signal mode (default: file)
   --rendezvous-url <url>          WebSocket URL (default: ws://127.0.0.1:3001)
-  --room <string>                 Session discriminator (REQUIRED for rendezvous)
+  --room <string>                 Room discriminator (REQUIRED for rendezvous)
+  --session <string>              Session discriminator (REQUIRED for rendezvous)
   --to <peer_code>                Target peer (REQUIRED for offerer + rendezvous)
   --expect-peer <peer_code>       Expected peer (REQUIRED for answerer + rendezvous)
   --peer-id <string>              Own peer code (optional, auto-generated)
@@ -108,28 +110,46 @@ cargo run
 
 # Terminal 1 (offerer):
 cargo run -- --role offerer --signal rendezvous --room test1 \
-  --peer-id alice --to bob
+  --session s1 --peer-id alice --to bob
 
 # Terminal 2 (answerer):
 cargo run -- --role answerer --signal rendezvous --room test1 \
-  --peer-id bob --expect-peer alice
+  --session s1 --peer-id bob --expect-peer alice
 ```
 
 For two-machine tests with manual setup time:
 
 ```bash
 cargo run -- --role offerer --signal rendezvous --room test1 \
-  --peer-id alice --to bob --phase-timeout-secs 300
+  --session s1 --peer-id alice --to bob --phase-timeout-secs 300
 ```
+
+### Rendezvous Hello/Ack Handshake
+
+Before the offer/answer exchange, rendezvous mode performs a hello/ack handshake:
+
+1. Offerer sends `msg_type="hello"` with peer identities, network scope, and session
+2. Answerer validates hello fields (peer IDs, scope match, payload version)
+3. Answerer replies `msg_type="ack"`
+4. Offerer validates ack, then proceeds with offer
+
+Any mismatch (wrong peer, scope mismatch, version mismatch) exits 1 immediately.
+
+All rendezvous payloads carry `payload_version: 1` and a `session` discriminator.
+Signals with a non-matching session are silently ignored (different test run).
+Signals with an unknown `payload_version` cause exit 1 (fail-closed).
 
 ### Rendezvous Fail-Closed Rules
 
 Rendezvous mode is **opt-in only**. There is no fallback to file mode.
 
 - `--signal rendezvous` without `--room` → exit 1
+- `--signal rendezvous` without `--session` → exit 1
 - `--signal rendezvous --role offerer` without `--to` → exit 1
 - `--signal rendezvous --role answerer` without `--expect-peer` → exit 1
 - Rendezvous server unreachable → exit 1 (no silent behavior change)
+- `payload_version` mismatch → exit 1
+- Hello peer identity or scope mismatch → exit 1
 
 ### Expected Output
 
@@ -186,6 +206,18 @@ Accepts all valid IP addresses (private + public + CGNAT).
 Still rejected: mDNS (`.local`), malformed candidates, empty IPs.
 
 No STUN or TURN servers are configured by default.
+
+## Local E2E Test (Rendezvous)
+
+An automated script runs bolt-rendezvous + two bolt-daemon peers locally:
+
+```bash
+bash scripts/e2e_rendezvous_local.sh
+```
+
+Requires `bolt-rendezvous` at `../bolt-rendezvous` (sibling repo). Builds both,
+starts the rendezvous server, runs offerer + answerer with hello/ack handshake,
+and reports PASS/FAIL. Logs are preserved on failure for debugging.
 
 ## Browser Interop
 
@@ -253,7 +285,7 @@ Both the daemon and the browser page use the same JSON format:
 cargo test
 ```
 
-50 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 10 rendezvous protocol.
+55 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 15 rendezvous protocol.
 
 ## Lint
 
@@ -273,7 +305,9 @@ bolt-daemon/
 ├── src/
 │   ├── main.rs          # CLI + handlers + signaling + E2E flow + file mode
 │   ├── ice_filter.rs    # NetworkScope policy + candidate filter + 33 tests
-│   └── rendezvous.rs    # WebSocket signaling via bolt-rendezvous + 10 tests
+│   └── rendezvous.rs    # WebSocket signaling via bolt-rendezvous + 15 tests
+├── scripts/
+│   └── e2e_rendezvous_local.sh  # Local E2E regression harness
 ├── interop/
 │   └── browser/
 │       └── index.html   # Browser interop test page
@@ -292,7 +326,7 @@ Key dependencies:
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.8-overlay-scope`
+Current: `daemon-v0.0.9-rendezvous-session`
 
 ## License
 

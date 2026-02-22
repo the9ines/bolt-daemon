@@ -84,6 +84,7 @@ pub(crate) struct Args {
     pub(crate) to_peer: Option<String>,
     pub(crate) expect_peer: Option<String>,
     pub(crate) peer_id: Option<String>,
+    pub(crate) session: Option<String>,
     pub(crate) phase_timeout: Duration,
     pub(crate) network_scope: NetworkScope,
 }
@@ -99,6 +100,7 @@ fn parse_args() -> Args {
     let mut to_peer = None;
     let mut expect_peer = None;
     let mut peer_id = None;
+    let mut session = None;
     let mut phase_timeout_secs = None;
     let mut network_scope = None;
 
@@ -199,6 +201,16 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--session" => {
+                i += 1;
+                session = Some(match argv.get(i) {
+                    Some(s) => s.clone(),
+                    None => {
+                        eprintln!("--session requires a value");
+                        std::process::exit(1);
+                    }
+                });
+            }
             "--phase-timeout-secs" => {
                 i += 1;
                 phase_timeout_secs = Some(match argv.get(i).and_then(|s| s.parse::<u64>().ok()) {
@@ -252,6 +264,10 @@ fn parse_args() -> Args {
             eprintln!("FATAL: --signal rendezvous requires --room");
             std::process::exit(1);
         }
+        if session.is_none() {
+            eprintln!("FATAL: --signal rendezvous requires --session");
+            std::process::exit(1);
+        }
         if matches!(role, Role::Offerer) && to_peer.is_none() {
             eprintln!("FATAL: --signal rendezvous --role offerer requires --to <peer_code>");
             std::process::exit(1);
@@ -279,6 +295,7 @@ fn parse_args() -> Args {
         to_peer,
         expect_peer,
         peer_id,
+        session,
         phase_timeout,
         network_scope: network_scope.unwrap_or(NetworkScope::Lan),
     }

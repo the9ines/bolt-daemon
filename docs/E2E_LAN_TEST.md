@@ -149,7 +149,7 @@ Default listen address: `ws://0.0.0.0:3001`
 # On Machine A:
 ./target/release/bolt-daemon --role offerer --signal rendezvous \
   --rendezvous-url ws://<rendezvous-ip>:3001 \
-  --room lan-test --peer-id alice --to bob
+  --room lan-test --session e2e-1 --peer-id alice --to bob
 ```
 
 ### Step 3: Start the answerer
@@ -158,7 +158,7 @@ Default listen address: `ws://0.0.0.0:3001`
 # On Machine B:
 ./target/release/bolt-daemon --role answerer --signal rendezvous \
   --rendezvous-url ws://<rendezvous-ip>:3001 \
-  --room lan-test --peer-id bob --expect-peer alice
+  --room lan-test --session e2e-1 --peer-id bob --expect-peer alice
 ```
 
 ### Step 4: Verify
@@ -218,7 +218,21 @@ echo "=== Machine B ===" && ssh $MACHINE_B "tail -5 /tmp/bolt-spike/offerer.log"
 | `ICE candidate REJECTED (Lan)` | Tailscale/VPN active | Disable VPN during test |
 | `bad CPU type in executable` | Wrong architecture binary | Build locally on each machine, do not scp binaries |
 | `rendezvous server unreachable` | bolt-rendezvous not running | Start it, or use file mode |
-| `FATAL: --signal rendezvous requires --room` | Missing required flag | Add `--room`, `--to`/`--expect-peer` |
+| `FATAL: --signal rendezvous requires --room` | Missing required flag | Add `--room`, `--session`, `--to`/`--expect-peer` |
+| `FATAL: --signal rendezvous requires --session` | Missing required flag | Add `--session` (must match on both sides) |
+| `network_scope mismatch` | Peers disagree on scope | Use same `--network-scope` on both sides |
+
+## Local Regression (Single Machine)
+
+For quick single-machine regression testing (no manual scp, no SSH), use the
+automated E2E script:
+
+```bash
+bash scripts/e2e_rendezvous_local.sh
+```
+
+This starts bolt-rendezvous + offerer + answerer locally with rendezvous signaling,
+hello/ack handshake, and session matching. See `README.md` for details.
 
 ## Known Limitations
 

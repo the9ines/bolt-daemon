@@ -15,10 +15,11 @@ jobs:
         with:
           path: bolt-daemon
 
-      - name: Checkout bolt-rendezvous (sibling for E2E)
+      - name: Checkout bolt-rendezvous (pinned tag for deterministic E2E)
         uses: actions/checkout@v4
         with:
           repository: the9ines/bolt-rendezvous
+          ref: rendezvous-v0.0.3-ci
           path: bolt-rendezvous
 
       - name: Install stable toolchain

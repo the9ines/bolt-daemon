@@ -27,7 +27,16 @@ cargo build --manifest-path "$RENDEZVOUS_DIR/Cargo.toml" 2>&1
 echo "=== Building bolt-daemon ==="
 cargo build --manifest-path "$DAEMON_DIR/Cargo.toml" 2>&1
 
-RENDEZVOUS_BIN="$RENDEZVOUS_DIR/target/debug/bolt-rendezvous"
+# Discover rendezvous binary (handles crate rename history)
+if [ -x "$RENDEZVOUS_DIR/target/debug/bolt-rendezvous" ]; then
+    RENDEZVOUS_BIN="$RENDEZVOUS_DIR/target/debug/bolt-rendezvous"
+elif [ -x "$RENDEZVOUS_DIR/target/debug/localbolt-signal" ]; then
+    RENDEZVOUS_BIN="$RENDEZVOUS_DIR/target/debug/localbolt-signal"
+else
+    echo "FATAL: no rendezvous binary found in $RENDEZVOUS_DIR/target/debug/"
+    echo "Expected bolt-rendezvous or localbolt-signal"
+    exit 1
+fi
 DAEMON_BIN="$DAEMON_DIR/target/debug/bolt-daemon"
 
 LOG_DIR="/tmp/bolt-e2e-$$"

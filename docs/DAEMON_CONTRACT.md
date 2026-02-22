@@ -97,6 +97,21 @@ stderr. The daemon MUST NOT change these strings without a version bump.
 | `ICE candidate accepted` | Both modes | Candidate passed scope filter |
 | `ICE candidate REJECTED` | Both modes | Candidate blocked by scope filter |
 
+## Data Plane vs Control Plane
+
+bolt-daemon's architecture separates control plane from data plane:
+
+- **Control plane (signaling):** bolt-rendezvous relays opaque signaling
+  payloads (SDP, ICE candidates, hello/ack) between peers. It is coordination
+  infrastructure only. No file payload bytes transit the rendezvous server.
+- **Data plane (payload):** File payload bytes flow directly between peers
+  over a WebRTC DataChannel (P2P). In the default architecture, no payload
+  bytes traverse any server operated by us.
+
+This separation is by design. The rendezvous server is untrusted and sees
+only opaque signaling metadata. All encryption and payload integrity are
+enforced at the peer level by the Bolt protocol layer.
+
 ## Compatibility Contract
 
 - **payload_version**: MUST be `1`. Any other value is fatal (exit 1).

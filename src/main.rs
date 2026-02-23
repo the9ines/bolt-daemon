@@ -17,6 +17,7 @@
 
 mod ice_filter;
 mod rendezvous;
+mod smoke;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -73,6 +74,12 @@ pub(crate) enum SignalMode {
     Rendezvous,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum DaemonMode {
+    Default,
+    Smoke,
+}
+
 #[derive(Debug)]
 pub(crate) struct Args {
     pub(crate) role: Role,
@@ -87,6 +94,8 @@ pub(crate) struct Args {
     pub(crate) session: Option<String>,
     pub(crate) phase_timeout: Duration,
     pub(crate) network_scope: NetworkScope,
+    pub(crate) daemon_mode: DaemonMode,
+    pub(crate) smoke_config: smoke::SmokeConfig,
 }
 
 fn parse_args() -> Args {
@@ -103,6 +112,10 @@ fn parse_args() -> Args {
     let mut session = None;
     let mut phase_timeout_secs = None;
     let mut network_scope = None;
+    let mut daemon_mode = None;
+    let mut smoke_bytes = None;
+    let mut smoke_repeat = None;
+    let mut smoke_json = false;
 
     let mut i = 1;
     while i < argv.len() {
@@ -236,6 +249,40 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--mode" => {
+                i += 1;
+                daemon_mode = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("default") => DaemonMode::Default,
+                    Some("smoke") => DaemonMode::Smoke,
+                    other => {
+                        eprintln!("--mode must be 'default' or 'smoke', got {:?}", other);
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--bytes" => {
+                i += 1;
+                smoke_bytes = Some(match argv.get(i).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(b) if b > 0 => b,
+                    _ => {
+                        eprintln!("--bytes requires a positive integer");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--repeat" => {
+                i += 1;
+                smoke_repeat = Some(match argv.get(i).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(r) if r > 0 => r,
+                    _ => {
+                        eprintln!("--repeat requires a positive integer");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--json" => {
+                smoke_json = true;
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -285,6 +332,13 @@ fn parse_args() -> Args {
     let answer =
         answer.unwrap_or_else(|| SignalPath::File(format!("{}/answer.json", DEFAULT_SIGNAL_DIR)));
 
+    let daemon_mode = daemon_mode.unwrap_or(DaemonMode::Default);
+    let smoke_config = smoke::SmokeConfig {
+        bytes: smoke_bytes.unwrap_or(smoke::DEFAULT_BYTES),
+        repeat: smoke_repeat.unwrap_or(smoke::DEFAULT_REPEAT),
+        json: smoke_json,
+    };
+
     Args {
         role,
         offer_path: offer,
@@ -298,6 +352,8 @@ fn parse_args() -> Args {
         session,
         phase_timeout,
         network_scope: network_scope.unwrap_or(NetworkScope::Lan),
+        daemon_mode,
+        smoke_config,
     }
 }
 
@@ -724,33 +780,174 @@ fn run_answerer(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+// ── Smoke mode offerer (file signaling) ─────────────────────
+
+fn run_smoke_offerer(args: &Args) -> Result<(), smoke::SmokeError> {
+    eprintln!("[smoke-offerer] starting...");
+
+    clean_signal_file(&args.offer_path);
+    clean_signal_file(&args.answer_path);
+
+    let (mut pc, ch) = create_peer_connection(args.network_scope)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("peer connection: {}", e)))?;
+
+    let (dc_open_tx, dc_open_rx) = mpsc::channel();
+    let (dc_msg_tx, dc_msg_rx) = mpsc::channel();
+
+    let dc_handler = DcHandler {
+        open_tx: dc_open_tx,
+        msg_tx: dc_msg_tx,
+    };
+
+    let mut dc = pc
+        .create_data_channel(DC_LABEL, dc_handler)
+        .map_err(|e| smoke::SmokeError::DataChannel(format!("create DC: {}", e)))?;
+
+    let offer_bundle = collect_local_signal(&ch, args.phase_timeout)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("collect offer: {}", e)))?;
+    write_signal(&args.offer_path, &offer_bundle)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("write offer: {}", e)))?;
+
+    let answer_bundle = read_signal(&args.answer_path, "answer", args.phase_timeout)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("read answer: {}", e)))?;
+    apply_remote_signal(&mut pc, &answer_bundle, args.network_scope)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("apply answer: {}", e)))?;
+
+    dc_open_rx
+        .recv_timeout(args.phase_timeout)
+        .map_err(|_| smoke::SmokeError::DataChannel("DataChannel open timeout".to_string()))?;
+    eprintln!("[smoke-offerer] DataChannel open");
+
+    for run in 1..=args.smoke_config.repeat {
+        if args.smoke_config.repeat > 1 {
+            eprintln!("[smoke] run {}/{}", run, args.smoke_config.repeat);
+        }
+        let report =
+            smoke::run_smoke_sender(&mut dc, &dc_msg_rx, &args.smoke_config, args.phase_timeout)?;
+        report.print(args.smoke_config.json);
+    }
+
+    Ok(())
+}
+
+// ── Smoke mode answerer (file signaling) ────────────────────
+
+fn run_smoke_answerer(args: &Args) -> Result<(), smoke::SmokeError> {
+    eprintln!("[smoke-answerer] starting...");
+
+    let offer_bundle = read_signal(&args.offer_path, "offer", args.phase_timeout)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("read offer: {}", e)))?;
+
+    let (mut pc, ch) = create_peer_connection(args.network_scope)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("peer connection: {}", e)))?;
+
+    apply_remote_signal(&mut pc, &offer_bundle, args.network_scope)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("apply offer: {}", e)))?;
+
+    let answer_bundle = collect_local_signal(&ch, args.phase_timeout)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("collect answer: {}", e)))?;
+    write_signal(&args.answer_path, &answer_bundle)
+        .map_err(|e| smoke::SmokeError::Signaling(format!("write answer: {}", e)))?;
+
+    let mut dc = ch
+        .incoming_dc_rx
+        .recv_timeout(args.phase_timeout)
+        .map_err(|_| smoke::SmokeError::DataChannel("incoming DC timeout".to_string()))?;
+    eprintln!("[smoke-answerer] DataChannel received");
+
+    ch.dc_open_rx
+        .recv_timeout(args.phase_timeout)
+        .map_err(|_| smoke::SmokeError::DataChannel("DataChannel open timeout".to_string()))?;
+    eprintln!("[smoke-answerer] DataChannel open");
+
+    for run in 1..=args.smoke_config.repeat {
+        if args.smoke_config.repeat > 1 {
+            eprintln!("[smoke] run {}/{}", run, args.smoke_config.repeat);
+        }
+        let report = smoke::run_smoke_receiver(
+            &mut dc,
+            &ch.dc_msg_rx,
+            &args.smoke_config,
+            args.phase_timeout,
+        )?;
+        report.print(args.smoke_config.json);
+    }
+
+    // Give the ack time to flush before exit
+    thread::sleep(Duration::from_millis(500));
+
+    Ok(())
+}
+
 // ── Entry ───────────────────────────────────────────────────
 
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} timeout={}s",
         args.role,
         args.signal_mode,
         args.network_scope,
+        args.daemon_mode,
         args.phase_timeout.as_secs()
     );
 
-    let result = match (&args.role, &args.signal_mode) {
-        (Role::Offerer, SignalMode::File) => run_offerer(&args),
-        (Role::Answerer, SignalMode::File) => run_answerer(&args),
-        (Role::Offerer, SignalMode::Rendezvous) => rendezvous::run_offerer_rendezvous(&args),
-        (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(&args),
-    };
-
-    match result {
-        Ok(()) => {
-            eprintln!("[bolt-daemon] exit 0");
-            std::process::exit(0);
+    match args.daemon_mode {
+        DaemonMode::Default => {
+            let result = match (&args.role, &args.signal_mode) {
+                (Role::Offerer, SignalMode::File) => run_offerer(&args),
+                (Role::Answerer, SignalMode::File) => run_answerer(&args),
+                (Role::Offerer, SignalMode::Rendezvous) => {
+                    rendezvous::run_offerer_rendezvous(&args)
+                }
+                (Role::Answerer, SignalMode::Rendezvous) => {
+                    rendezvous::run_answerer_rendezvous(&args)
+                }
+            };
+            match result {
+                Ok(()) => {
+                    eprintln!("[bolt-daemon] exit 0");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[bolt-daemon] FATAL: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("[bolt-daemon] FATAL: {}", e);
-            std::process::exit(1);
+        DaemonMode::Smoke => {
+            let result = match (&args.role, &args.signal_mode) {
+                (Role::Offerer, SignalMode::File) => run_smoke_offerer(&args),
+                (Role::Answerer, SignalMode::File) => run_smoke_answerer(&args),
+                (Role::Offerer, SignalMode::Rendezvous) => {
+                    // Reuse rendezvous signaling, then smoke transfer
+                    // For now, rendezvous smoke delegates to file-like smoke
+                    // after the rendezvous handshake sets up the DataChannel.
+                    // Full rendezvous smoke requires modifying rendezvous.rs
+                    // which is forbidden. Use file mode or wrap externally.
+                    eprintln!("[smoke] rendezvous smoke not yet supported; use --signal file");
+                    std::process::exit(1);
+                }
+                (Role::Answerer, SignalMode::Rendezvous) => {
+                    eprintln!("[smoke] rendezvous smoke not yet supported; use --signal file");
+                    std::process::exit(1);
+                }
+            };
+            match result {
+                Ok(()) => {
+                    eprintln!("[bolt-daemon] exit 0");
+                    std::process::exit(smoke::EXIT_SUCCESS);
+                }
+                Err(e) => {
+                    let report = smoke::SmokeReport::failure(
+                        &e,
+                        args.smoke_config.bytes,
+                        args.smoke_config.repeat,
+                    );
+                    report.print(args.smoke_config.json);
+                    std::process::exit(e.exit_code());
+                }
+            }
         }
     }
 }

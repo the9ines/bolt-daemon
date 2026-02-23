@@ -224,6 +224,13 @@ impl SmokeReport {
     }
 }
 
+// ── Constants ───────────────────────────────────────────────
+
+/// Maximum bytes per DataChannel send. SCTP (used by WebRTC DataChannels)
+/// has a maximum message size; libdatachannel rejects sends above its limit
+/// with InvalidArg. 64 KiB is well under all known SCTP/WebRTC ceilings.
+const SEND_CHUNK_SIZE: usize = 65_536;
+
 // ── Smoke transfer execution ────────────────────────────────
 
 /// Classify a generic error into a SmokeError.
@@ -255,9 +262,11 @@ pub fn run_smoke_sender(
     eprintln!("[smoke] sending {} bytes...", config.bytes);
     let start = Instant::now();
 
-    // Send payload
-    dc.send(&payload)
-        .map_err(|e| SmokeError::DataChannel(format!("send failed: {}", e)))?;
+    // Send payload in chunks (SCTP has a max message size; single large sends fail)
+    for chunk in payload.chunks(SEND_CHUNK_SIZE) {
+        dc.send(chunk)
+            .map_err(|e| SmokeError::DataChannel(format!("send failed: {}", e)))?;
+    }
 
     // Wait for receiver's SHA-256 ack
     let ack = msg_rx

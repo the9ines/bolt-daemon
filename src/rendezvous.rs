@@ -352,6 +352,22 @@ fn wait_for_signal(
     }
 }
 
+// ── Smoke exchange context ──────────────────────────────────
+
+/// Narrow context passed to the exchange closure after rendezvous
+/// handshake and DataChannel open. Contains only what smoke mode needs.
+/// No rendezvous signaling handles or message types are exposed.
+pub(crate) struct SmokeDcContext<'a> {
+    pub dc: &'a mut datachannel::RtcDataChannel<crate::DcHandler>,
+    pub msg_rx: &'a std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Local peer ID (for reporting). Not used by smoke transfer functions.
+    #[allow(dead_code)]
+    pub peer_id: Option<&'a str>,
+    /// Remote peer ID (for reporting). Not used by smoke transfer functions.
+    #[allow(dead_code)]
+    pub expect_peer: Option<&'a str>,
+}
+
 // ── Entry points ────────────────────────────────────────────
 
 /// Offerer flow via rendezvous signaling.
@@ -680,6 +696,310 @@ pub fn run_answerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Er
         )
         .into())
     }
+}
+
+// ── Parameterized rendezvous session (smoke hook) ───────────
+
+/// Run the full rendezvous signaling flow (connect, hello/ack, offer/answer,
+/// DataChannel open), then hand control to `exchange` for the data phase.
+///
+/// This is the ONLY pub(crate) entry point for custom exchange logic over
+/// rendezvous. The existing `run_offerer_rendezvous` and `run_answerer_rendezvous`
+/// functions are untouched. No rendezvous internals are exposed.
+pub(crate) fn run_rendezvous_session_with_exchange<F>(
+    args: &crate::Args,
+    exchange: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(SmokeDcContext<'a>) -> Result<(), Box<dyn std::error::Error>>,
+{
+    match &args.role {
+        crate::Role::Offerer => offerer_with_exchange(args, exchange),
+        crate::Role::Answerer => answerer_with_exchange(args, exchange),
+    }
+}
+
+/// Offerer flow with custom exchange. Identical to `run_offerer_rendezvous`
+/// except the DataChannel data phase is delegated to `exchange`.
+fn offerer_with_exchange<F>(
+    args: &crate::Args,
+    exchange: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(SmokeDcContext<'a>) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let room = args
+        .room
+        .as_ref()
+        .ok_or("BUG: --room required for rendezvous mode")?;
+    let to_peer = args
+        .to_peer
+        .as_ref()
+        .ok_or("BUG: --to required for offerer rendezvous mode")?;
+    let session = args
+        .session
+        .as_ref()
+        .ok_or("BUG: --session required for rendezvous mode")?;
+    let peer_id = args.peer_id.clone().unwrap_or_else(generate_peer_id);
+
+    eprintln!(
+        "[offerer] rendezvous mode: room='{}', session='{}', peer_id='{}', to='{}'",
+        room, session, peer_id, to_peer
+    );
+
+    let deadline = Instant::now() + args.phase_timeout;
+    let mut ws = connect_and_register(&args.rendezvous_url, &peer_id)?;
+
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
+
+    let (dc_open_tx, dc_open_rx) = mpsc::channel();
+    let (dc_msg_tx, dc_msg_rx) = mpsc::channel();
+
+    let dc_handler = crate::DcHandler {
+        open_tx: dc_open_tx,
+        msg_tx: dc_msg_tx,
+    };
+
+    let mut dc = pc.create_data_channel(crate::DC_LABEL, dc_handler)?;
+    eprintln!("[offerer] DataChannel '{}' created", crate::DC_LABEL);
+
+    // Hello/ack handshake with retry (identical to run_offerer_rendezvous)
+    let hello_payload = SignalPayload {
+        payload_version: PAYLOAD_VERSION,
+        session: session.clone(),
+        room: room.clone(),
+        msg_type: "hello".to_string(),
+        bundle: None,
+        from_peer: Some(peer_id.clone()),
+        to_peer: Some(to_peer.clone()),
+        network_scope: Some(scope_to_str(args.network_scope).to_string()),
+        phase_timeout_secs: Some(args.phase_timeout.as_secs()),
+    };
+
+    let mut backoff = Duration::from_millis(100);
+    let max_backoff = Duration::from_secs(1);
+
+    let ack = loop {
+        send_signal(&mut ws, to_peer, &hello_payload)?;
+
+        match wait_for_signal(&mut ws, deadline, to_peer, room, session, "ack") {
+            Ok(ack) => break ack,
+            Err(e) => {
+                let msg = e.to_string();
+                let server_msg = msg
+                    .strip_prefix("rendezvous server error: ")
+                    .unwrap_or(&msg);
+                if is_retryable_peer_not_found(server_msg, to_peer) {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out waiting for peer '{}' to register",
+                            to_peer
+                        )
+                        .into());
+                    }
+                    eprintln!(
+                        "[rendezvous] hello retry: target '{}' not registered yet",
+                        to_peer
+                    );
+                    thread::sleep(backoff);
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    // Validate ack fields
+    if let Some(ref from) = ack.from_peer {
+        if from != to_peer {
+            return Err(format!(
+                "ack from_peer mismatch: expected '{}', got '{}'",
+                to_peer, from
+            )
+            .into());
+        }
+    }
+    if let Some(ref to) = ack.to_peer {
+        if to != &peer_id {
+            return Err(
+                format!("ack to_peer mismatch: expected '{}', got '{}'", peer_id, to).into(),
+            );
+        }
+    }
+
+    eprintln!("[rendezvous] hello/ack complete — session '{}'", session);
+
+    // Offer/answer exchange
+    let offer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
+
+    let offer_payload = SignalPayload {
+        payload_version: PAYLOAD_VERSION,
+        session: session.clone(),
+        room: room.clone(),
+        msg_type: "offer".to_string(),
+        bundle: Some(offer_bundle),
+        from_peer: None,
+        to_peer: None,
+        network_scope: None,
+        phase_timeout_secs: None,
+    };
+    send_signal(&mut ws, to_peer, &offer_payload)?;
+
+    let answer_sp = wait_for_signal(&mut ws, deadline, to_peer, room, session, "answer")?;
+    let answer_bundle = answer_sp.bundle.ok_or("answer signal missing bundle")?;
+
+    apply_remote_signal(&mut pc, &answer_bundle, args.network_scope)?;
+
+    // Wait for DataChannel open
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("phase timeout expired waiting for DataChannel open")?;
+    dc_open_rx.recv_timeout(remaining)?;
+    eprintln!("[offerer] DataChannel open");
+
+    // Hand off to exchange closure
+    let ctx = SmokeDcContext {
+        dc: &mut dc,
+        msg_rx: &dc_msg_rx,
+        peer_id: Some(&peer_id),
+        expect_peer: Some(to_peer),
+    };
+    exchange(ctx)
+}
+
+/// Answerer flow with custom exchange. Identical to `run_answerer_rendezvous`
+/// except the DataChannel data phase is delegated to `exchange`.
+fn answerer_with_exchange<F>(
+    args: &crate::Args,
+    exchange: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(SmokeDcContext<'a>) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let room = args
+        .room
+        .as_ref()
+        .ok_or("BUG: --room required for rendezvous mode")?;
+    let expect_peer = args
+        .expect_peer
+        .as_ref()
+        .ok_or("BUG: --expect-peer required for answerer rendezvous mode")?;
+    let session = args
+        .session
+        .as_ref()
+        .ok_or("BUG: --session required for rendezvous mode")?;
+    let peer_id = args.peer_id.clone().unwrap_or_else(generate_peer_id);
+
+    eprintln!(
+        "[answerer] rendezvous mode: room='{}', session='{}', peer_id='{}', expect-peer='{}'",
+        room, session, peer_id, expect_peer
+    );
+
+    let deadline = Instant::now() + args.phase_timeout;
+    let mut ws = connect_and_register(&args.rendezvous_url, &peer_id)?;
+
+    // Hello/ack handshake (identical to run_answerer_rendezvous)
+    let hello = wait_for_signal(&mut ws, deadline, expect_peer, room, session, "hello")?;
+
+    // Validate hello fields
+    if let Some(ref from) = hello.from_peer {
+        if from != expect_peer {
+            return Err(format!(
+                "hello from_peer mismatch: expected '{}', got '{}'",
+                expect_peer, from
+            )
+            .into());
+        }
+    }
+    if let Some(ref to) = hello.to_peer {
+        if to != &peer_id {
+            return Err(format!(
+                "hello to_peer mismatch: expected '{}', got '{}'",
+                peer_id, to
+            )
+            .into());
+        }
+    }
+    let local_scope_str = scope_to_str(args.network_scope);
+    if let Some(ref remote_scope) = hello.network_scope {
+        if remote_scope != local_scope_str {
+            return Err(format!(
+                "network_scope mismatch: remote='{}' local='{}'",
+                remote_scope, local_scope_str
+            )
+            .into());
+        }
+    }
+
+    // Send ack
+    let ack_payload = SignalPayload {
+        payload_version: PAYLOAD_VERSION,
+        session: session.clone(),
+        room: room.clone(),
+        msg_type: "ack".to_string(),
+        bundle: None,
+        from_peer: Some(peer_id.clone()),
+        to_peer: Some(expect_peer.clone()),
+        network_scope: None,
+        phase_timeout_secs: None,
+    };
+    send_signal(&mut ws, expect_peer, &ack_payload)?;
+
+    eprintln!("[rendezvous] hello/ack complete — session '{}'", session);
+
+    // Offer/answer exchange
+    let offer_sp = wait_for_signal(&mut ws, deadline, expect_peer, room, session, "offer")?;
+    let offer_bundle = offer_sp.bundle.ok_or("offer signal missing bundle")?;
+
+    let (mut pc, ch) = create_peer_connection(args.network_scope)?;
+
+    apply_remote_signal(&mut pc, &offer_bundle, args.network_scope)?;
+
+    let answer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
+
+    let answer_payload = SignalPayload {
+        payload_version: PAYLOAD_VERSION,
+        session: session.clone(),
+        room: room.clone(),
+        msg_type: "answer".to_string(),
+        bundle: Some(answer_bundle),
+        from_peer: None,
+        to_peer: None,
+        network_scope: None,
+        phase_timeout_secs: None,
+    };
+    send_signal(&mut ws, expect_peer, &answer_payload)?;
+
+    // Wait for incoming DataChannel
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("phase timeout expired waiting for incoming DataChannel")?;
+    let mut dc = ch.incoming_dc_rx.recv_timeout(remaining)?;
+    eprintln!("[answerer] DataChannel received");
+
+    // Wait for DC to open
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("phase timeout expired waiting for DataChannel open")?;
+    ch.dc_open_rx.recv_timeout(remaining)?;
+    eprintln!("[answerer] DataChannel open");
+
+    // Hand off to exchange closure
+    let ctx = SmokeDcContext {
+        dc: &mut dc,
+        msg_rx: &ch.dc_msg_rx,
+        peer_id: Some(&peer_id),
+        expect_peer: Some(expect_peer),
+    };
+    let result = exchange(ctx);
+
+    // Answerer drain sleep (same as default mode)
+    if result.is_ok() {
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    result
 }
 
 // ── Tests ───────────────────────────────────────────────────

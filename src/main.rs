@@ -879,6 +879,35 @@ fn run_smoke_answerer(args: &Args) -> Result<(), smoke::SmokeError> {
     Ok(())
 }
 
+// ── Smoke mode rendezvous (via narrow hook) ─────────────────
+
+fn run_smoke_rendezvous(args: &Args) -> Result<(), smoke::SmokeError> {
+    let is_offerer = matches!(args.role, Role::Offerer);
+    rendezvous::run_rendezvous_session_with_exchange(args, |ctx| {
+        for run in 1..=args.smoke_config.repeat {
+            if args.smoke_config.repeat > 1 {
+                eprintln!("[smoke] run {}/{}", run, args.smoke_config.repeat);
+            }
+            let report = if is_offerer {
+                smoke::run_smoke_sender(ctx.dc, ctx.msg_rx, &args.smoke_config, args.phase_timeout)?
+            } else {
+                smoke::run_smoke_receiver(
+                    ctx.dc,
+                    ctx.msg_rx,
+                    &args.smoke_config,
+                    args.phase_timeout,
+                )?
+            };
+            report.print(args.smoke_config.json);
+        }
+        Ok(())
+    })
+    .map_err(|e| match e.downcast::<smoke::SmokeError>() {
+        Ok(smoke_err) => *smoke_err,
+        Err(e) => smoke::classify_error(e.as_ref()),
+    })
+}
+
 // ── Entry ───────────────────────────────────────────────────
 
 fn main() {
@@ -919,19 +948,8 @@ fn main() {
             let result = match (&args.role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_smoke_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_smoke_answerer(&args),
-                (Role::Offerer, SignalMode::Rendezvous) => {
-                    // Reuse rendezvous signaling, then smoke transfer
-                    // For now, rendezvous smoke delegates to file-like smoke
-                    // after the rendezvous handshake sets up the DataChannel.
-                    // Full rendezvous smoke requires modifying rendezvous.rs
-                    // which is forbidden. Use file mode or wrap externally.
-                    eprintln!("[smoke] rendezvous smoke not yet supported; use --signal file");
-                    std::process::exit(1);
-                }
-                (Role::Answerer, SignalMode::Rendezvous) => {
-                    eprintln!("[smoke] rendezvous smoke not yet supported; use --signal file");
-                    std::process::exit(1);
-                }
+                (Role::Offerer, SignalMode::Rendezvous)
+                | (Role::Answerer, SignalMode::Rendezvous) => run_smoke_rendezvous(&args),
             };
             match result {
                 Ok(()) => {
@@ -1022,5 +1040,32 @@ mod tests {
         // NetworkScope default is Lan — verified by parse_args() defaulting to Lan
         assert_eq!(NetworkScope::Lan, NetworkScope::Lan);
         assert_ne!(NetworkScope::Lan, NetworkScope::Global);
+    }
+
+    #[test]
+    fn smoke_error_downcast_from_box() {
+        // Verifies the downcast path used by run_smoke_rendezvous
+        let err: Box<dyn std::error::Error> =
+            Box::new(smoke::SmokeError::Signaling("test".to_string()));
+        let result = err.downcast::<smoke::SmokeError>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().exit_code(), smoke::EXIT_SIGNALING_FAILURE);
+    }
+
+    #[test]
+    fn smoke_error_classify_rendezvous_error() {
+        // Verifies the classify_error fallback for non-SmokeError Box<dyn Error>
+        let err: Box<dyn std::error::Error> =
+            "rendezvous server unreachable at ws://127.0.0.1:3001".into();
+        let smoke_err = smoke::classify_error(err.as_ref());
+        assert_eq!(smoke_err.exit_code(), smoke::EXIT_SIGNALING_FAILURE);
+    }
+
+    #[test]
+    fn smoke_error_classify_timeout_error() {
+        // Verifies the classify_error fallback for timeout errors
+        let err: Box<dyn std::error::Error> = "timed out waiting for peer".into();
+        let smoke_err = smoke::classify_error(err.as_ref());
+        assert_eq!(smoke_err.exit_code(), smoke::EXIT_TIMEOUT);
     }
 }

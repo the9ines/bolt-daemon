@@ -1,180 +1,212 @@
 # Two-Machine Smoke Test (Rendezvous Signaling)
 
-Reproduce the bolt-daemon WebRTC DataChannel exchange between two physical
-machines using rendezvous signaling via bolt-rendezvous.
-This procedure assumes the [DAEMON_CONTRACT.md](DAEMON_CONTRACT.md) surface.
+Operator guide for running bolt-daemon's smoke validation mode (`--mode smoke`)
+between two physical machines using rendezvous signaling via bolt-rendezvous.
+
+Smoke mode transfers a deterministic payload over the DataChannel, verifies
+SHA-256 integrity on both sides, and reports latency/throughput with structured
+exit codes. This replaces the default HELLO_PAYLOAD exchange with a configurable,
+integrity-verified transfer.
 
 ## Prerequisites
 
-Both machines need:
+**Software (both machines):**
 
 - Rust stable toolchain (1.70+)
 - CMake (for vendored libdatachannel build)
 - Xcode Command Line Tools (macOS) or build-essential (Linux)
-- Network connectivity between machines (same LAN, Tailscale, or public)
 
-## Pinned Pairing
+**Network:**
 
-Use these exact tags for reproducibility:
+- Connectivity between machines (same LAN, Tailscale, or public)
+- bolt-rendezvous server running and reachable from both machines
 
-| Component | Tag | Commit |
-|-----------|-----|--------|
-| bolt-daemon | `daemon-v0.0.10-ci-pin` | `f9c8f95` |
-| bolt-rendezvous | `rendezvous-v0.0.3-ci` | `a9c496e` |
+**Code:**
 
-## Setup
+- bolt-daemon at `daemon-v0.1.3-smoke-rendezvous` or later (Phase 4L+ merged)
+- bolt-rendezvous at `rendezvous-v0.0.3-ci` or later
 
-### Machine A (runs rendezvous server + one daemon peer)
+Without Phase 4L+, `--mode smoke --signal rendezvous` exits 1 with
+"not yet supported."
+
+## Required Flags
+
+Both peers must agree on all shared parameters. Mismatch causes a fatal
+exit or silent ignore.
+
+| Flag | Offerer | Answerer | Must Match |
+|------|---------|----------|------------|
+| `--role` | `offerer` | `answerer` | N/A |
+| `--signal` | `rendezvous` | `rendezvous` | yes |
+| `--mode` | `smoke` | `smoke` | yes |
+| `--rendezvous-url` | `ws://IP:3001` | `ws://IP:3001` | yes |
+| `--room` | same string | same string | yes |
+| `--session` | same string | same string | yes |
+| `--network-scope` | `lan\|overlay\|global` | same value | yes (fatal on mismatch) |
+| `--bytes` | same value | same value | yes |
+| `--peer-id` | unique ID | unique ID | distinct |
+| `--to` | answerer's peer-id | N/A | N/A |
+| `--expect-peer` | N/A | offerer's peer-id | N/A |
+| `--phase-timeout-secs` | per-peer | per-peer | independent |
+| `--repeat` | per-peer | per-peer | must match |
+| `--json` | optional | optional | independent |
+
+## Recommended Defaults
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `--bytes` | 1048576 (1 MiB) | Counter-based deterministic payload |
+| `--repeat` | 1 | Number of send/verify cycles |
+| `--phase-timeout-secs` | 30 | Use 300 for manual two-machine tests |
+| `--room` | `test` | Any string, must match |
+| `--json` | off | Add for machine-parseable output |
+
+## Exit Codes
+
+| Code | Meaning | Both peers must exit 0 for PASS |
+|------|---------|---------------------------------|
+| 0 | Success — SHA-256 verified, transfer complete | |
+| 1 | Signaling failure (rendezvous unreachable, registration failed) | |
+| 2 | DataChannel failure (open timeout, send error) | |
+| 3 | Integrity mismatch (SHA-256 of received payload differs from expected) | |
+| 4 | Timeout (transfer or ack timed out) | |
+
+## Quick Start
+
+### 1. Start the rendezvous server (Machine A)
 
 ```bash
-cd ~/Desktop/the9ines.com/bolt-ecosystem
-
-# Ensure rendezvous is at the pinned tag
-cd bolt-rendezvous
-git fetch --tags
-git checkout rendezvous-v0.0.3-ci
-cargo build
-
-# Start rendezvous server (foreground, port 3001)
+cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-rendezvous
 cargo run
 ```
 
-Leave the server running. Open a second terminal on Machine A.
+Leave running. Open a second terminal.
 
-### Machine B (runs the other daemon peer)
+### 2. Start answerer (Machine A, second terminal)
 
-```bash
-# Clone repos if not already present
-git clone https://github.com/the9ines/bolt-daemon.git
-git clone https://github.com/the9ines/bolt-rendezvous.git  # not needed for running, but for reference
+Replace `MACHINE_A_IP` with Machine A's actual IP (LAN: `192.168.x.x`,
+overlay: `100.x.y.z`, global: public IP).
 
-cd bolt-daemon
-git fetch --tags
-git checkout daemon-v0.0.10-ci-pin
-cargo build
-```
-
-## Test Commands
-
-Replace `MACHINE_A_IP` with the actual IP of Machine A:
-- LAN: use the private IP (e.g., `192.168.1.100`)
-- Overlay: use the Tailscale IP (e.g., `100.x.y.z`)
-- Global: use the public IP
-
-### A) LAN Scope
-
-Machine A (answerer):
 ```bash
 cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-daemon
-cargo run -- --role answerer --signal rendezvous \
+cargo run -- --role answerer --signal rendezvous --mode smoke \
   --rendezvous-url ws://MACHINE_A_IP:3001 \
-  --room smoke --session smoke-lan-001 \
-  --peer-id mac-studio --expect-peer macbook \
-  --network-scope lan --phase-timeout-secs 300
+  --room test --session smoke-lan-001 \
+  --peer-id bob --expect-peer alice \
+  --network-scope lan --bytes 1048576 --phase-timeout-secs 300
 ```
 
-Machine B (offerer):
+### 3. Start offerer (Machine B)
+
 ```bash
 cd bolt-daemon
-cargo run -- --role offerer --signal rendezvous \
+cargo run -- --role offerer --signal rendezvous --mode smoke \
   --rendezvous-url ws://MACHINE_A_IP:3001 \
-  --room smoke --session smoke-lan-001 \
-  --peer-id macbook --to mac-studio \
-  --network-scope lan --phase-timeout-secs 300
+  --room test --session smoke-lan-001 \
+  --peer-id alice --to bob \
+  --network-scope lan --bytes 1048576 --phase-timeout-secs 300
 ```
 
-### B) Overlay Scope (Tailscale / CGNAT)
+### 4. Verify
 
-Both machines must have Tailscale running. Use the Tailscale IP of Machine A.
+Both peers should print a smoke report and exit 0:
 
-Machine A (answerer):
+```
+[smoke] handshake .......... OK
+[smoke] data channel ....... OK
+[smoke] transferred ........ 1048576 bytes
+[smoke] sha256 ............. OK (2c26b46b04e10182...)
+[smoke] latency ............ 42 ms
+[smoke] throughput ......... 23.8 MB/s
+[smoke] result ............. PASS
+```
+
+With `--json`:
+
+```json
+{
+  "mode": "smoke",
+  "handshake": true,
+  "data_channel": true,
+  "bytes": 1048576,
+  "sha256_expected": "2c26b46b04e10182...",
+  "sha256_received": "2c26b46b04e10182...",
+  "sha256_match": true,
+  "latency_ms": 42,
+  "throughput_mbps": 23.8,
+  "repeat": 1,
+  "result": "PASS",
+  "error": null
+}
+```
+
+## Command Generator
+
+Use the helper script to generate copy/paste commands for any configuration:
+
 ```bash
-cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-daemon
-cargo run -- --role answerer --signal rendezvous \
-  --rendezvous-url ws://100.x.y.z:3001 \
-  --room smoke --session smoke-overlay-001 \
-  --peer-id mac-studio --expect-peer macbook \
-  --network-scope overlay --phase-timeout-secs 300
+bash scripts/print_two_machine_smoke_commands.sh \
+  --network-scope lan \
+  --session smoke-lan-001 \
+  --rendezvous-url ws://192.168.1.100:3001 \
+  --bytes 1048576
 ```
 
-Machine B (offerer):
+See `scripts/print_two_machine_smoke_commands.sh --help` for all options.
+
+## Local Validation (Same Machine)
+
+For same-machine testing before a two-machine run:
+
 ```bash
-cd bolt-daemon
-cargo run -- --role offerer --signal rendezvous \
-  --rendezvous-url ws://100.x.y.z:3001 \
-  --room smoke --session smoke-overlay-001 \
-  --peer-id macbook --to mac-studio \
-  --network-scope overlay --phase-timeout-secs 300
+bash scripts/e2e_rendezvous_smoke_local.sh
 ```
 
-### C) Global Scope
+This starts bolt-rendezvous + two daemon peers on localhost and verifies
+both exit 0 with SHA-256 integrity.
 
-Accepts all valid IPs including public. Use Machine A's routable IP.
+## Network Scope Reference
 
-Machine A (answerer):
-```bash
-cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-daemon
-cargo run -- --role answerer --signal rendezvous \
-  --rendezvous-url ws://MACHINE_A_IP:3001 \
-  --room smoke --session smoke-global-001 \
-  --peer-id mac-studio --expect-peer macbook \
-  --network-scope global --phase-timeout-secs 300
-```
+| Scope | ICE candidates accepted | Use case |
+|-------|------------------------|----------|
+| `lan` | Private IPs only (192.168.x, 10.x, 172.16-31.x, link-local) | Same LAN |
+| `overlay` | Private + CGNAT 100.64/10 (Tailscale, ZeroTier) | VPN mesh |
+| `global` | All valid IPs including public | Direct public connectivity |
 
-Machine B (offerer):
-```bash
-cd bolt-daemon
-cargo run -- --role offerer --signal rendezvous \
-  --rendezvous-url ws://MACHINE_A_IP:3001 \
-  --room smoke --session smoke-global-001 \
-  --peer-id macbook --to mac-studio \
-  --network-scope global --phase-timeout-secs 300
-```
-
-**Note:** Global scope accepts public IPs. No STUN/TURN is configured by
-default, so this only works when both machines can reach each other directly.
-For NAT traversal, STUN/TURN integration is required (not yet implemented).
+Global scope requires direct reachability (no STUN/TURN configured).
 
 ## Session Naming Convention
 
 Use descriptive, unique session strings to prevent cross-talk:
 
 ```
-<scope>-<purpose>-<NNN>
+smoke-<scope>-<NNN>
 ```
 
-Examples: `smoke-lan-001`, `smoke-overlay-002`, `debug-global-005`
+Examples: `smoke-lan-001`, `smoke-overlay-002`, `smoke-global-005`
 
-Increment the suffix for each test run. Two daemon instances with different
-`--session` values silently ignore each other's signals.
+Increment the suffix for each test run. Peers with different `--session`
+values silently ignore each other's signals (non-fatal, continues waiting).
 
-## Success Criteria
+## Default Mode (Non-Smoke)
 
-Both peers must:
+The daemon also supports default mode (`--mode default`, the default) which
+exchanges a 13-byte `bolt-hello-v1` payload without SHA-256 verification.
+For default mode two-machine testing, use:
 
-1. Print `hello/ack complete` with the matching session
-2. Print `DataChannel open`
-3. Print `SUCCESS` and exit 0
+- `scripts/print_two_machine_commands.sh` (command generator)
+- `scripts/e2e_rendezvous_local.sh` (local E2E)
 
-Example offerer output:
-```
-[offerer] rendezvous mode: room='smoke', session='smoke-lan-001', peer_id='macbook', to='mac-studio'
-[rendezvous] received 'ack' signal from 'mac-studio'
-[rendezvous] hello/ack complete — session 'smoke-lan-001'
-[rendezvous] received 'answer' signal from 'mac-studio'
-[offerer] DataChannel open
-[offerer] SUCCESS — received matching payload
-```
+Default mode has a single exit code: 0 (success) or 1 (any failure).
 
 ## Troubleshooting
 
 ### macOS Firewall Blocks Rebuilt Binary
 
 macOS asks "allow incoming connections?" each time you rebuild. If the dialog
-was dismissed or denied, the binary is silently blocked. Fix:
+was dismissed or denied, the binary is silently blocked.
 
 ```bash
-# Remove the firewall rule for the old binary, rebuild, and re-allow
 cargo build
 # macOS will prompt again — click Allow
 ```
@@ -187,7 +219,7 @@ The offerer retries hello automatically (100ms backoff, up to 1s) if the
 answerer hasn't registered yet. Start the answerer first. If it persists:
 
 - Verify both peers use the same `--rendezvous-url`
-- Verify the `--peer-id` on one machine matches `--to` or `--expect-peer` on the other
+- Verify `--peer-id` on one machine matches `--to` or `--expect-peer` on the other
 - Check that the rendezvous server is running and reachable
 
 ### Signals Ignored (Session Mismatch)
@@ -208,16 +240,32 @@ network_scope mismatch: remote='overlay' local='lan'
 
 Fix: both peers must use the same `--network-scope` value.
 
+### Exit Code 3 (Integrity Mismatch)
+
+Symptom: one peer reports `sha256_match: false` and exits 3.
+
+This indicates data corruption during transfer. Check:
+- Both peers use the same `--bytes` value
+- No proxy or middlebox is modifying WebRTC traffic
+- Try a smaller `--bytes` value to isolate
+
+### Exit Code 4 (Timeout)
+
+Symptom: peer exits 4 after receiving partial data.
+
+- Increase `--phase-timeout-secs`
+- Check network bandwidth between machines
+- Try a smaller `--bytes` value
+
 ### Port 3001 Already in Use
 
 ```bash
-# Find what's using port 3001
 lsof -i :3001    # macOS
 ss -tlnp | grep 3001  # Linux
 
-# Kill it or use a different port
+# Use a different port
 cargo run -- --port 3002   # rendezvous server
-# Then update --rendezvous-url ws://...:3002 on both peers
+# Update --rendezvous-url ws://...:3002 on both peers
 ```
 
 ### Tailscale Not Routing (Overlay Scope)
@@ -225,9 +273,4 @@ cargo run -- --port 3002   # rendezvous server
 - Verify Tailscale is running: `tailscale status`
 - Verify both machines can ping each other's Tailscale IP
 - The rendezvous server must bind `0.0.0.0` (default) to accept Tailscale connections
-- If ICE candidates are rejected, verify `--network-scope overlay` is set on both peers
-
-### Phase Timeout Expired
-
-Default timeout is 30 seconds. For manual two-machine tests where you need
-time to start the second peer, use `--phase-timeout-secs 300` (5 minutes).
+- Verify `--network-scope overlay` is set on both peers

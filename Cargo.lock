@@ -52,6 +52,7 @@ version = "0.0.1"
 dependencies = [
  "datachannel",
  "hex",
+ "rand",
  "serde",
  "serde_json",
  "sha2",

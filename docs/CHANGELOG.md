@@ -2,6 +2,22 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## NATIVE-1 — Adopt Rust bolt-core (b3ebb85)
+
+Replaces local `sha2` + `hex` crate usage in `smoke.rs` with canonical
+`bolt_core::hash::sha256_hex`. Removes direct `sha2` and `hex` dependencies.
+bolt-core is now a path dependency (`../bolt-core-sdk/rust/bolt-core`).
+
+### Changed
+- `Cargo.toml` — added `bolt-core` path dependency, removed `sha2 = "0.10"`
+  and `hex = "0.4"`.
+- `src/smoke.rs` — `sha256_hex()` now delegates to `bolt_core::hash::sha256_hex`.
+  Removed `use sha2::{Digest, Sha256}`.
+
+### Tests
+- 94 tests (79 main + 15 relay). Added `sha256_hex_matches_bolt_core_canonical`
+  adoption test.
+
 ## Phase A2 — Consume bolt-rendezvous-protocol (276b5ad)
 
 Replaces inline `ClientMsg`, `ServerMsg`, `PeerInfo` definitions with

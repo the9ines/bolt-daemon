@@ -2,6 +2,25 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## Phase A2 — Consume bolt-rendezvous-protocol (276b5ad)
+
+Replaces inline `ClientMsg`, `ServerMsg`, `PeerInfo` definitions with
+canonical types from `bolt-rendezvous-protocol` crate. Zero wire format
+changes. Zero new transitive dependencies (serde + serde_json already
+present).
+
+### Changed
+- `Cargo.toml` — added git dependency: `bolt-rendezvous-protocol`
+  pinned to `rendezvous-protocol-v0.1.0` tag.
+- `src/rendezvous.rs` — removed `ClientMsg`, `ServerMsg`, `PeerInfo`
+  inline definitions. Imports `ClientMessage`, `ServerMessage`,
+  `PeerData`, `DeviceType` from `bolt_rendezvous_protocol`.
+  `device_type: "desktop".to_string()` → `device_type: DeviceType::Desktop`.
+  `SignalPayload` stays local (daemon-specific).
+
+### Tests
+- 93 tests (78 main + 15 relay). No test changes (wire format preserved).
+
 ## daemon-v0.0.9-rendezvous-hello-retry (0d7658e)
 
 Phase 3G — Rendezvous session + hello/ack handshake + hello retry.

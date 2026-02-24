@@ -50,6 +50,7 @@ dependencies = [
 name = "bolt-daemon"
 version = "0.0.1"
 dependencies = [
+ "bolt-rendezvous-protocol",
  "datachannel",
  "hex",
  "rand",
@@ -58,6 +59,15 @@ dependencies = [
  "sha2",
  "tungstenite",
  "webrtc-sdp",
+]
+
+[[package]]
+name = "bolt-rendezvous-protocol"
+version = "0.1.0"
+source = "git+https://github.com/the9ines/bolt-rendezvous.git?tag=rendezvous-protocol-v0.1.0#68befd7efb160064cd6793edbc9af152413455fe"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

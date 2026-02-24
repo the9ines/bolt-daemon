@@ -14,6 +14,7 @@ name = "bolt-relay"
 path = "src/relay_main.rs"
 
 [dependencies]
+bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-protocol-v0.1.0", package = "bolt-rendezvous-protocol" }
 datachannel = { version = "0.16", features = ["vendored"] }
 webrtc-sdp = "0.3"
 serde = { version = "1", features = ["derive"] }

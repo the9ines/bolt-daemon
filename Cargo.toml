@@ -14,14 +14,13 @@ name = "bolt-relay"
 path = "src/relay_main.rs"
 
 [dependencies]
+bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-protocol-v0.1.0", package = "bolt-rendezvous-protocol" }
 datachannel = { version = "0.16", features = ["vendored"] }
 webrtc-sdp = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.24"
-sha2 = "0.10"
-hex = "0.4"
 rand = "0.8"
 
 [profile.dev]

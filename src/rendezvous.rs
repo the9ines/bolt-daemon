@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bolt_rendezvous_protocol::{ClientMessage, DeviceType, ServerMessage};
 use serde::{Deserialize, Serialize};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -28,61 +29,6 @@ use crate::{
 
 /// Current payload version. Reject any payload with a different version.
 const PAYLOAD_VERSION: u32 = 1;
-
-// ── Protocol message types ──────────────────────────────────
-// Mirrors bolt-rendezvous/src/protocol.rs
-
-/// Client → Server messages.
-#[derive(Serialize, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)]
-enum ClientMsg {
-    Register {
-        peer_code: String,
-        device_name: String,
-        device_type: String,
-    },
-    Signal {
-        to: String,
-        payload: serde_json::Value,
-    },
-    Ping,
-}
-
-/// Server → Client messages.
-#[derive(Deserialize, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMsg {
-    Peers {
-        #[allow(dead_code)]
-        peers: Vec<PeerInfo>,
-    },
-    PeerJoined {
-        #[allow(dead_code)]
-        peer: PeerInfo,
-    },
-    PeerLeft {
-        #[allow(dead_code)]
-        peer_code: String,
-    },
-    Signal {
-        from: String,
-        payload: serde_json::Value,
-    },
-    Error {
-        message: String,
-    },
-}
-
-#[derive(Deserialize, Debug)]
-struct PeerInfo {
-    #[allow(dead_code)]
-    peer_code: String,
-    #[allow(dead_code)]
-    device_name: String,
-    #[allow(dead_code)]
-    device_type: String,
-}
 
 /// Our inner payload format (inside the opaque `payload` field).
 /// All msg_types use this struct. Optional fields are present/absent depending on msg_type:
@@ -154,10 +100,10 @@ fn connect_and_register(url: &str, peer_id: &str) -> Result<WsStream, Box<dyn st
 
     eprintln!("[rendezvous] connected, registering as '{}'", peer_id);
 
-    let register = ClientMsg::Register {
+    let register = ClientMessage::Register {
         peer_code: peer_id.to_string(),
         device_name: "bolt-daemon".to_string(),
-        device_type: "desktop".to_string(),
+        device_type: DeviceType::Desktop,
     };
     let json = serde_json::to_string(&register)?;
     ws.send(Message::Text(json))?;
@@ -167,13 +113,13 @@ fn connect_and_register(url: &str, peer_id: &str) -> Result<WsStream, Box<dyn st
     let text = msg
         .into_text()
         .map_err(|e| format!("expected text from server: {}", e))?;
-    let server_msg: ServerMsg = serde_json::from_str(&text)?;
+    let server_msg: ServerMessage = serde_json::from_str(&text)?;
 
     match server_msg {
-        ServerMsg::Peers { .. } => {
+        ServerMessage::Peers { .. } => {
             eprintln!("[rendezvous] registered successfully");
         }
-        ServerMsg::Error { message } => {
+        ServerMessage::Error { message } => {
             return Err(format!("rendezvous registration failed: {}", message).into());
         }
         other => {
@@ -194,7 +140,7 @@ fn send_signal(
     payload: &SignalPayload,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload_value = serde_json::to_value(payload)?;
-    let msg = ClientMsg::Signal {
+    let msg = ClientMessage::Signal {
         to: to.to_string(),
         payload: payload_value,
     };
@@ -210,7 +156,7 @@ fn send_signal(
 fn recv_with_deadline(
     ws: &mut WsStream,
     deadline: Instant,
-) -> Result<ServerMsg, Box<dyn std::error::Error>> {
+) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -236,7 +182,7 @@ fn recv_with_deadline(
                 let text = msg
                     .into_text()
                     .map_err(|e| format!("expected text from server: {}", e))?;
-                let server_msg: ServerMsg = serde_json::from_str(&text)?;
+                let server_msg: ServerMessage = serde_json::from_str(&text)?;
                 return Ok(server_msg);
             }
             Err(tungstenite::Error::Io(ref e))
@@ -272,7 +218,7 @@ fn wait_for_signal(
         let server_msg = recv_with_deadline(ws, deadline)?;
 
         match server_msg {
-            ServerMsg::Signal { from, payload } => {
+            ServerMessage::Signal { from, payload } => {
                 // Primary filter: peer_code must match exactly
                 if from != from_peer {
                     eprintln!(
@@ -336,16 +282,16 @@ fn wait_for_signal(
                 );
                 return Ok(signal_payload);
             }
-            ServerMsg::PeerJoined { peer } => {
+            ServerMessage::PeerJoined { peer } => {
                 eprintln!("[rendezvous] peer joined: '{}'", peer.peer_code);
             }
-            ServerMsg::PeerLeft { peer_code } => {
+            ServerMessage::PeerLeft { peer_code } => {
                 eprintln!("[rendezvous] peer left: '{}'", peer_code);
             }
-            ServerMsg::Peers { .. } => {
+            ServerMessage::Peers { .. } => {
                 // Additional peers list, ignore
             }
-            ServerMsg::Error { message } => {
+            ServerMessage::Error { message } => {
                 return Err(format!("rendezvous server error: {}", message).into());
             }
         }
@@ -1152,10 +1098,10 @@ mod tests {
 
     #[test]
     fn client_msg_register_serde() {
-        let msg = ClientMsg::Register {
+        let msg = ClientMessage::Register {
             peer_code: "alice".to_string(),
             device_name: "bolt-daemon".to_string(),
-            device_type: "desktop".to_string(),
+            device_type: DeviceType::Desktop,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"register\""));
@@ -1166,7 +1112,7 @@ mod tests {
 
     #[test]
     fn client_msg_signal_serde() {
-        let msg = ClientMsg::Signal {
+        let msg = ClientMessage::Signal {
             to: "bob".to_string(),
             payload: serde_json::json!({"room": "test", "msg_type": "offer"}),
         };
@@ -1177,7 +1123,7 @@ mod tests {
 
     #[test]
     fn client_msg_ping_serde() {
-        let msg = ClientMsg::Ping;
+        let msg = ClientMessage::Ping;
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, "{\"type\":\"ping\"}");
     }
@@ -1185,30 +1131,30 @@ mod tests {
     #[test]
     fn server_msg_peers_deser() {
         let json = r#"{"type":"peers","peers":[{"peer_code":"alice","device_name":"test","device_type":"desktop"}]}"#;
-        let msg: ServerMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ServerMsg::Peers { .. }));
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::Peers { .. }));
     }
 
     #[test]
     fn server_msg_peer_joined_deser() {
         let json = r#"{"type":"peer_joined","peer":{"peer_code":"bob","device_name":"test","device_type":"desktop"}}"#;
-        let msg: ServerMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ServerMsg::PeerJoined { .. }));
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::PeerJoined { .. }));
     }
 
     #[test]
     fn server_msg_peer_left_deser() {
         let json = r#"{"type":"peer_left","peer_code":"bob"}"#;
-        let msg: ServerMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ServerMsg::PeerLeft { .. }));
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::PeerLeft { .. }));
     }
 
     #[test]
     fn server_msg_signal_deser() {
         let json = r#"{"type":"signal","from":"alice","payload":{"payload_version":1,"session":"s1","room":"test","msg_type":"offer","bundle":{"description":{"sdp_type":"offer","sdp":"v=0"},"candidates":[]}}}"#;
-        let msg: ServerMsg = serde_json::from_str(json).unwrap();
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ServerMsg::Signal { from, payload } => {
+            ServerMessage::Signal { from, payload } => {
                 assert_eq!(from, "alice");
                 let sp: SignalPayload = serde_json::from_value(payload).unwrap();
                 assert_eq!(sp.room, "test");
@@ -1223,9 +1169,9 @@ mod tests {
     #[test]
     fn server_msg_error_deser() {
         let json = r#"{"type":"error","message":"peer not found"}"#;
-        let msg: ServerMsg = serde_json::from_str(json).unwrap();
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ServerMsg::Error { message } => assert_eq!(message, "peer not found"),
+            ServerMessage::Error { message } => assert_eq!(message, "peer not found"),
             _ => panic!("expected Error"),
         }
     }

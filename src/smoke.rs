@@ -6,7 +6,6 @@
 //! No protocol changes. No crypto changes. Uses existing signaling and
 //! DataChannel infrastructure.
 
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 // ── Exit codes (smoke mode only) ────────────────────────────
@@ -55,11 +54,9 @@ pub fn generate_payload(size: usize) -> Vec<u8> {
 }
 
 /// Compute SHA-256 digest of `data`, return hex string.
+/// Delegates to `bolt_core::hash::sha256_hex` (canonical Rust implementation).
 pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    hex::encode(result)
+    bolt_core::hash::sha256_hex(data)
 }
 
 // ── Error classification ────────────────────────────────────
@@ -552,5 +549,23 @@ mod tests {
         let err: Box<dyn std::error::Error> = "something broke".into();
         let smoke_err = classify_error(err.as_ref());
         assert_eq!(smoke_err.exit_code(), EXIT_DATACHANNEL_FAILURE);
+    }
+
+    // ── bolt-core adoption gate ─────────────────────────────────
+
+    /// Proves sha256_hex delegates to bolt_core::hash::sha256_hex.
+    /// If someone reverts to a local implementation, this will catch
+    /// any output mismatch against the canonical crate.
+    #[test]
+    fn sha256_hex_matches_bolt_core_canonical() {
+        let data = b"bolt-core adoption test";
+        let from_smoke = sha256_hex(data);
+        let from_core = bolt_core::hash::sha256_hex(data);
+        assert_eq!(from_smoke, from_core);
+        // Also verify well-known empty-input constant via bolt-core directly.
+        assert_eq!(
+            bolt_core::hash::sha256_hex(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

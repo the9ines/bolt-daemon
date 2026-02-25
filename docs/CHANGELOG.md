@@ -2,6 +2,40 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## INTEROP-4 — Minimal post-HELLO message set (d7a79c4)
+
+Prove the INTEROP-3 session + profile-envelope-v1 path works end-to-end
+with real post-HELLO messages: ping/pong heartbeat and app_message echo.
+
+### Added
+- `src/dc_messages.rs` (NEW) — DcMessage enum (Ping, Pong, AppMessage) with
+  serde tag="type", parse_dc_message/encode_dc_message helpers, now_ms(); 9 tests
+- `route_inner_message()` in envelope.rs — routes decrypted inner messages:
+  ping → pong reply, pong → log, app_message → log + echo. All replies go
+  through encode_envelope (no plaintext sends)
+- `EnvelopeError::Protocol` variant for inner message parse failures
+- Offerer sends initial ping + app_message after HELLO, periodic ping every 2s
+- Answerer responds to ping with pong, echoes app_message
+- `scripts/e2e_interop_4_local.sh` — E2E test: rendezvous + offerer + answerer
+  in full web interop mode, validates HELLO, envelope, ping/pong, app_message
+
+### Changed
+- `src/envelope.rs` — added Protocol error variant, route_inner_message function
+- `src/rendezvous.rs` — replaced minimal router stub with route_inner_message
+  in both offerer and answerer loops; offerer sends initial messages + periodic ping
+- `src/main.rs` — added `pub(crate) mod dc_messages`
+
+### Design
+- Inner messages: `{"type":"ping","ts_ms":N}`, `{"type":"pong","ts_ms":N,"reply_to_ms":N}`,
+  `{"type":"app_message","text":"..."}`
+- All sends go through encode_envelope (NaCl box encrypted)
+- Offerer-initiated: sends ping + app_message immediately after HELLO
+- Periodic ping: 2s interval from offerer, via Instant bookkeeping in recv loop
+- No file transfer, no TOFU, no persistence — minimal validation set only
+
+### Tests
+- 210 total (195 bolt-daemon + 15 relay)
+
 ## INTEROP-3 — Session Context + Profile Envelope v1 (a39fefc)
 
 Persist HELLO outcome in SessionContext, implement Profile Envelope v1

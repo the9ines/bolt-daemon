@@ -779,44 +779,79 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
             }
             eprintln!("[INTEROP-3] entering post-HELLO DC envelope loop (offerer)");
 
+            // Send initial ping + app_message for E2E validation
+            let ping = crate::dc_messages::DcMessage::Ping {
+                ts_ms: crate::dc_messages::now_ms(),
+            };
+            let ping_json = crate::dc_messages::encode_dc_message(&ping)
+                .map_err(|e| format!("[INTEROP-4] encode ping: {e}"))?;
+            let ping_env = crate::envelope::encode_envelope(&ping_json, &session)?;
+            dc.send(&ping_env)?;
+            eprintln!("[INTEROP-4] sent initial ping");
+
+            let app = crate::dc_messages::DcMessage::AppMessage {
+                text: "hello from offerer".to_string(),
+            };
+            let app_json = crate::dc_messages::encode_dc_message(&app)
+                .map_err(|e| format!("[INTEROP-4] encode app_message: {e}"))?;
+            let app_env = crate::envelope::encode_envelope(&app_json, &session)?;
+            dc.send(&app_env)?;
+            eprintln!("[INTEROP-4] sent app_message");
+
+            // Periodic ping interval
+            const PING_INTERVAL: Duration = Duration::from_secs(2);
+            let mut last_ping = Instant::now();
+
             loop {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or("phase timeout expired in DC envelope loop")?;
-                let raw = match dc_msg_rx.recv_timeout(remaining) {
+                // Use short poll interval so we can send periodic pings
+                let poll_timeout = std::cmp::min(
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or(Duration::ZERO),
+                    Duration::from_millis(200),
+                );
+                if deadline <= Instant::now() {
+                    eprintln!("[INTEROP-4] DC loop timeout — clean exit");
+                    break;
+                }
+
+                let raw = match dc_msg_rx.recv_timeout(poll_timeout) {
                     Ok(r) => r,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        eprintln!("[INTEROP-3] DC loop timeout — clean exit");
-                        break;
+                        // Send periodic ping if interval elapsed
+                        if last_ping.elapsed() >= PING_INTERVAL {
+                            let ping = crate::dc_messages::DcMessage::Ping {
+                                ts_ms: crate::dc_messages::now_ms(),
+                            };
+                            if let Ok(json) = crate::dc_messages::encode_dc_message(&ping) {
+                                if let Ok(env) = crate::envelope::encode_envelope(&json, &session) {
+                                    let _ = dc.send(&env);
+                                    eprintln!("[INTEROP-4] sent periodic ping");
+                                }
+                            }
+                            last_ping = Instant::now();
+                        }
+                        continue;
                     }
-                    Err(e) => return Err(format!("[INTEROP-3] DC recv error: {e}").into()),
+                    Err(e) => return Err(format!("[INTEROP-4] DC recv error: {e}").into()),
                 };
 
                 match crate::envelope::decode_envelope(&raw, &session) {
-                    Ok(inner) => {
-                        // Minimal router: parse inner type
-                        let inner_type = serde_json::from_slice::<serde_json::Value>(&inner)
-                            .ok()
-                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
-                            .unwrap_or_else(|| "<unknown>".to_string());
-
-                        if inner_type == "error" {
-                            eprintln!(
-                                "[INTEROP-3] received error message: {}",
-                                String::from_utf8_lossy(&inner)
-                            );
-                            return Err(format!(
-                                "[INTEROP-3] remote error: {}",
-                                String::from_utf8_lossy(&inner)
-                            )
-                            .into());
+                    Ok(inner) => match crate::envelope::route_inner_message(&inner, &session) {
+                        Ok(Some(reply)) => {
+                            let _ = dc.send(&reply);
                         }
-
-                        eprintln!("[INTEROP-3_UNHANDLED] type={} — dropping", inner_type);
-                    }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("[INTEROP-4] route error: {e}");
+                            let err_msg =
+                                crate::envelope::make_error_message(e.code(), &e.to_string());
+                            let _ = dc.send(&err_msg);
+                            return Err(format!("[INTEROP-4] {e}").into());
+                        }
+                    },
                     Err(e) => {
                         eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        // Send error message best-effort, then disconnect
                         let err_msg = crate::envelope::make_error_message(e.code(), &e.to_string());
                         let _ = dc.send(&err_msg);
                         return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());
@@ -1095,37 +1130,28 @@ pub fn run_answerer_rendezvous(
                 let raw = match ch.dc_msg_rx.recv_timeout(remaining) {
                     Ok(r) => r,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        eprintln!("[INTEROP-3] DC loop timeout — clean exit");
+                        eprintln!("[INTEROP-4] DC loop timeout — clean exit");
                         break;
                     }
-                    Err(e) => return Err(format!("[INTEROP-3] DC recv error: {e}").into()),
+                    Err(e) => return Err(format!("[INTEROP-4] DC recv error: {e}").into()),
                 };
 
                 match crate::envelope::decode_envelope(&raw, &session) {
-                    Ok(inner) => {
-                        // Minimal router: parse inner type
-                        let inner_type = serde_json::from_slice::<serde_json::Value>(&inner)
-                            .ok()
-                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
-                            .unwrap_or_else(|| "<unknown>".to_string());
-
-                        if inner_type == "error" {
-                            eprintln!(
-                                "[INTEROP-3] received error message: {}",
-                                String::from_utf8_lossy(&inner)
-                            );
-                            return Err(format!(
-                                "[INTEROP-3] remote error: {}",
-                                String::from_utf8_lossy(&inner)
-                            )
-                            .into());
+                    Ok(inner) => match crate::envelope::route_inner_message(&inner, &session) {
+                        Ok(Some(reply)) => {
+                            let _ = dc.send(&reply);
                         }
-
-                        eprintln!("[INTEROP-3_UNHANDLED] type={} — dropping", inner_type);
-                    }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("[INTEROP-4] route error: {e}");
+                            let err_msg =
+                                crate::envelope::make_error_message(e.code(), &e.to_string());
+                            let _ = dc.send(&err_msg);
+                            return Err(format!("[INTEROP-4] {e}").into());
+                        }
+                    },
                     Err(e) => {
                         eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        // Send error message best-effort, then disconnect
                         let err_msg = crate::envelope::make_error_message(e.code(), &e.to_string());
                         let _ = dc.send(&err_msg);
                         return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());

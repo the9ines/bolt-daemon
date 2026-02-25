@@ -15,6 +15,7 @@
 //! Usage:
 //!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
 
+pub(crate) mod dc_messages;
 pub(crate) mod envelope;
 mod ice_filter;
 pub(crate) mod ipc;

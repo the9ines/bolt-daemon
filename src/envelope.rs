@@ -260,8 +260,8 @@ mod tests {
         let pk_a = kp_a.public_key;
         let pk_b = kp_b.public_key;
         let caps = vec!["bolt.profile-envelope-v1".to_string()];
-        let sess_a = SessionContext::new(kp_a, pk_b, caps.clone());
-        let sess_b = SessionContext::new(kp_b, pk_a, caps);
+        let sess_a = SessionContext::new(kp_a, pk_b, caps.clone()).unwrap();
+        let sess_b = SessionContext::new(kp_b, pk_a, caps).unwrap();
         (sess_a, sess_b)
     }
 
@@ -303,7 +303,7 @@ mod tests {
     fn encode_requires_negotiated_cap() {
         let kp = generate_identity_keypair();
         let remote_pk = generate_identity_keypair().public_key;
-        let session = SessionContext::new(kp, remote_pk, vec![]); // no caps
+        let session = SessionContext::new(kp, remote_pk, vec![]).unwrap(); // no caps
         let result = encode_envelope(b"{}", &session);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -344,8 +344,10 @@ mod tests {
             kp_a,
             kp_b.public_key,
             vec!["bolt.profile-envelope-v1".to_string()],
-        );
-        let sess_b_no_cap = SessionContext::new(kp_b, sess_a.local_keypair.public_key, vec![]);
+        )
+        .unwrap();
+        let sess_b_no_cap =
+            SessionContext::new(kp_b, sess_a.local_keypair.public_key, vec![]).unwrap();
         let encoded = encode_envelope(b"{}", &sess_a).unwrap();
         let result = decode_envelope(&encoded, &sess_b_no_cap);
         assert!(result.is_err());
@@ -362,7 +364,8 @@ mod tests {
             kp_c,
             sess_a.local_keypair.public_key,
             vec!["bolt.profile-envelope-v1".to_string()],
-        );
+        )
+        .unwrap();
         let result = decode_envelope(&encoded, &sess_c);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "ENVELOPE_DECRYPT_FAIL");
@@ -409,7 +412,8 @@ mod tests {
         let kp = generate_identity_keypair();
         let remote_pk = generate_identity_keypair().public_key;
         let session =
-            SessionContext::new(kp, remote_pk, vec!["bolt.profile-envelope-v1".to_string()]);
+            SessionContext::new(kp, remote_pk, vec!["bolt.profile-envelope-v1".to_string()])
+                .unwrap();
         let result = decode_envelope(json.as_bytes(), &session);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "INVALID_STATE");
@@ -420,7 +424,8 @@ mod tests {
         let kp = generate_identity_keypair();
         let remote_pk = generate_identity_keypair().public_key;
         let session =
-            SessionContext::new(kp, remote_pk, vec!["bolt.profile-envelope-v1".to_string()]);
+            SessionContext::new(kp, remote_pk, vec!["bolt.profile-envelope-v1".to_string()])
+                .unwrap();
         let result = decode_envelope(&[0xFF, 0xFE], &session);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "ENVELOPE_INVALID");

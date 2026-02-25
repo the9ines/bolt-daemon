@@ -1075,10 +1075,14 @@ fn run_simulate(simulate_event: SimulateEvent) {
         ui_connected: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    server.emit_event(IpcMessage::new_event(
-        "daemon.status",
-        serde_json::to_value(&status).unwrap(),
-    ));
+    let status_value = match serde_json::to_value(&status) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[simulate] FATAL: serialize status: {e}");
+            std::process::exit(1);
+        }
+    };
+    server.emit_event(IpcMessage::new_event("daemon.status", status_value));
 
     // Small delay to let status arrive before the prompt
     thread::sleep(Duration::from_millis(100));
@@ -1096,10 +1100,14 @@ fn run_simulate(simulate_event: SimulateEvent) {
                 capabilities_requested: vec!["file_transfer".to_string()],
             };
             eprintln!("[simulate] emitting pairing.request (request_id={request_id})");
-            server.emit_event(IpcMessage::new_event(
-                "pairing.request",
-                serde_json::to_value(&payload).unwrap(),
-            ));
+            let payload_value = match serde_json::to_value(&payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[simulate] FATAL: serialize pairing.request: {e}");
+                    std::process::exit(1);
+                }
+            };
+            server.emit_event(IpcMessage::new_event("pairing.request", payload_value));
         }
         SimulateEvent::IncomingTransfer => {
             let payload = TransferIncomingRequestPayload {
@@ -1114,9 +1122,16 @@ fn run_simulate(simulate_event: SimulateEvent) {
                 mime: Some("application/pdf".to_string()),
             };
             eprintln!("[simulate] emitting transfer.incoming.request (request_id={request_id})");
+            let payload_value = match serde_json::to_value(&payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[simulate] FATAL: serialize transfer.incoming.request: {e}");
+                    std::process::exit(1);
+                }
+            };
             server.emit_event(IpcMessage::new_event(
                 "transfer.incoming.request",
-                serde_json::to_value(&payload).unwrap(),
+                payload_value,
             ));
         }
     }
@@ -1177,10 +1192,13 @@ fn main() {
             };
             let trust_path = default_trust_path();
 
-            let role = args
-                .role
-                .as_ref()
-                .expect("--role required for default mode");
+            let role = match args.role.as_ref() {
+                Some(r) => r,
+                None => {
+                    eprintln!("[bolt-daemon] FATAL: --role required for default mode");
+                    std::process::exit(1);
+                }
+            };
             let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
@@ -1203,7 +1221,13 @@ fn main() {
             }
         }
         DaemonMode::Smoke => {
-            let role = args.role.as_ref().expect("--role required for smoke mode");
+            let role = match args.role.as_ref() {
+                Some(r) => r,
+                None => {
+                    eprintln!("[bolt-daemon] FATAL: --role required for smoke mode");
+                    std::process::exit(1);
+                }
+            };
             let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_smoke_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_smoke_answerer(&args),

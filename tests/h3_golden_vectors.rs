@@ -233,7 +233,7 @@ fn envelope_open_golden_vectors_via_decode_envelope() {
             secret_key: receiver_sk,
         };
         let caps = vec!["bolt.profile-envelope-v1".to_string()];
-        let session = SessionContext::new(receiver_kp, sender_pk, caps);
+        let session = SessionContext::new(receiver_kp, sender_pk, caps).unwrap();
 
         let envelope_bytes = serde_json::to_vec(&serde_json::json!({
             "type": case.envelope_json.msg_type,

@@ -149,8 +149,12 @@ impl IpcServer {
     }
 
     /// Check if a UI client is connected.
+    /// Returns false if the mutex is poisoned (fail-closed).
     pub fn is_ui_connected(&self) -> bool {
-        *self.ui_connected.lock().unwrap()
+        match self.ui_connected.lock() {
+            Ok(guard) => *guard,
+            Err(_) => false,
+        }
     }
 
     /// Block until a decision matching `request_id` arrives, or timeout.
@@ -207,14 +211,26 @@ impl IpcServer {
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     eprintln!("[IPC] client connected");
-                    *ui_connected.lock().unwrap() = true;
+                    match ui_connected.lock() {
+                        Ok(mut guard) => *guard = true,
+                        Err(_) => {
+                            eprintln!("[IPC] FATAL: ui_connected mutex poisoned");
+                            return;
+                        }
+                    }
 
                     // Drain any stale events from previous client session
                     while event_rx.try_recv().is_ok() {}
 
                     Self::handle_client(stream, &event_rx, &decision_tx);
 
-                    *ui_connected.lock().unwrap() = false;
+                    match ui_connected.lock() {
+                        Ok(mut guard) => *guard = false,
+                        Err(_) => {
+                            eprintln!("[IPC] FATAL: ui_connected mutex poisoned");
+                            return;
+                        }
+                    }
                     eprintln!("[IPC_CLIENT_DISCONNECTED]");
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {

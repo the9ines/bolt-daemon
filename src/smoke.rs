@@ -209,7 +209,10 @@ impl SmokeReport {
             "result": self.result,
             "error": self.error,
         });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        match serde_json::to_string_pretty(&json) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("[smoke] FATAL: serialize report: {e}"),
+        }
     }
 
     pub fn print(&self, json_mode: bool) {

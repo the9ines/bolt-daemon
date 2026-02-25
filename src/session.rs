@@ -30,22 +30,20 @@ impl SessionContext {
     ///
     /// `hello_state` is immediately marked completed — the caller has
     /// already finished the HELLO exchange before calling this.
+    /// Returns Err if HelloState was already completed (internal invariant violation).
     pub fn new(
         local_keypair: KeyPair,
         remote_public_key: [u8; 32],
         negotiated_capabilities: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self, &'static str> {
         let mut hello_state = HelloState::new();
-        // Safe: this is the only call, immediately after HELLO completes.
-        hello_state
-            .mark_completed()
-            .expect("BUG: HelloState was already completed before SessionContext::new");
-        Self {
+        hello_state.mark_completed()?;
+        Ok(Self {
             local_keypair,
             remote_public_key,
             negotiated_capabilities,
             hello_state,
-        }
+        })
     }
 
     /// Check if a specific capability was negotiated.
@@ -75,7 +73,7 @@ mod tests {
     fn make_ctx(caps: Vec<String>) -> SessionContext {
         let kp = generate_identity_keypair();
         let remote_pk = generate_identity_keypair().public_key;
-        SessionContext::new(kp, remote_pk, caps)
+        SessionContext::new(kp, remote_pk, caps).unwrap()
     }
 
     #[test]
@@ -118,7 +116,7 @@ mod tests {
         let kp = generate_identity_keypair();
         let remote_kp = generate_identity_keypair();
         let remote_pk = remote_kp.public_key;
-        let ctx = SessionContext::new(kp, remote_pk, vec![]);
+        let ctx = SessionContext::new(kp, remote_pk, vec![]).unwrap();
         assert_eq!(ctx.remote_public_key, remote_pk);
     }
 
@@ -137,7 +135,14 @@ mod tests {
         let kp = generate_identity_keypair();
         let pk = kp.public_key;
         let remote_pk = generate_identity_keypair().public_key;
-        let ctx = SessionContext::new(kp, remote_pk, vec![]);
+        let ctx = SessionContext::new(kp, remote_pk, vec![]).unwrap();
         assert_eq!(ctx.local_keypair.public_key, pk);
+    }
+
+    #[test]
+    fn new_returns_ok_for_fresh_state() {
+        let kp = generate_identity_keypair();
+        let remote_pk = generate_identity_keypair().public_key;
+        assert!(SessionContext::new(kp, remote_pk, vec![]).is_ok());
     }
 }

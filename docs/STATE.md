@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag | `daemon-v0.2.3-interop-3-session-envelope` |
-| Commit | `a39fefc` |
-| Branch | `main` |
-| Phase | INTEROP-3 — Session Context + Profile Envelope v1 |
+| Tag | `daemon-v0.2.4-interop-4-min-msgset` |
+| Commit | `d7a79c4` |
+| Branch | `feature/interop-4-min-msgset` |
+| Phase | INTEROP-4 — Minimal post-HELLO message set |
 
 ## Test Status
 
-- 201 tests (186 bolt-daemon + 15 relay)
+- 210 tests (195 bolt-daemon + 15 relay)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -52,6 +52,17 @@
 | LAN | Stable (default) | Private/link-local IPs only |
 | Overlay | Stable | LAN + CGNAT 100.64.0.0/10 (Tailscale) |
 | Global | Stable | All valid IPs (ByteBolt) |
+
+## Post-HELLO Message Set (INTEROP-4)
+
+- Inner message types: ping, pong, app_message (serde-tagged enum)
+- Offerer sends initial ping + app_message immediately after HELLO
+- Periodic ping: 2s interval from offerer via Instant bookkeeping
+- Answerer responds: ping → pong reply, app_message → echo
+- All sends go through encode_envelope (NaCl box encrypted)
+- route_inner_message() in envelope.rs handles dispatch
+- E2E script: `scripts/e2e_interop_4_local.sh`
+- Log markers: `[INTEROP-4]`
 
 ## Session Context + Profile Envelope v1 (INTEROP-3)
 
@@ -116,8 +127,9 @@
 
 ```
 src/main.rs            — CLI, args, handlers, file mode, simulate mode, E2E flow
+src/dc_messages.rs     — Inner DC message types: ping, pong, app_message (INTEROP-4)
 src/session.rs         — SessionContext: HELLO outcome for post-handshake DC operations
-src/envelope.rs        — Profile Envelope v1 codec: encode/decode, DcErrorMessage, EnvelopeError
+src/envelope.rs        — Profile Envelope v1 codec: encode/decode, route, DcErrorMessage, EnvelopeError
 src/web_hello.rs       — Web HELLO handshake: NaCl-box encrypted JSON, capability negotiation
 src/web_signal.rs      — Web inner signaling payloads: {type,data,from,to} schema
 src/ipc/mod.rs         — IPC module root

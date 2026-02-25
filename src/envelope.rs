@@ -50,6 +50,8 @@ pub enum EnvelopeError {
     NotEnvelope,
     /// JSON parse error.
     ParseError(String),
+    /// Inner message protocol error (unknown type, malformed).
+    Protocol(String),
 }
 
 impl EnvelopeError {
@@ -61,6 +63,7 @@ impl EnvelopeError {
             EnvelopeError::DecryptFail(_) => "ENVELOPE_DECRYPT_FAIL",
             EnvelopeError::NotEnvelope => "INVALID_STATE",
             EnvelopeError::ParseError(_) => "ENVELOPE_INVALID",
+            EnvelopeError::Protocol(_) => "INVALID_MESSAGE",
         }
     }
 }
@@ -82,6 +85,9 @@ impl fmt::Display for EnvelopeError {
             }
             EnvelopeError::ParseError(detail) => {
                 write!(f, "envelope parse error: {detail}")
+            }
+            EnvelopeError::Protocol(detail) => {
+                write!(f, "inner message protocol error: {detail}")
             }
         }
     }
@@ -174,6 +180,55 @@ pub fn decode_envelope(raw: &[u8], session: &SessionContext) -> Result<Vec<u8>, 
     .map_err(|e| EnvelopeError::DecryptFail(e.to_string()))?;
 
     Ok(plaintext)
+}
+
+// ── Inner message router ────────────────────────────────────
+
+/// Route a decrypted inner message: handle ping/pong/app_message.
+///
+/// Returns `Ok(Some(envelope_bytes))` if a reply should be sent on the DC,
+/// `Ok(None)` if no reply is needed, or `Err` on protocol violation.
+///
+/// All reply bytes are already envelope-encrypted and ready for `dc.send()`.
+pub fn route_inner_message(
+    inner: &[u8],
+    session: &SessionContext,
+) -> Result<Option<Vec<u8>>, EnvelopeError> {
+    use crate::dc_messages::{encode_dc_message, now_ms, parse_dc_message, DcMessage};
+
+    let msg =
+        parse_dc_message(inner).map_err(|e| EnvelopeError::Protocol(format!("parse: {e}")))?;
+
+    match msg {
+        DcMessage::Ping { ts_ms } => {
+            let pong = DcMessage::Pong {
+                ts_ms: now_ms(),
+                reply_to_ms: ts_ms,
+            };
+            let pong_json = encode_dc_message(&pong)
+                .map_err(|e| EnvelopeError::Protocol(format!("encode pong: {e}")))?;
+            let envelope_bytes = encode_envelope(&pong_json, session)?;
+            eprintln!("[INTEROP-4] recv ping ts={ts_ms}, sent pong");
+            Ok(Some(envelope_bytes))
+        }
+        DcMessage::Pong { ts_ms, reply_to_ms } => {
+            let rtt = ts_ms.saturating_sub(reply_to_ms);
+            eprintln!("[INTEROP-4] recv pong ts={ts_ms} reply_to={reply_to_ms} rtt_ms={rtt}");
+            Ok(None)
+        }
+        DcMessage::AppMessage { ref text } => {
+            eprintln!("[INTEROP-4] app_message recv: \"{text}\"");
+            // Echo back
+            let echo = DcMessage::AppMessage {
+                text: format!("echo: {text}"),
+            };
+            let echo_json = encode_dc_message(&echo)
+                .map_err(|e| EnvelopeError::Protocol(format!("encode echo: {e}")))?;
+            let envelope_bytes = encode_envelope(&echo_json, session)?;
+            eprintln!("[INTEROP-4] sent echo");
+            Ok(Some(envelope_bytes))
+        }
+    }
 }
 
 // ── Error message helper ────────────────────────────────────

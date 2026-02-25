@@ -3,7 +3,10 @@
 //! Reads the SAME vector JSON files from bolt-core-sdk (no duplication).
 //! Exercises parse_hello_message and decode_envelope against precomputed
 //! sealed payloads, verifying cross-implementation parity.
+//!
+//! Requires: `cargo test --features test-support`
 
+#![cfg(feature = "test-support")]
 #![allow(non_snake_case)]
 
 use serde::Deserialize;
@@ -94,7 +97,6 @@ fn hello_open_golden_vectors_via_open_box_payload() {
         let sender_pk = hex_to_32(&case.sender_public_hex);
         let receiver_sk = hex_to_32(&case.receiver_secret_hex);
 
-        // Use bolt-core's open_box_payload directly (same path as parse_hello_message)
         let decrypted = bolt_core::crypto::open_box_payload(
             &case.sealed_payload_base64,
             &sender_pk,
@@ -115,7 +117,6 @@ fn hello_open_golden_vectors_via_open_box_payload() {
             case.name
         );
 
-        // Verify it matches the daemon's expected HELLO schema
         assert_eq!(inner.msg_type, "hello");
         assert_eq!(inner.version, 1);
         assert!(!inner.identity_public_key.is_empty());
@@ -124,6 +125,8 @@ fn hello_open_golden_vectors_via_open_box_payload() {
 
 #[test]
 fn hello_open_golden_vectors_via_parse_hello_message() {
+    use bolt_daemon::test_support::parse_hello_message;
+
     let path = vectors_dir().join("web-hello-open.vectors.json");
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
@@ -134,21 +137,18 @@ fn hello_open_golden_vectors_via_parse_hello_message() {
         let sender_pk = hex_to_32(&case.sender_public_hex);
         let receiver_sk = hex_to_32(&case.receiver_secret_hex);
 
-        // Build the outer HELLO frame as the daemon would receive it on the DC
         let outer_json = serde_json::json!({
             "type": "hello",
             "payload": case.sealed_payload_base64
         });
         let outer_bytes = serde_json::to_vec(&outer_json).unwrap();
 
-        // Build a keypair for the receiver
         let receiver_kp = bolt_core::crypto::KeyPair {
             public_key: [0u8; 32], // not used for decryption
             secret_key: receiver_sk,
         };
 
-        let result =
-            bolt_daemon::web_hello::parse_hello_message(&outer_bytes, &sender_pk, &receiver_kp);
+        let result = parse_hello_message(&outer_bytes, &sender_pk, &receiver_kp);
 
         match result {
             Ok(inner) => {
@@ -185,7 +185,6 @@ fn envelope_open_golden_vectors_via_open_box_payload() {
     assert_eq!(vecs.version, 1);
 
     for case in &vecs.cases {
-        // Validate envelope frame structure
         assert_eq!(case.envelope_json.msg_type, "profile-envelope");
         assert_eq!(case.envelope_json.version, 1);
         assert_eq!(case.envelope_json.encoding, "base64");
@@ -217,6 +216,8 @@ fn envelope_open_golden_vectors_via_open_box_payload() {
 
 #[test]
 fn envelope_open_golden_vectors_via_decode_envelope() {
+    use bolt_daemon::test_support::{decode_envelope, SessionContext};
+
     let path = vectors_dir().join("envelope-open.vectors.json");
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
@@ -227,15 +228,13 @@ fn envelope_open_golden_vectors_via_decode_envelope() {
         let sender_pk = hex_to_32(&case.sender_public_hex);
         let receiver_sk = hex_to_32(&case.receiver_secret_hex);
 
-        // Build a SessionContext with the correct keys
         let receiver_kp = bolt_core::crypto::KeyPair {
             public_key: [0u8; 32], // not used in decode
             secret_key: receiver_sk,
         };
         let caps = vec!["bolt.profile-envelope-v1".to_string()];
-        let session = bolt_daemon::session::SessionContext::new(receiver_kp, sender_pk, caps);
+        let session = SessionContext::new(receiver_kp, sender_pk, caps);
 
-        // Serialize the full envelope frame as the daemon would receive it
         let envelope_bytes = serde_json::to_vec(&serde_json::json!({
             "type": case.envelope_json.msg_type,
             "version": case.envelope_json.version,
@@ -244,7 +243,7 @@ fn envelope_open_golden_vectors_via_decode_envelope() {
         }))
         .unwrap();
 
-        let decrypted = bolt_daemon::envelope::decode_envelope(&envelope_bytes, &session)
+        let decrypted = decode_envelope(&envelope_bytes, &session)
             .unwrap_or_else(|e| panic!("decode_envelope failed for case '{}': {}", case.name, e));
 
         let inner: serde_json::Value = serde_json::from_slice(&decrypted).unwrap_or_else(|e| {

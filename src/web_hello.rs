@@ -76,14 +76,13 @@ pub struct WebHelloInner {
 /// Tracks whether the HELLO exchange has completed.
 /// Rejects duplicate HELLOs (fail-closed).
 /// Wired into SessionContext at runtime (INTEROP-3).
-#[derive(Default)]
-pub struct HelloState {
+pub(crate) struct HelloState {
     completed: bool,
 }
 
 impl HelloState {
     pub fn new() -> Self {
-        Self::default()
+        Self { completed: false }
     }
 
     /// Mark HELLO as completed. Returns Err if already completed.

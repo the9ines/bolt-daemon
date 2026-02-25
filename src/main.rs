@@ -19,6 +19,7 @@ mod ice_filter;
 pub(crate) mod ipc;
 mod rendezvous;
 mod smoke;
+pub(crate) mod web_signal;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -106,6 +107,7 @@ pub(crate) struct Args {
     pub(crate) smoke_config: smoke::SmokeConfig,
     pub(crate) simulate_event: Option<SimulateEvent>,
     pub(crate) pairing_policy: ipc::trust::PairingPolicy,
+    pub(crate) interop_signal: web_signal::InteropSignal,
 }
 
 fn parse_args() -> Args {
@@ -128,6 +130,7 @@ fn parse_args() -> Args {
     let mut smoke_json = false;
     let mut simulate_event = None;
     let mut pairing_policy = None;
+    let mut interop_signal = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -328,6 +331,20 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--interop-signal" => {
+                i += 1;
+                interop_signal = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("daemon_v1") => web_signal::InteropSignal::DaemonV1,
+                    Some("web_v1") => web_signal::InteropSignal::WebV1,
+                    other => {
+                        eprintln!(
+                            "--interop-signal must be 'daemon_v1' or 'web_v1', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -403,6 +420,7 @@ fn parse_args() -> Args {
         smoke_config,
         simulate_event,
         pairing_policy: pairing_policy.unwrap_or(ipc::trust::PairingPolicy::Ask),
+        interop_signal: interop_signal.unwrap_or(web_signal::InteropSignal::DaemonV1),
     }
 }
 
@@ -1059,12 +1077,13 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop={:?} timeout={}s",
         args.role,
         args.signal_mode,
         args.network_scope,
         args.daemon_mode,
         args.pairing_policy,
+        args.interop_signal,
         args.phase_timeout.as_secs()
     );
 

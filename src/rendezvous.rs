@@ -298,6 +298,207 @@ fn wait_for_signal(
     }
 }
 
+// ── Web-compat helpers (INTEROP-1) ──────────────────────────
+
+/// Send a daemon SignalBundle as web-schema payloads (1 SDP + N ICE candidates).
+/// Each web payload is sent as a separate rendezvous Signal message.
+fn send_web_payloads(
+    ws: &mut WsStream,
+    to: &str,
+    bundle: &crate::SignalBundle,
+    sdp_type: &str,
+    from_peer: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payloads = crate::web_signal::bundle_to_web_payloads(bundle, sdp_type, from_peer, to);
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let msg = ClientMessage::Signal {
+            to: to.to_string(),
+            payload: payload.clone(),
+        };
+        let json = serde_json::to_string(&msg)?;
+        ws.send(Message::Text(json))?;
+
+        if i == 0 {
+            eprintln!("[INTEROP-1] sent web {} to '{}'", sdp_type, to);
+        }
+    }
+
+    if payloads.len() > 1 {
+        eprintln!(
+            "[INTEROP-1] sent {} ice-candidate(s) to '{}'",
+            payloads.len() - 1,
+            to
+        );
+    }
+
+    Ok(())
+}
+
+/// Receive web-schema signals and assemble into a daemon SignalBundle.
+///
+/// Collects the SDP (offer or answer) and trickled ICE candidates from
+/// web-format payloads. Falls back to daemon-format if web parsing fails
+/// (defensive compat). Returns once:
+/// - ICE collection timeout expires (3s after SDP received), OR
+/// - End-of-candidates marker received (empty candidate string), OR
+/// - Phase deadline expires
+fn receive_web_bundle(
+    ws: &mut WsStream,
+    deadline: Instant,
+    from_peer: &str,
+    room: &str,
+    session: &str,
+    expected_sdp_type: &str,
+    network_scope: crate::NetworkScope,
+) -> Result<crate::SignalBundle, Box<dyn std::error::Error>> {
+    use crate::web_signal::{self, ParsedWebSignal};
+
+    let mut sdp_info: Option<crate::SdpInfo> = None;
+    let mut candidates: Vec<crate::CandidateInfo> = Vec::new();
+    let mut ice_deadline: Option<Instant> = None;
+
+    /// ICE collection window after SDP is received (seconds).
+    const ICE_COLLECT_SECS: u64 = 3;
+
+    eprintln!(
+        "[INTEROP-1] waiting for web '{}' + ice-candidates from '{}' (room '{}', session '{}')",
+        expected_sdp_type, from_peer, room, session
+    );
+
+    loop {
+        // After SDP, use tighter ICE collection deadline
+        let effective_deadline = match (sdp_info.is_some(), ice_deadline) {
+            (true, Some(ice_dl)) => ice_dl.min(deadline),
+            _ => deadline,
+        };
+
+        let server_msg = match recv_with_deadline(ws, effective_deadline) {
+            Ok(msg) => msg,
+            Err(_) if sdp_info.is_some() => {
+                // Timeout during ICE collection — proceed with what we have
+                eprintln!(
+                    "[INTEROP-1] ICE collection timeout — proceeding with {} candidate(s)",
+                    candidates.len()
+                );
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+
+        match server_msg {
+            ServerMessage::Signal { from, payload } => {
+                if from != from_peer {
+                    eprintln!(
+                        "[rendezvous] ignoring signal from '{}' (expected '{}')",
+                        from, from_peer
+                    );
+                    continue;
+                }
+
+                // Try web schema first
+                match web_signal::parse_web_payload(&payload) {
+                    Ok(Some(parsed)) => match parsed {
+                        ParsedWebSignal::Offer { sdp_type, sdp }
+                            if expected_sdp_type == "offer" =>
+                        {
+                            eprintln!("[INTEROP-1] received web offer from '{}'", from_peer);
+                            sdp_info = Some(crate::SdpInfo { sdp_type, sdp });
+                            ice_deadline =
+                                Some(Instant::now() + Duration::from_secs(ICE_COLLECT_SECS));
+                        }
+                        ParsedWebSignal::Answer { sdp_type, sdp }
+                            if expected_sdp_type == "answer" =>
+                        {
+                            eprintln!("[INTEROP-1] received web answer from '{}'", from_peer);
+                            sdp_info = Some(crate::SdpInfo { sdp_type, sdp });
+                            ice_deadline =
+                                Some(Instant::now() + Duration::from_secs(ICE_COLLECT_SECS));
+                        }
+                        ParsedWebSignal::IceCandidate { candidate, mid } => {
+                            if candidate.is_empty() {
+                                eprintln!("[INTEROP-1] end-of-candidates from '{}'", from_peer);
+                                if sdp_info.is_some() {
+                                    break;
+                                }
+                            } else if crate::ice_filter::is_allowed_candidate(
+                                &candidate,
+                                network_scope,
+                            ) {
+                                eprintln!(
+                                    "[INTEROP-1] ICE candidate accepted ({:?}): {}",
+                                    network_scope, &candidate
+                                );
+                                candidates.push(crate::CandidateInfo { candidate, mid });
+                            } else {
+                                eprintln!(
+                                    "[INTEROP-1] ICE candidate REJECTED ({:?}): {}",
+                                    network_scope, &candidate
+                                );
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "[INTEROP-1] ignoring unexpected web signal type from '{}'",
+                                from_peer
+                            );
+                        }
+                    },
+                    Ok(None) => {
+                        // Unknown web type, already logged by parse_web_payload
+                    }
+                    Err(_) => {
+                        // Web parsing failed — try daemon format as fallback
+                        if let Ok(sp) = serde_json::from_value::<SignalPayload>(payload) {
+                            if sp.payload_version != PAYLOAD_VERSION {
+                                return Err(format!(
+                                    "unsupported payload_version {} (expected {})",
+                                    sp.payload_version, PAYLOAD_VERSION
+                                )
+                                .into());
+                            }
+                            if sp.session != session || sp.room != room {
+                                continue;
+                            }
+                            if sp.msg_type == expected_sdp_type {
+                                if let Some(bundle) = sp.bundle {
+                                    eprintln!(
+                                        "[INTEROP-1] received daemon-format {} (fallback compat)",
+                                        expected_sdp_type
+                                    );
+                                    return Ok(bundle);
+                                }
+                            }
+                        }
+                        // Both formats failed — continue listening
+                    }
+                }
+            }
+            ServerMessage::PeerJoined { peer } => {
+                eprintln!("[rendezvous] peer joined: '{}'", peer.peer_code);
+            }
+            ServerMessage::PeerLeft { peer_code } => {
+                eprintln!("[rendezvous] peer left: '{}'", peer_code);
+            }
+            ServerMessage::Peers { .. } => {}
+            ServerMessage::Error { message } => {
+                return Err(format!("rendezvous server error: {}", message).into());
+            }
+        }
+    }
+
+    let description = sdp_info.ok_or("phase timeout — did not receive SDP")?;
+    eprintln!(
+        "[INTEROP-1] assembled bundle: {} + {} candidate(s)",
+        expected_sdp_type,
+        candidates.len()
+    );
+    Ok(crate::SignalBundle {
+        description,
+        candidates,
+    })
+}
+
 // ── Smoke exchange context ──────────────────────────────────
 
 /// Narrow context passed to the exchange closure after rendezvous
@@ -343,6 +544,9 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
         "[offerer] rendezvous mode: room='{}', session='{}', peer_id='{}', to='{}'",
         room, session, peer_id, to_peer
     );
+    if args.interop_signal == crate::web_signal::InteropSignal::WebV1 {
+        eprintln!("[INTEROP-1] web_v1 mode enabled — using web payload schema");
+    }
 
     let deadline = Instant::now() + args.phase_timeout;
 
@@ -442,22 +646,43 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     let offer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
 
     // Send offer to target peer via rendezvous
-    let offer_payload = SignalPayload {
-        payload_version: PAYLOAD_VERSION,
-        session: session.clone(),
-        room: room.clone(),
-        msg_type: "offer".to_string(),
-        bundle: Some(offer_bundle),
-        from_peer: None,
-        to_peer: None,
-        network_scope: None,
-        phase_timeout_secs: None,
-    };
-    send_signal(&mut ws, to_peer, &offer_payload)?;
+    match args.interop_signal {
+        crate::web_signal::InteropSignal::WebV1 => {
+            eprintln!("[INTEROP-1] offerer sending web-format offer");
+            send_web_payloads(&mut ws, to_peer, &offer_bundle, "offer", &peer_id)?;
+        }
+        crate::web_signal::InteropSignal::DaemonV1 => {
+            let offer_payload = SignalPayload {
+                payload_version: PAYLOAD_VERSION,
+                session: session.clone(),
+                room: room.clone(),
+                msg_type: "offer".to_string(),
+                bundle: Some(offer_bundle),
+                from_peer: None,
+                to_peer: None,
+                network_scope: None,
+                phase_timeout_secs: None,
+            };
+            send_signal(&mut ws, to_peer, &offer_payload)?;
+        }
+    }
 
     // Wait for answer from target peer (deadline-respecting, filtered)
-    let answer_sp = wait_for_signal(&mut ws, deadline, to_peer, room, session, "answer")?;
-    let answer_bundle = answer_sp.bundle.ok_or("answer signal missing bundle")?;
+    let answer_bundle = match args.interop_signal {
+        crate::web_signal::InteropSignal::WebV1 => receive_web_bundle(
+            &mut ws,
+            deadline,
+            to_peer,
+            room,
+            session,
+            "answer",
+            args.network_scope,
+        )?,
+        crate::web_signal::InteropSignal::DaemonV1 => {
+            let answer_sp = wait_for_signal(&mut ws, deadline, to_peer, room, session, "answer")?;
+            answer_sp.bundle.ok_or("answer signal missing bundle")?
+        }
+    };
 
     // Apply answer (reuses scope-filtered logic)
     apply_remote_signal(&mut pc, &answer_bundle, args.network_scope)?;
@@ -524,6 +749,9 @@ pub fn run_answerer_rendezvous(
         "[answerer] rendezvous mode: room='{}', session='{}', peer_id='{}', expect-peer='{}'",
         room, session, peer_id, expect_peer
     );
+    if args.interop_signal == crate::web_signal::InteropSignal::WebV1 {
+        eprintln!("[INTEROP-1] web_v1 mode enabled — using web payload schema");
+    }
 
     let deadline = Instant::now() + args.phase_timeout;
 
@@ -600,8 +828,21 @@ pub fn run_answerer_rendezvous(
     // ── Offer/answer exchange ────────────────────────────────
 
     // Wait for offer from expected peer (deadline-respecting, filtered)
-    let offer_sp = wait_for_signal(&mut ws, deadline, expect_peer, room, session, "offer")?;
-    let offer_bundle = offer_sp.bundle.ok_or("offer signal missing bundle")?;
+    let offer_bundle = match args.interop_signal {
+        crate::web_signal::InteropSignal::WebV1 => receive_web_bundle(
+            &mut ws,
+            deadline,
+            expect_peer,
+            room,
+            session,
+            "offer",
+            args.network_scope,
+        )?,
+        crate::web_signal::InteropSignal::DaemonV1 => {
+            let offer_sp = wait_for_signal(&mut ws, deadline, expect_peer, room, session, "offer")?;
+            offer_sp.bundle.ok_or("offer signal missing bundle")?
+        }
+    };
 
     // Create PeerConnection
     let (mut pc, ch) = create_peer_connection(args.network_scope)?;
@@ -613,18 +854,27 @@ pub fn run_answerer_rendezvous(
     let answer_bundle = collect_local_signal(&ch, args.phase_timeout)?;
 
     // Send answer to expected peer via rendezvous
-    let answer_payload = SignalPayload {
-        payload_version: PAYLOAD_VERSION,
-        session: session.clone(),
-        room: room.clone(),
-        msg_type: "answer".to_string(),
-        bundle: Some(answer_bundle),
-        from_peer: None,
-        to_peer: None,
-        network_scope: None,
-        phase_timeout_secs: None,
-    };
-    send_signal(&mut ws, expect_peer, &answer_payload)?;
+    match args.interop_signal {
+        crate::web_signal::InteropSignal::WebV1 => {
+            let peer_id_ref = &peer_id;
+            eprintln!("[INTEROP-1] answerer sending web-format answer");
+            send_web_payloads(&mut ws, expect_peer, &answer_bundle, "answer", peer_id_ref)?;
+        }
+        crate::web_signal::InteropSignal::DaemonV1 => {
+            let answer_payload = SignalPayload {
+                payload_version: PAYLOAD_VERSION,
+                session: session.clone(),
+                room: room.clone(),
+                msg_type: "answer".to_string(),
+                bundle: Some(answer_bundle),
+                from_peer: None,
+                to_peer: None,
+                network_scope: None,
+                phase_timeout_secs: None,
+            };
+            send_signal(&mut ws, expect_peer, &answer_payload)?;
+        }
+    }
 
     // Wait for incoming DataChannel
     let remaining = deadline

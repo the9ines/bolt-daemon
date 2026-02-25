@@ -2,6 +2,36 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## EVENT-0 — Daemon ↔ UI IPC skeleton (e9ada46)
+
+Add local Unix-socket NDJSON IPC between bolt-daemon and a UI client.
+Defines event/decision schema (pairing.request, transfer.incoming.request,
+daemon.status), strict bounded parser (1 MiB cap), request correlation,
+and a dev client + simulator to prove round-trip. Fail-closed when UI
+is disconnected.
+
+### Added
+- `src/ipc/` module: types.rs, server.rs, id.rs, mod.rs
+- `src/ipc_client_main.rs` — bolt-ipc-client dev binary
+- `--mode simulate --simulate-event` CLI (standalone, no --role required)
+- 28 new unit tests (3 id + 15 types + 10 server)
+
+### Changed
+- `src/main.rs` — DaemonMode::Simulate, SimulateEvent enum, run_simulate(),
+  role made Option<Role> (optional for simulate mode)
+- `src/rendezvous.rs` — handle Option<Role>
+- `Cargo.toml` — add [[bin]] bolt-ipc-client
+
+### Design
+- Socket: `/tmp/bolt-daemon.sock` (chmod 600, single-client, kick-old policy)
+- IDs: `evt-<monotonic counter>` (deterministic, no rand)
+- Channel: event_tx in daemon, decision_rx in daemon; server holds receivers
+- Bounded reader: `read_until(b'\n')` with 1 MiB cap
+- Decision variants: allow_once, allow_always, deny_once, deny_always
+
+### Tests
+- 122 total (107 bolt-daemon + 15 relay)
+
 ## NATIVE-1 — Adopt Rust bolt-core (b3ebb85)
 
 Replaces local `sha2` + `hex` crate usage in `smoke.rs` with canonical

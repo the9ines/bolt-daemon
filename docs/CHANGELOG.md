@@ -2,6 +2,99 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## INTEROP-2 — Web HELLO handshake compatibility (dd82669)
+
+Add web-compatible encrypted HELLO handshake over DataChannel, gated by
+`--interop-hello {daemon_hello_v1, web_hello_v1}`. When web_hello_v1 is
+enabled, the daemon performs the same NaCl-box encrypted JSON HELLO
+exchange that bolt-transport-web uses.
+
+### Added
+- `src/web_hello.rs` (NEW) — InteropHelloMode enum, WebHelloOuter/WebHelloInner
+  serde types, build_hello_message/parse_hello_message (NaCl box via bolt-core),
+  capability negotiation, HelloState exactly-once guard, decode_public_key helper
+- `--interop-hello {daemon_hello_v1, web_hello_v1}` CLI flag (default: daemon_hello_v1)
+- Fail-closed validation: web_hello_v1 requires --signal rendezvous + --interop-signal web_v1
+- No-downgrade: legacy `b"bolt-hello-v1"` rejected in web_hello_v1 mode
+- 20 new tests in web_hello.rs (serde, crypto roundtrip, bidirectional, failure, capabilities)
+
+### Changed
+- `src/web_signal.rs` — `public_key_b64: Option<String>` added to ParsedWebSignal::Offer
+  and ::Answer; encode_web_offer/encode_web_answer/bundle_to_web_payloads accept
+  identity_pk_b64 parameter; 4 new tests
+- `src/rendezvous.rs` — identity keypair generation, publicKey threading through
+  send_web_payloads/receive_web_bundle, encrypted web HELLO exchange in offerer
+  and answerer flows
+- `src/main.rs` — `pub(crate) mod web_hello`, Args.interop_hello field, startup log
+
+### Design
+- Identity keypairs: ephemeral per process run (generate_identity_keypair)
+- Key exchange: identity public keys carried in signaling publicKey field
+- Outer frame: `{"type":"hello","payload":"<sealed base64>"}`
+- Inner plaintext: `{"type":"hello","version":1,"identityPublicKey":"<b64>","capabilities":[...]}`
+- Encryption: NaCl box via bolt_core::crypto::{seal_box_payload, open_box_payload}
+- Capabilities: `["bolt.profile-envelope-v1"]` (negotiated via set intersection)
+- Offerer sends HELLO first; answerer receives, then replies
+
+### Known gaps (INTEROP-3 prerequisites)
+- HelloState not yet wired into runtime (low-risk: single-shot flows)
+- Negotiated capabilities logged and dropped (no session context struct yet)
+
+### Tests
+- 181 total (166 bolt-daemon + 15 relay)
+
+## INTEROP-1 — Web inner signaling payload mode (14c7448)
+
+Add `--interop-signal {daemon_v1, web_v1}` CLI flag for web-compatible inner
+signaling payloads. When web_v1 is enabled, the daemon uses `{type, data, from, to}`
+schema matching bolt-transport-web instead of daemon-native bundled schema.
+
+### Added
+- `src/web_signal.rs` (NEW) — InteropSignal enum, WebSignalPayload/WebOfferData/
+  WebAnswerData/WebSdp/WebIceCandidateData serde types, ParsedWebSignal enum,
+  parse_web_payload, encode_web_offer/encode_web_answer/encode_web_ice_candidate,
+  bundle_to_web_payloads, conversion helpers, 18 tests
+- `--interop-signal {daemon_v1, web_v1}` CLI flag (default: daemon_v1)
+- send_web_payloads() and receive_web_bundle() in rendezvous.rs
+- 3s ICE collection window for trickled candidates in web_v1 mode
+- Daemon-format fallback in receive_web_bundle (defensive compat)
+
+### Changed
+- `src/rendezvous.rs` — offerer/answerer branching on interop_signal for offer
+  send and answer receive
+- `src/main.rs` — `pub(crate) mod web_signal`, Args.interop_signal field, startup log
+
+### Tests
+- 157 total (142 bolt-daemon + 15 relay)
+
+## EVENT-1 — Pairing approval hook (6328ce2)
+
+Wire pairing approval into the rendezvous answerer handshake. When the
+answerer receives a hello from a remote peer, it consults the trust store
+and (if needed) emits pairing.request over IPC for a UI decision.
+
+### Added
+- `src/ipc/trust.rs` — TrustStore (JSON persistence at ~/.config/bolt-daemon/trust.json),
+  PairingPolicy enum (ask/deny/allow), check_pairing_approval() function
+- `--pairing-policy {ask, deny, allow}` CLI flag (default: ask)
+- 12 new trust tests
+
+### Changed
+- `src/rendezvous.rs` — pairing approval gate in run_answerer_rendezvous
+  (after hello validation, before ack)
+- `src/main.rs` — IPC server start in Default mode, trust_path plumbing,
+  Args.pairing_policy field
+- `src/ipc/mod.rs` — `pub mod trust;`
+
+### Design
+- Answerer-only: offerer explicitly chose to connect
+- Trust keyed by from_peer (session-specific; will re-key to identity keys later)
+- Fail-closed: no IPC server or no UI connected → deny all
+- Policy override: --pairing-policy allow bypasses IPC, deny rejects all
+
+### Tests
+- 142 total (127 bolt-daemon + 15 relay)
+
 ## EVENT-0 — Daemon ↔ UI IPC skeleton (e9ada46)
 
 Add local Unix-socket NDJSON IPC between bolt-daemon and a UI client.

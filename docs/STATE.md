@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag | `daemon-v0.1.9-event-0-ipc-skeleton` |
-| Commit | `e9ada46` (merge `c314c25`) |
+| Tag | `daemon-v0.2.2-interop-2-web-hello` |
+| Commit | `dd82669` |
 | Branch | `main` |
-| Phase | EVENT-0 — daemon ↔ UI IPC skeleton for approval prompts |
+| Phase | INTEROP-2 — Web HELLO handshake compatibility |
 
 ## Test Status
 
-- 122 tests (107 bolt-daemon + 15 relay)
+- 181 tests (166 bolt-daemon + 15 relay)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -23,6 +23,17 @@
 | Default | Stable | WebRTC transport with file or rendezvous signaling |
 | Smoke | Stable | Deterministic payload transfer + SHA-256 verification |
 | Simulate | NEW | IPC-only mode for testing event/decision round-trip |
+
+## Interop Modes
+
+| Flag | Values | Default | Notes |
+|------|--------|---------|-------|
+| `--interop-signal` | `daemon_v1`, `web_v1` | `daemon_v1` | Inner signaling payload format |
+| `--interop-hello` | `daemon_hello_v1`, `web_hello_v1` | `daemon_hello_v1` | HELLO handshake protocol |
+
+- `web_hello_v1` requires `--signal rendezvous` + `--interop-signal web_v1` (fail-closed validation)
+- `web_v1` signaling uses `{type, data, from, to}` schema matching bolt-transport-web
+- `web_hello_v1` uses NaCl-box encrypted JSON HELLO over DataChannel
 
 ## Signaling Modes
 
@@ -38,6 +49,28 @@
 | LAN | Stable (default) | Private/link-local IPs only |
 | Overlay | Stable | LAN + CGNAT 100.64.0.0/10 (Tailscale) |
 | Global | Stable | All valid IPs (ByteBolt) |
+
+## Web HELLO Handshake (INTEROP-2)
+
+- Identity keypairs: ephemeral per process run (`generate_identity_keypair`)
+- Key exchange: identity public keys carried in signaling `publicKey` field
+- Outer frame: `{"type":"hello","payload":"<sealed base64>"}`
+- Inner plaintext: `{"type":"hello","version":1,"identityPublicKey":"<b64>","capabilities":[...]}`
+- Encryption: NaCl box via `bolt_core::crypto::{seal_box_payload, open_box_payload}`
+- Capabilities: `["bolt.profile-envelope-v1"]` (negotiated via set intersection)
+- Offerer sends HELLO first; answerer receives, then replies
+- No-downgrade: legacy `b"bolt-hello-v1"` rejected in `web_hello_v1` mode
+- Known gaps (INTEROP-3 prerequisites):
+  - HelloState not yet wired into runtime (low-risk: single-shot flows)
+  - Negotiated capabilities logged and dropped (no session context struct yet)
+
+## Pairing Approval (EVENT-1)
+
+- Answerer-only: offerer explicitly chose to connect
+- Trust store: `~/.config/bolt-daemon/trust.json` keyed by `from_peer`
+- `--pairing-policy {ask, deny, allow}` CLI flag (default: ask)
+- Fail-closed: no IPC server or no UI connected → deny all
+- Stored decisions: `allow_always` / `deny_always` persist; `_once` variants do not
 
 ## IPC Channel (EVENT-0)
 
@@ -73,10 +106,13 @@
 
 ```
 src/main.rs            — CLI, args, handlers, file mode, simulate mode, E2E flow
+src/web_hello.rs       — Web HELLO handshake: NaCl-box encrypted JSON, capability negotiation
+src/web_signal.rs      — Web inner signaling payloads: {type,data,from,to} schema
 src/ipc/mod.rs         — IPC module root
 src/ipc/types.rs       — IpcMessage, IpcKind, event/decision payload structs
 src/ipc/server.rs      — IpcServer, bounded reader, client handler
 src/ipc/id.rs          — Monotonic request ID generator
+src/ipc/trust.rs       — TrustStore persistence + check_pairing_approval()
 src/ipc_client_main.rs — bolt-ipc-client dev binary
 src/smoke.rs           — Smoke-test harness (sha256 via bolt-core)
 src/ice_filter.rs      — NetworkScope policy + candidate filtering (33 tests)

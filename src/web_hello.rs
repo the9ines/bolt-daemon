@@ -75,14 +75,11 @@ pub struct WebHelloInner {
 
 /// Tracks whether the HELLO exchange has completed.
 /// Rejects duplicate HELLOs (fail-closed).
-/// Currently used in tests; will be wired into runtime path
-/// when persistent sessions are added.
-#[allow(dead_code)]
-pub struct HelloState {
+/// Wired into SessionContext at runtime (INTEROP-3).
+pub(crate) struct HelloState {
     completed: bool,
 }
 
-#[allow(dead_code)]
 impl HelloState {
     pub fn new() -> Self {
         Self { completed: false }
@@ -97,6 +94,7 @@ impl HelloState {
         Ok(())
     }
 
+    #[allow(dead_code)] // Called via SessionContext::is_hello_complete(); tested
     pub fn is_completed(&self) -> bool {
         self.completed
     }

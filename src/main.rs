@@ -15,9 +15,11 @@
 //! Usage:
 //!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
 
+pub(crate) mod envelope;
 mod ice_filter;
 pub(crate) mod ipc;
 mod rendezvous;
+pub(crate) mod session;
 mod smoke;
 pub(crate) mod web_hello;
 pub(crate) mod web_signal;
@@ -90,6 +92,15 @@ pub(crate) enum SimulateEvent {
     IncomingTransfer,
 }
 
+/// Selects which DataChannel mode the daemon uses after HELLO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteropDcMode {
+    /// Legacy: return immediately after HELLO (default).
+    DaemonDcV1,
+    /// Web: post-HELLO envelope recv loop.
+    WebDcV1,
+}
+
 #[derive(Debug)]
 pub(crate) struct Args {
     pub(crate) role: Option<Role>,
@@ -110,6 +121,7 @@ pub(crate) struct Args {
     pub(crate) pairing_policy: ipc::trust::PairingPolicy,
     pub(crate) interop_signal: web_signal::InteropSignal,
     pub(crate) interop_hello: web_hello::InteropHelloMode,
+    pub(crate) interop_dc: InteropDcMode,
 }
 
 fn parse_args() -> Args {
@@ -134,6 +146,7 @@ fn parse_args() -> Args {
     let mut pairing_policy = None;
     let mut interop_signal = None;
     let mut interop_hello = None;
+    let mut interop_dc = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -362,6 +375,20 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--interop-dc" => {
+                i += 1;
+                interop_dc = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("daemon_dc_v1") => InteropDcMode::DaemonDcV1,
+                    Some("web_dc_v1") => InteropDcMode::WebDcV1,
+                    other => {
+                        eprintln!(
+                            "--interop-dc must be 'daemon_dc_v1' or 'web_dc_v1', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -423,6 +450,15 @@ fn parse_args() -> Args {
         }
     }
 
+    // ── Fail-closed validation for web_dc_v1 ────────────────
+    let interop_dc_val = interop_dc.unwrap_or(InteropDcMode::DaemonDcV1);
+    if interop_dc_val == InteropDcMode::WebDcV1
+        && interop_hello_val != web_hello::InteropHelloMode::WebHelloV1
+    {
+        eprintln!("FATAL: --interop-dc web_dc_v1 requires --interop-hello web_hello_v1");
+        std::process::exit(1);
+    }
+
     let offer =
         offer.unwrap_or_else(|| SignalPath::File(format!("{}/offer.json", DEFAULT_SIGNAL_DIR)));
     let answer =
@@ -453,6 +489,7 @@ fn parse_args() -> Args {
         pairing_policy: pairing_policy.unwrap_or(ipc::trust::PairingPolicy::Ask),
         interop_signal: interop_signal_val,
         interop_hello: interop_hello_val,
+        interop_dc: interop_dc_val,
     }
 }
 
@@ -1109,7 +1146,7 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} interop_dc={:?} timeout={}s",
         args.role,
         args.signal_mode,
         args.network_scope,
@@ -1117,6 +1154,7 @@ fn main() {
         args.pairing_policy,
         args.interop_signal,
         args.interop_hello,
+        args.interop_dc,
         args.phase_timeout.as_secs()
     );
 

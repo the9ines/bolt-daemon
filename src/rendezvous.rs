@@ -500,7 +500,11 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
 ///
 /// INVARIANT: `--signal rendezvous` is required. No fallback to file mode.
 /// If the server is down or peer is unreachable, exit 1.
-pub fn run_answerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_answerer_rendezvous(
+    args: &Args,
+    ipc_server: Option<&crate::ipc::server::IpcServer>,
+    trust_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed: these are validated in parse_args() but double-check here
     let room = args
         .room
@@ -560,6 +564,22 @@ pub fn run_answerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Er
             .into());
         }
     }
+
+    // ── Pairing approval gate ──────────────────────────────────
+    let remote_peer = hello.from_peer.as_deref().unwrap_or(expect_peer);
+    if !crate::ipc::trust::check_pairing_approval(
+        ipc_server,
+        trust_path,
+        remote_peer,
+        args.pairing_policy,
+    ) {
+        return Err(format!(
+            "pairing denied for peer '{}' — aborting handshake",
+            remote_peer
+        )
+        .into());
+    }
+    eprintln!("[rendezvous] pairing approved for peer '{}'", remote_peer);
 
     // Send ack to expected peer
     let ack_payload = SignalPayload {

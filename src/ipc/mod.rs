@@ -5,4 +5,5 @@
 
 pub mod id;
 pub mod server;
+pub mod trust;
 pub mod types;

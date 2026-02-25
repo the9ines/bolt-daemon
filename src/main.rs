@@ -105,6 +105,7 @@ pub(crate) struct Args {
     pub(crate) daemon_mode: DaemonMode,
     pub(crate) smoke_config: smoke::SmokeConfig,
     pub(crate) simulate_event: Option<SimulateEvent>,
+    pub(crate) pairing_policy: ipc::trust::PairingPolicy,
 }
 
 fn parse_args() -> Args {
@@ -126,6 +127,7 @@ fn parse_args() -> Args {
     let mut smoke_repeat = None;
     let mut smoke_json = false;
     let mut simulate_event = None;
+    let mut pairing_policy = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -311,6 +313,21 @@ fn parse_args() -> Args {
             "--json" => {
                 smoke_json = true;
             }
+            "--pairing-policy" => {
+                i += 1;
+                pairing_policy = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("ask") => ipc::trust::PairingPolicy::Ask,
+                    Some("deny") => ipc::trust::PairingPolicy::Deny,
+                    Some("allow") => ipc::trust::PairingPolicy::Allow,
+                    other => {
+                        eprintln!(
+                            "--pairing-policy must be 'ask', 'deny', or 'allow', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -385,6 +402,7 @@ fn parse_args() -> Args {
         daemon_mode,
         smoke_config,
         simulate_event,
+        pairing_policy: pairing_policy.unwrap_or(ipc::trust::PairingPolicy::Ask),
     }
 }
 
@@ -1041,16 +1059,37 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} timeout={}s",
         args.role,
         args.signal_mode,
         args.network_scope,
         args.daemon_mode,
+        args.pairing_policy,
         args.phase_timeout.as_secs()
     );
 
     match args.daemon_mode {
         DaemonMode::Default => {
+            use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
+            use ipc::trust::default_trust_path;
+
+            // Start IPC server for UI communication.
+            // Fail-closed: if IPC start fails, pairing will deny all.
+            let ipc_server = match IpcServer::start(DEFAULT_SOCKET_PATH) {
+                Ok(s) => {
+                    eprintln!("[bolt-daemon] IPC server started");
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[bolt-daemon] WARNING: IPC server failed to start: {e} \
+                         — pairing will deny all"
+                    );
+                    None
+                }
+            };
+            let trust_path = default_trust_path();
+
             let role = args
                 .role
                 .as_ref()
@@ -1062,7 +1101,7 @@ fn main() {
                     rendezvous::run_offerer_rendezvous(&args)
                 }
                 (Role::Answerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_answerer_rendezvous(&args)
+                    rendezvous::run_answerer_rendezvous(&args, ipc_server.as_ref(), &trust_path)
                 }
             };
             match result {

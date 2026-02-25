@@ -5,6 +5,10 @@ edition = "2021"
 description = "Headless WebRTC transport spike for the Bolt Protocol"
 license = "MIT"
 
+[lib]
+name = "bolt_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bolt-daemon"
 path = "src/main.rs"

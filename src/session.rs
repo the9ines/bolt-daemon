@@ -17,7 +17,7 @@ use crate::web_hello::HelloState;
 /// Invariants:
 /// - `hello_state` is completed at construction time (HELLO already done).
 /// - `session_legacy` is never true in web_dc_v1 mode (enforced by caller).
-pub(crate) struct SessionContext {
+pub struct SessionContext {
     pub local_keypair: KeyPair,
     pub remote_public_key: [u8; 32],
     pub negotiated_capabilities: Vec<String>,

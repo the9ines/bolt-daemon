@@ -15,14 +15,14 @@
 //! Usage:
 //!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
 
-pub(crate) mod dc_messages;
-pub(crate) mod envelope;
+// Core protocol modules live in lib.rs for integration-test access.
+// Re-export into the binary crate so existing `crate::` paths still resolve.
+pub(crate) use bolt_daemon::{dc_messages, envelope, session, web_hello, HELLO_PAYLOAD};
+
 mod ice_filter;
 pub(crate) mod ipc;
 mod rendezvous;
-pub(crate) mod session;
 mod smoke;
-pub(crate) mod web_hello;
 pub(crate) mod web_signal;
 
 use std::fs;
@@ -42,10 +42,6 @@ use serde::{Deserialize, Serialize};
 pub(crate) use ice_filter::NetworkScope;
 
 // ── Constants ───────────────────────────────────────────────
-
-/// Deterministic payload exchanged during the spike.
-/// Both peers send and verify this exact byte sequence.
-pub(crate) const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";
 
 /// DataChannel label.
 pub(crate) const DC_LABEL: &str = "bolt";

@@ -16,6 +16,7 @@
 //!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
 
 mod ice_filter;
+pub(crate) mod ipc;
 mod rendezvous;
 mod smoke;
 
@@ -78,11 +79,18 @@ pub(crate) enum SignalMode {
 pub(crate) enum DaemonMode {
     Default,
     Smoke,
+    Simulate,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SimulateEvent {
+    PairingRequest,
+    IncomingTransfer,
 }
 
 #[derive(Debug)]
 pub(crate) struct Args {
-    pub(crate) role: Role,
+    pub(crate) role: Option<Role>,
     offer_path: SignalPath,
     answer_path: SignalPath,
     pub(crate) signal_mode: SignalMode,
@@ -96,6 +104,7 @@ pub(crate) struct Args {
     pub(crate) network_scope: NetworkScope,
     pub(crate) daemon_mode: DaemonMode,
     pub(crate) smoke_config: smoke::SmokeConfig,
+    pub(crate) simulate_event: Option<SimulateEvent>,
 }
 
 fn parse_args() -> Args {
@@ -116,6 +125,7 @@ fn parse_args() -> Args {
     let mut smoke_bytes = None;
     let mut smoke_repeat = None;
     let mut smoke_json = false;
+    let mut simulate_event = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -254,8 +264,26 @@ fn parse_args() -> Args {
                 daemon_mode = Some(match argv.get(i).map(|s| s.as_str()) {
                     Some("default") => DaemonMode::Default,
                     Some("smoke") => DaemonMode::Smoke,
+                    Some("simulate") => DaemonMode::Simulate,
                     other => {
-                        eprintln!("--mode must be 'default' or 'smoke', got {:?}", other);
+                        eprintln!(
+                            "--mode must be 'default', 'smoke', or 'simulate', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--simulate-event" => {
+                i += 1;
+                simulate_event = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("pairing-request") => SimulateEvent::PairingRequest,
+                    Some("incoming-transfer") => SimulateEvent::IncomingTransfer,
+                    other => {
+                        eprintln!(
+                            "--simulate-event must be 'pairing-request' or 'incoming-transfer', got {:?}",
+                            other
+                        );
                         std::process::exit(1);
                     }
                 });
@@ -291,12 +319,15 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let role = role.unwrap_or_else(|| {
+    let daemon_mode = daemon_mode.unwrap_or(DaemonMode::Default);
+
+    // Simulate mode does not require --role
+    if daemon_mode != DaemonMode::Simulate && role.is_none() {
         eprintln!(
             "Usage: bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]"
         );
         std::process::exit(1);
-    });
+    }
 
     let signal_mode = signal_mode.unwrap_or(SignalMode::File);
     let phase_timeout = phase_timeout_secs
@@ -315,11 +346,11 @@ fn parse_args() -> Args {
             eprintln!("FATAL: --signal rendezvous requires --session");
             std::process::exit(1);
         }
-        if matches!(role, Role::Offerer) && to_peer.is_none() {
+        if matches!(role, Some(Role::Offerer)) && to_peer.is_none() {
             eprintln!("FATAL: --signal rendezvous --role offerer requires --to <peer_code>");
             std::process::exit(1);
         }
-        if matches!(role, Role::Answerer) && expect_peer.is_none() {
+        if matches!(role, Some(Role::Answerer)) && expect_peer.is_none() {
             eprintln!(
                 "FATAL: --signal rendezvous --role answerer requires --expect-peer <peer_code>"
             );
@@ -332,7 +363,6 @@ fn parse_args() -> Args {
     let answer =
         answer.unwrap_or_else(|| SignalPath::File(format!("{}/answer.json", DEFAULT_SIGNAL_DIR)));
 
-    let daemon_mode = daemon_mode.unwrap_or(DaemonMode::Default);
     let smoke_config = smoke::SmokeConfig {
         bytes: smoke_bytes.unwrap_or(smoke::DEFAULT_BYTES),
         repeat: smoke_repeat.unwrap_or(smoke::DEFAULT_REPEAT),
@@ -354,6 +384,7 @@ fn parse_args() -> Args {
         network_scope: network_scope.unwrap_or(NetworkScope::Lan),
         daemon_mode,
         smoke_config,
+        simulate_event,
     }
 }
 
@@ -882,7 +913,7 @@ fn run_smoke_answerer(args: &Args) -> Result<(), smoke::SmokeError> {
 // ── Smoke mode rendezvous (via narrow hook) ─────────────────
 
 fn run_smoke_rendezvous(args: &Args) -> Result<(), smoke::SmokeError> {
-    let is_offerer = matches!(args.role, Role::Offerer);
+    let is_offerer = matches!(args.role, Some(Role::Offerer));
     rendezvous::run_rendezvous_session_with_exchange(args, |ctx| {
         for run in 1..=args.smoke_config.repeat {
             if args.smoke_config.repeat > 1 {
@@ -908,6 +939,103 @@ fn run_smoke_rendezvous(args: &Args) -> Result<(), smoke::SmokeError> {
     })
 }
 
+// ── Simulate mode ────────────────────────────────────────────
+
+fn run_simulate(simulate_event: SimulateEvent) {
+    use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
+    use ipc::types::{
+        DaemonStatusPayload, IpcMessage, PairingRequestPayload, TransferIncomingRequestPayload,
+    };
+
+    let server = match IpcServer::start(DEFAULT_SOCKET_PATH) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[simulate] FATAL: failed to start IPC server: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Wait up to 10s for a client to connect
+    eprintln!("[simulate] waiting for IPC client to connect...");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !server.is_ui_connected() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("[simulate] TIMEOUT: no IPC client connected within 10s");
+            std::process::exit(1);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("[simulate] IPC client connected");
+
+    // Emit daemon.status
+    let status = DaemonStatusPayload {
+        connected_peers: 0,
+        ui_connected: true,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    server.emit_event(IpcMessage::new_event(
+        "daemon.status",
+        serde_json::to_value(&status).unwrap(),
+    ));
+
+    // Small delay to let status arrive before the prompt
+    thread::sleep(Duration::from_millis(100));
+
+    // Emit the simulated event
+    let request_id = ipc::id::generate_request_id();
+    match simulate_event {
+        SimulateEvent::PairingRequest => {
+            let payload = PairingRequestPayload {
+                request_id: request_id.clone(),
+                remote_device_name: "Simulated iPhone 15".to_string(),
+                remote_device_type: "mobile".to_string(),
+                remote_identity_pk_b64: "c2ltdWxhdGVkLXB1YmxpYy1rZXk=".to_string(),
+                sas: "482917".to_string(),
+                capabilities_requested: vec!["file_transfer".to_string()],
+            };
+            eprintln!("[simulate] emitting pairing.request (request_id={request_id})");
+            server.emit_event(IpcMessage::new_event(
+                "pairing.request",
+                serde_json::to_value(&payload).unwrap(),
+            ));
+        }
+        SimulateEvent::IncomingTransfer => {
+            let payload = TransferIncomingRequestPayload {
+                request_id: request_id.clone(),
+                from_device_name: "Simulated MacBook Pro".to_string(),
+                from_identity_pk_b64: "c2ltdWxhdGVkLXB1YmxpYy1rZXk=".to_string(),
+                file_name: "test-document.pdf".to_string(),
+                file_size_bytes: 2_097_152,
+                sha256_hex: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                ),
+                mime: Some("application/pdf".to_string()),
+            };
+            eprintln!("[simulate] emitting transfer.incoming.request (request_id={request_id})");
+            server.emit_event(IpcMessage::new_event(
+                "transfer.incoming.request",
+                serde_json::to_value(&payload).unwrap(),
+            ));
+        }
+    }
+
+    // Await decision with 30s timeout
+    eprintln!("[simulate] awaiting decision for request_id={request_id} (30s timeout)...");
+    match server.await_decision(&request_id, Duration::from_secs(30)) {
+        Some(decision) => {
+            eprintln!(
+                "[simulate] decision received: {:?} (note: {:?})",
+                decision.decision, decision.note
+            );
+            std::process::exit(0);
+        }
+        None => {
+            eprintln!("[simulate] TIMEOUT: no decision received — fail-closed deny");
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── Entry ───────────────────────────────────────────────────
 
 fn main() {
@@ -923,7 +1051,11 @@ fn main() {
 
     match args.daemon_mode {
         DaemonMode::Default => {
-            let result = match (&args.role, &args.signal_mode) {
+            let role = args
+                .role
+                .as_ref()
+                .expect("--role required for default mode");
+            let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
                 (Role::Offerer, SignalMode::Rendezvous) => {
@@ -945,7 +1077,8 @@ fn main() {
             }
         }
         DaemonMode::Smoke => {
-            let result = match (&args.role, &args.signal_mode) {
+            let role = args.role.as_ref().expect("--role required for smoke mode");
+            let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_smoke_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_smoke_answerer(&args),
                 (Role::Offerer, SignalMode::Rendezvous)
@@ -966,6 +1099,13 @@ fn main() {
                     std::process::exit(e.exit_code());
                 }
             }
+        }
+        DaemonMode::Simulate => {
+            let event = args.simulate_event.unwrap_or_else(|| {
+                eprintln!("--simulate-event required in simulate mode");
+                std::process::exit(1);
+            });
+            run_simulate(event);
         }
     }
 }

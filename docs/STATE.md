@@ -4,17 +4,28 @@
 
 | Field | Value |
 |-------|-------|
-| Tag | `daemon-v0.2.4-interop-4-min-msgset` |
-| Commit | `d7a79c4` |
-| Branch | `feature/interop-4-min-msgset` |
-| Phase | INTEROP-4 — Minimal post-HELLO message set |
+| Tag (main) | `daemon-v0.2.4-interop-4-min-msgset` |
+| Commit (main) | `719752d` (merge of `d7a79c4`) |
+| Tag (feature) | `daemon-v0.2.5-h3-golden-vectors` |
+| Commit (feature) | `3751118` |
+| Branch | `feature/h4-panic-elimination` (current), `feature/h3-golden-vectors` (H3 tagged) |
+| Phase | H4 — Panic surface elimination (in-flight) |
 
 ## Test Status
 
-- 210 tests (195 bolt-daemon + 15 relay)
+- 215+ tests (with `--features test-support`, on feature branch)
+- 210 tests (main, without test-support feature)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
+
+## H-Phase Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| H3 | DONE | Golden vector tests, `daemon-v0.2.5-h3-golden-vectors` (`3751118`), feature branch |
+| H4 | In-flight | Panic surface elimination, `feature/h4-panic-elimination` |
+| H5 | Planned | Downgrade resistance + error code validation |
 
 ## Daemon Modes
 

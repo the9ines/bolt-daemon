@@ -2,6 +2,30 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## H3 — Golden Vector Integration Tests (3751118)
+
+Add HELLO-open and envelope-open golden vector tests consuming shared
+vector files from bolt-core-sdk. Feature-gated behind `test-support`
+to avoid exposing test internals in production builds.
+
+### Added
+- `tests/` golden vector tests for HELLO-open and envelope-open operations
+  using shared vector files from bolt-core-sdk
+- `test-support` cargo feature gating test internals (pub(crate) → pub)
+
+### Changed
+- `Cargo.toml` — `test-support` feature added
+- Test internals in `web_hello.rs` and `envelope.rs` conditionally public
+
+### Tests
+- 215+ total (with `--features test-support`)
+
+**Tag:** `daemon-v0.2.5-h3-golden-vectors`
+**Commit:** `3751118`
+**Branch:** `feature/h3-golden-vectors` → `feature/h4-panic-elimination` (not yet merged to main)
+
+---
+
 ## INTEROP-4 — Minimal post-HELLO message set (d7a79c4)
 
 Prove the INTEROP-3 session + profile-envelope-v1 path works end-to-end

@@ -19,6 +19,7 @@ mod ice_filter;
 pub(crate) mod ipc;
 mod rendezvous;
 mod smoke;
+pub(crate) mod web_hello;
 pub(crate) mod web_signal;
 
 use std::fs;
@@ -108,6 +109,7 @@ pub(crate) struct Args {
     pub(crate) simulate_event: Option<SimulateEvent>,
     pub(crate) pairing_policy: ipc::trust::PairingPolicy,
     pub(crate) interop_signal: web_signal::InteropSignal,
+    pub(crate) interop_hello: web_hello::InteropHelloMode,
 }
 
 fn parse_args() -> Args {
@@ -131,6 +133,7 @@ fn parse_args() -> Args {
     let mut simulate_event = None;
     let mut pairing_policy = None;
     let mut interop_signal = None;
+    let mut interop_hello = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -345,6 +348,20 @@ fn parse_args() -> Args {
                     }
                 });
             }
+            "--interop-hello" => {
+                i += 1;
+                interop_hello = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("daemon_hello_v1") => web_hello::InteropHelloMode::DaemonHelloV1,
+                    Some("web_hello_v1") => web_hello::InteropHelloMode::WebHelloV1,
+                    other => {
+                        eprintln!(
+                            "--interop-hello must be 'daemon_hello_v1' or 'web_hello_v1', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -392,6 +409,20 @@ fn parse_args() -> Args {
         }
     }
 
+    // ── Fail-closed validation for web_hello_v1 ──────────────
+    let interop_hello_val = interop_hello.unwrap_or(web_hello::InteropHelloMode::DaemonHelloV1);
+    let interop_signal_val = interop_signal.unwrap_or(web_signal::InteropSignal::DaemonV1);
+    if interop_hello_val == web_hello::InteropHelloMode::WebHelloV1 {
+        if signal_mode != SignalMode::Rendezvous {
+            eprintln!("FATAL: --interop-hello web_hello_v1 requires --signal rendezvous");
+            std::process::exit(1);
+        }
+        if interop_signal_val != web_signal::InteropSignal::WebV1 {
+            eprintln!("FATAL: --interop-hello web_hello_v1 requires --interop-signal web_v1");
+            std::process::exit(1);
+        }
+    }
+
     let offer =
         offer.unwrap_or_else(|| SignalPath::File(format!("{}/offer.json", DEFAULT_SIGNAL_DIR)));
     let answer =
@@ -420,7 +451,8 @@ fn parse_args() -> Args {
         smoke_config,
         simulate_event,
         pairing_policy: pairing_policy.unwrap_or(ipc::trust::PairingPolicy::Ask),
-        interop_signal: interop_signal.unwrap_or(web_signal::InteropSignal::DaemonV1),
+        interop_signal: interop_signal_val,
+        interop_hello: interop_hello_val,
     }
 }
 
@@ -1077,13 +1109,14 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} timeout={}s",
         args.role,
         args.signal_mode,
         args.network_scope,
         args.daemon_mode,
         args.pairing_policy,
         args.interop_signal,
+        args.interop_hello,
         args.phase_timeout.as_secs()
     );
 

@@ -302,14 +302,18 @@ fn wait_for_signal(
 
 /// Send a daemon SignalBundle as web-schema payloads (1 SDP + N ICE candidates).
 /// Each web payload is sent as a separate rendezvous Signal message.
+/// If `identity_pk_b64` is Some, the identity public key is included in the
+/// SDP payload's `publicKey` field (required for INTEROP-2 web HELLO).
 fn send_web_payloads(
     ws: &mut WsStream,
     to: &str,
     bundle: &crate::SignalBundle,
     sdp_type: &str,
     from_peer: &str,
+    identity_pk_b64: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payloads = crate::web_signal::bundle_to_web_payloads(bundle, sdp_type, from_peer, to);
+    let payloads =
+        crate::web_signal::bundle_to_web_payloads(bundle, sdp_type, from_peer, to, identity_pk_b64);
 
     for (i, payload) in payloads.iter().enumerate() {
         let msg = ClientMessage::Signal {
@@ -343,6 +347,9 @@ fn send_web_payloads(
 /// - ICE collection timeout expires (3s after SDP received), OR
 /// - End-of-candidates marker received (empty candidate string), OR
 /// - Phase deadline expires
+///
+/// Returns `(SignalBundle, Option<String>)` — the assembled bundle and the
+/// remote peer's identity public key (base64), if present in the SDP payload.
 fn receive_web_bundle(
     ws: &mut WsStream,
     deadline: Instant,
@@ -351,10 +358,11 @@ fn receive_web_bundle(
     session: &str,
     expected_sdp_type: &str,
     network_scope: crate::NetworkScope,
-) -> Result<crate::SignalBundle, Box<dyn std::error::Error>> {
+) -> Result<(crate::SignalBundle, Option<String>), Box<dyn std::error::Error>> {
     use crate::web_signal::{self, ParsedWebSignal};
 
     let mut sdp_info: Option<crate::SdpInfo> = None;
+    let mut remote_pk_b64: Option<String> = None;
     let mut candidates: Vec<crate::CandidateInfo> = Vec::new();
     let mut ice_deadline: Option<Instant> = None;
 
@@ -399,19 +407,25 @@ fn receive_web_bundle(
                 // Try web schema first
                 match web_signal::parse_web_payload(&payload) {
                     Ok(Some(parsed)) => match parsed {
-                        ParsedWebSignal::Offer { sdp_type, sdp }
-                            if expected_sdp_type == "offer" =>
-                        {
+                        ParsedWebSignal::Offer {
+                            sdp_type,
+                            sdp,
+                            public_key_b64,
+                        } if expected_sdp_type == "offer" => {
                             eprintln!("[INTEROP-1] received web offer from '{}'", from_peer);
                             sdp_info = Some(crate::SdpInfo { sdp_type, sdp });
+                            remote_pk_b64 = public_key_b64;
                             ice_deadline =
                                 Some(Instant::now() + Duration::from_secs(ICE_COLLECT_SECS));
                         }
-                        ParsedWebSignal::Answer { sdp_type, sdp }
-                            if expected_sdp_type == "answer" =>
-                        {
+                        ParsedWebSignal::Answer {
+                            sdp_type,
+                            sdp,
+                            public_key_b64,
+                        } if expected_sdp_type == "answer" => {
                             eprintln!("[INTEROP-1] received web answer from '{}'", from_peer);
                             sdp_info = Some(crate::SdpInfo { sdp_type, sdp });
+                            remote_pk_b64 = public_key_b64;
                             ice_deadline =
                                 Some(Instant::now() + Duration::from_secs(ICE_COLLECT_SECS));
                         }
@@ -466,7 +480,7 @@ fn receive_web_bundle(
                                         "[INTEROP-1] received daemon-format {} (fallback compat)",
                                         expected_sdp_type
                                     );
-                                    return Ok(bundle);
+                                    return Ok((bundle, None));
                                 }
                             }
                         }
@@ -493,10 +507,13 @@ fn receive_web_bundle(
         expected_sdp_type,
         candidates.len()
     );
-    Ok(crate::SignalBundle {
-        description,
-        candidates,
-    })
+    Ok((
+        crate::SignalBundle {
+            description,
+            candidates,
+        },
+        remote_pk_b64,
+    ))
 }
 
 // ── Smoke exchange context ──────────────────────────────────
@@ -547,6 +564,25 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     if args.interop_signal == crate::web_signal::InteropSignal::WebV1 {
         eprintln!("[INTEROP-1] web_v1 mode enabled — using web payload schema");
     }
+    let use_web_hello = args.interop_hello == crate::web_hello::InteropHelloMode::WebHelloV1;
+    if use_web_hello {
+        eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
+    }
+
+    // Generate identity keypair for web HELLO (if enabled)
+    let local_keypair = if use_web_hello {
+        let kp = bolt_core::identity::generate_identity_keypair();
+        eprintln!(
+            "[INTEROP-2] identity keypair generated (pk={})",
+            bolt_core::encoding::to_base64(&kp.public_key)
+        );
+        Some(kp)
+    } else {
+        None
+    };
+    let local_pk_b64 = local_keypair
+        .as_ref()
+        .map(|kp| bolt_core::encoding::to_base64(&kp.public_key));
 
     let deadline = Instant::now() + args.phase_timeout;
 
@@ -649,7 +685,14 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     match args.interop_signal {
         crate::web_signal::InteropSignal::WebV1 => {
             eprintln!("[INTEROP-1] offerer sending web-format offer");
-            send_web_payloads(&mut ws, to_peer, &offer_bundle, "offer", &peer_id)?;
+            send_web_payloads(
+                &mut ws,
+                to_peer,
+                &offer_bundle,
+                "offer",
+                &peer_id,
+                local_pk_b64.as_deref(),
+            )?;
         }
         crate::web_signal::InteropSignal::DaemonV1 => {
             let offer_payload = SignalPayload {
@@ -668,7 +711,7 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     }
 
     // Wait for answer from target peer (deadline-respecting, filtered)
-    let answer_bundle = match args.interop_signal {
+    let (answer_bundle, remote_pk_b64) = match args.interop_signal {
         crate::web_signal::InteropSignal::WebV1 => receive_web_bundle(
             &mut ws,
             deadline,
@@ -680,7 +723,8 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
         )?,
         crate::web_signal::InteropSignal::DaemonV1 => {
             let answer_sp = wait_for_signal(&mut ws, deadline, to_peer, room, session, "answer")?;
-            answer_sp.bundle.ok_or("answer signal missing bundle")?
+            let bundle = answer_sp.bundle.ok_or("answer signal missing bundle")?;
+            (bundle, None)
         }
     };
 
@@ -694,28 +738,59 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[offerer] DataChannel open");
 
-    // Send hello payload
-    dc.send(HELLO_PAYLOAD)?;
-    eprintln!(
-        "[offerer] sent: {:?}",
-        std::str::from_utf8(HELLO_PAYLOAD).unwrap_or("<binary>")
-    );
+    // ── DataChannel HELLO exchange ──────────────────────────
+    if use_web_hello {
+        // INTEROP-2: Encrypted web HELLO
+        let local_kp = local_keypair.as_ref().unwrap();
+        let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
+            "[INTEROP-2_HELLO_FAIL] no remote identity key in answer signal — cannot encrypt HELLO",
+        )?;
+        let remote_pk = crate::web_hello::decode_public_key(remote_pk_b64_str)?;
+        eprintln!("[INTEROP-2] remote identity pk: {}", remote_pk_b64_str);
 
-    // Wait for echo
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or("phase timeout expired waiting for echo")?;
-    let response = dc_msg_rx.recv_timeout(remaining)?;
-    if response == HELLO_PAYLOAD {
-        eprintln!("[offerer] SUCCESS — received matching payload");
-        Ok(())
+        // Send encrypted HELLO
+        let hello_msg = crate::web_hello::build_hello_message(local_kp, &remote_pk)?;
+        dc.send(hello_msg.as_bytes())?;
+        eprintln!("[INTEROP-2] sent encrypted HELLO");
+
+        // Receive + decrypt remote HELLO
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("phase timeout expired waiting for web HELLO")?;
+        let response = dc_msg_rx.recv_timeout(remaining)?;
+        let remote_hello = crate::web_hello::parse_hello_message(&response, &remote_pk, local_kp)?;
+
+        // Negotiate capabilities
+        let local_caps = crate::web_hello::daemon_capabilities();
+        let negotiated =
+            crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
+        eprintln!(
+            "[INTEROP-2] HELLO exchange complete — remote_pk={}, negotiated_caps={:?}",
+            remote_hello.identity_public_key, negotiated
+        );
     } else {
-        Err(format!(
-            "payload mismatch: expected {:?}, got {:?}",
-            HELLO_PAYLOAD, response
-        )
-        .into())
+        // Legacy daemon HELLO
+        dc.send(HELLO_PAYLOAD)?;
+        eprintln!(
+            "[offerer] sent: {:?}",
+            std::str::from_utf8(HELLO_PAYLOAD).unwrap_or("<binary>")
+        );
+
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("phase timeout expired waiting for echo")?;
+        let response = dc_msg_rx.recv_timeout(remaining)?;
+        if response != HELLO_PAYLOAD {
+            return Err(format!(
+                "payload mismatch: expected {:?}, got {:?}",
+                HELLO_PAYLOAD, response
+            )
+            .into());
+        }
+        eprintln!("[offerer] SUCCESS — received matching payload");
     }
+
+    Ok(())
 }
 
 /// Answerer flow via rendezvous signaling.
@@ -752,6 +827,25 @@ pub fn run_answerer_rendezvous(
     if args.interop_signal == crate::web_signal::InteropSignal::WebV1 {
         eprintln!("[INTEROP-1] web_v1 mode enabled — using web payload schema");
     }
+    let use_web_hello = args.interop_hello == crate::web_hello::InteropHelloMode::WebHelloV1;
+    if use_web_hello {
+        eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
+    }
+
+    // Generate identity keypair for web HELLO (if enabled)
+    let local_keypair = if use_web_hello {
+        let kp = bolt_core::identity::generate_identity_keypair();
+        eprintln!(
+            "[INTEROP-2] identity keypair generated (pk={})",
+            bolt_core::encoding::to_base64(&kp.public_key)
+        );
+        Some(kp)
+    } else {
+        None
+    };
+    let local_pk_b64 = local_keypair
+        .as_ref()
+        .map(|kp| bolt_core::encoding::to_base64(&kp.public_key));
 
     let deadline = Instant::now() + args.phase_timeout;
 
@@ -828,7 +922,7 @@ pub fn run_answerer_rendezvous(
     // ── Offer/answer exchange ────────────────────────────────
 
     // Wait for offer from expected peer (deadline-respecting, filtered)
-    let offer_bundle = match args.interop_signal {
+    let (offer_bundle, remote_pk_b64) = match args.interop_signal {
         crate::web_signal::InteropSignal::WebV1 => receive_web_bundle(
             &mut ws,
             deadline,
@@ -840,7 +934,8 @@ pub fn run_answerer_rendezvous(
         )?,
         crate::web_signal::InteropSignal::DaemonV1 => {
             let offer_sp = wait_for_signal(&mut ws, deadline, expect_peer, room, session, "offer")?;
-            offer_sp.bundle.ok_or("offer signal missing bundle")?
+            let bundle = offer_sp.bundle.ok_or("offer signal missing bundle")?;
+            (bundle, None)
         }
     };
 
@@ -856,9 +951,15 @@ pub fn run_answerer_rendezvous(
     // Send answer to expected peer via rendezvous
     match args.interop_signal {
         crate::web_signal::InteropSignal::WebV1 => {
-            let peer_id_ref = &peer_id;
             eprintln!("[INTEROP-1] answerer sending web-format answer");
-            send_web_payloads(&mut ws, expect_peer, &answer_bundle, "answer", peer_id_ref)?;
+            send_web_payloads(
+                &mut ws,
+                expect_peer,
+                &answer_bundle,
+                "answer",
+                &peer_id,
+                local_pk_b64.as_deref(),
+            )?;
         }
         crate::web_signal::InteropSignal::DaemonV1 => {
             let answer_payload = SignalPayload {
@@ -890,28 +991,63 @@ pub fn run_answerer_rendezvous(
     ch.dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[answerer] DataChannel open");
 
-    // Wait for hello payload
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or("phase timeout expired waiting for hello payload")?;
-    let msg = ch.dc_msg_rx.recv_timeout(remaining)?;
-    eprintln!(
-        "[answerer] received: {:?}",
-        std::str::from_utf8(&msg).unwrap_or("<binary>")
-    );
+    // ── DataChannel HELLO exchange ──────────────────────────
+    if use_web_hello {
+        // INTEROP-2: Encrypted web HELLO (answerer receives first, then sends)
+        let local_kp = local_keypair.as_ref().unwrap();
+        let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
+            "[INTEROP-2_HELLO_FAIL] no remote identity key in offer signal — cannot encrypt HELLO",
+        )?;
+        let remote_pk = crate::web_hello::decode_public_key(remote_pk_b64_str)?;
+        eprintln!("[INTEROP-2] remote identity pk: {}", remote_pk_b64_str);
 
-    if msg == HELLO_PAYLOAD {
-        dc.send(HELLO_PAYLOAD)?;
-        eprintln!("[answerer] SUCCESS — echoed matching payload");
+        // Receive + decrypt remote HELLO
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("phase timeout expired waiting for web HELLO")?;
+        let msg = ch.dc_msg_rx.recv_timeout(remaining)?;
+        let remote_hello = crate::web_hello::parse_hello_message(&msg, &remote_pk, local_kp)?;
+
+        // Send encrypted HELLO reply
+        let hello_msg = crate::web_hello::build_hello_message(local_kp, &remote_pk)?;
+        dc.send(hello_msg.as_bytes())?;
+        eprintln!("[INTEROP-2] sent encrypted HELLO reply");
+
+        // Negotiate capabilities
+        let local_caps = crate::web_hello::daemon_capabilities();
+        let negotiated =
+            crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
+        eprintln!(
+            "[INTEROP-2] HELLO exchange complete — remote_pk={}, negotiated_caps={:?}",
+            remote_hello.identity_public_key, negotiated
+        );
+
         thread::sleep(Duration::from_millis(500));
-        Ok(())
     } else {
-        Err(format!(
-            "payload mismatch: expected {:?}, got {:?}",
-            HELLO_PAYLOAD, msg
-        )
-        .into())
+        // Legacy daemon HELLO
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("phase timeout expired waiting for hello payload")?;
+        let msg = ch.dc_msg_rx.recv_timeout(remaining)?;
+        eprintln!(
+            "[answerer] received: {:?}",
+            std::str::from_utf8(&msg).unwrap_or("<binary>")
+        );
+
+        if msg == HELLO_PAYLOAD {
+            dc.send(HELLO_PAYLOAD)?;
+            eprintln!("[answerer] SUCCESS — echoed matching payload");
+            thread::sleep(Duration::from_millis(500));
+        } else {
+            return Err(format!(
+                "payload mismatch: expected {:?}, got {:?}",
+                HELLO_PAYLOAD, msg
+            )
+            .into());
+        }
     }
+
+    Ok(())
 }
 
 // ── Parameterized rendezvous session (smoke hook) ───────────

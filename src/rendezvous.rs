@@ -659,7 +659,7 @@ pub(crate) fn run_rendezvous_session_with_exchange<F>(
 where
     F: for<'a> FnOnce(SmokeDcContext<'a>) -> Result<(), Box<dyn std::error::Error>>,
 {
-    match &args.role {
+    match args.role.as_ref().expect("role required for rendezvous") {
         crate::Role::Offerer => offerer_with_exchange(args, exchange),
         crate::Role::Answerer => answerer_with_exchange(args, exchange),
     }

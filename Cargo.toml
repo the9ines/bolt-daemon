@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "bolt-relay"
 path = "src/relay_main.rs"
 
+[[bin]]
+name = "bolt-ipc-client"
+path = "src/ipc_client_main.rs"
+
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-protocol-v0.1.0", package = "bolt-rendezvous-protocol" }

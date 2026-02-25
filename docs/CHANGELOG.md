@@ -2,6 +2,51 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## INTEROP-3 — Session Context + Profile Envelope v1 (a39fefc)
+
+Persist HELLO outcome in SessionContext, implement Profile Envelope v1
+encrypt/decrypt for DataChannel messages, add post-HELLO DC recv loop
+gated by `--interop-dc web_dc_v1`, enforce no-downgrade semantics.
+
+### Added
+- `src/session.rs` (NEW) — SessionContext struct storing local_keypair,
+  remote_public_key, negotiated_capabilities, HelloState; helpers for
+  capability checks and hello completion state; 8 tests
+- `src/envelope.rs` (NEW) — ProfileEnvelopeV1 serde type, DcErrorMessage serde
+  type, EnvelopeError enum with typed error codes (ENVELOPE_UNNEGOTIATED,
+  ENVELOPE_INVALID, ENVELOPE_DECRYPT_FAIL, INVALID_STATE), encode_envelope,
+  decode_envelope, make_error_message; 12 tests
+- `--interop-dc {daemon_dc_v1, web_dc_v1}` CLI flag (default: daemon_dc_v1)
+- Fail-closed validation: web_dc_v1 requires --interop-hello web_hello_v1
+  (and transitively --signal rendezvous + --interop-signal web_v1)
+- Post-HELLO DC envelope recv loop in offerer + answerer rendezvous paths
+- Minimal router: error → Err, unhandled → log `[INTEROP-3_UNHANDLED]` and drop
+- No-downgrade: envelope cap required, non-envelope messages rejected in web mode
+
+### Changed
+- `src/web_hello.rs` — removed `#[allow(dead_code)]` from HelloState, made `pub(crate)`
+- `src/main.rs` — InteropDcMode enum, `--interop-dc` CLI parsing, fail-closed
+  validation block, Args.interop_dc field, startup log update
+- `src/rendezvous.rs` — SessionContext construction after HELLO exchange,
+  post-HELLO DC envelope loop (offerer + answerer), envelope error handling
+  with DC error message send + disconnect
+
+### Design
+- Profile Envelope v1: `{"type":"profile-envelope","version":1,"encoding":"base64","payload":"<sealed>"}`
+- Encryption: NaCl box via bolt_core::crypto (same primitives as HELLO)
+- SessionContext carries HELLO outcome for post-handshake DC operations
+- HelloState wired into runtime (no longer dead_code)
+- daemon_dc_v1 preserves current behavior (return after HELLO, no loop)
+- Log markers: `[INTEROP-3]`, `[INTEROP-3_NO_ENVELOPE_CAP]`,
+  `[INTEROP-3_ENVELOPE_ERR]`, `[INTEROP-3_UNHANDLED]`
+
+### INTEROP-2 gaps resolved
+- HelloState wired into runtime via SessionContext
+- Negotiated capabilities persisted in SessionContext (no longer dropped)
+
+### Tests
+- 201 total (186 bolt-daemon + 15 relay)
+
 ## INTEROP-2 — Web HELLO handshake compatibility (dd82669)
 
 Add web-compatible encrypted HELLO handshake over DataChannel, gated by

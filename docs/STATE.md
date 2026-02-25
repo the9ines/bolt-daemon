@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag | `daemon-v0.2.2-interop-2-web-hello` |
-| Commit | `dd82669` |
+| Tag | `daemon-v0.2.3-interop-3-session-envelope` |
+| Commit | `a39fefc` |
 | Branch | `main` |
-| Phase | INTEROP-2 — Web HELLO handshake compatibility |
+| Phase | INTEROP-3 — Session Context + Profile Envelope v1 |
 
 ## Test Status
 
-- 181 tests (166 bolt-daemon + 15 relay)
+- 201 tests (186 bolt-daemon + 15 relay)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -30,10 +30,13 @@
 |------|--------|---------|-------|
 | `--interop-signal` | `daemon_v1`, `web_v1` | `daemon_v1` | Inner signaling payload format |
 | `--interop-hello` | `daemon_hello_v1`, `web_hello_v1` | `daemon_hello_v1` | HELLO handshake protocol |
+| `--interop-dc` | `daemon_dc_v1`, `web_dc_v1` | `daemon_dc_v1` | Post-HELLO DataChannel mode |
 
+- `web_dc_v1` requires `--interop-hello web_hello_v1` (and transitively rendezvous + web_v1)
 - `web_hello_v1` requires `--signal rendezvous` + `--interop-signal web_v1` (fail-closed validation)
 - `web_v1` signaling uses `{type, data, from, to}` schema matching bolt-transport-web
 - `web_hello_v1` uses NaCl-box encrypted JSON HELLO over DataChannel
+- `web_dc_v1` enables post-HELLO envelope recv loop with Profile Envelope v1
 
 ## Signaling Modes
 
@@ -50,6 +53,16 @@
 | Overlay | Stable | LAN + CGNAT 100.64.0.0/10 (Tailscale) |
 | Global | Stable | All valid IPs (ByteBolt) |
 
+## Session Context + Profile Envelope v1 (INTEROP-3)
+
+- SessionContext persists HELLO outcome: local_keypair, remote_public_key, negotiated_capabilities, HelloState
+- Profile Envelope v1: `{"type":"profile-envelope","version":1,"encoding":"base64","payload":"<sealed>"}`
+- Encryption: NaCl box via bolt_core::crypto (same primitives as HELLO)
+- Post-HELLO DC recv loop: decode envelope → minimal router (error → Err, unhandled → log+drop)
+- No-downgrade: envelope cap required in web_dc_v1; non-envelope messages = protocol violation
+- Error framing: `{"type":"error","code":"<CODE>","message":"<detail>"}` sent on DC before disconnect
+- Log markers: `[INTEROP-3]`, `[INTEROP-3_NO_ENVELOPE_CAP]`, `[INTEROP-3_ENVELOPE_ERR]`, `[INTEROP-3_UNHANDLED]`
+
 ## Web HELLO Handshake (INTEROP-2)
 
 - Identity keypairs: ephemeral per process run (`generate_identity_keypair`)
@@ -60,9 +73,6 @@
 - Capabilities: `["bolt.profile-envelope-v1"]` (negotiated via set intersection)
 - Offerer sends HELLO first; answerer receives, then replies
 - No-downgrade: legacy `b"bolt-hello-v1"` rejected in `web_hello_v1` mode
-- Known gaps (INTEROP-3 prerequisites):
-  - HelloState not yet wired into runtime (low-risk: single-shot flows)
-  - Negotiated capabilities logged and dropped (no session context struct yet)
 
 ## Pairing Approval (EVENT-1)
 
@@ -106,6 +116,8 @@
 
 ```
 src/main.rs            — CLI, args, handlers, file mode, simulate mode, E2E flow
+src/session.rs         — SessionContext: HELLO outcome for post-handshake DC operations
+src/envelope.rs        — Profile Envelope v1 codec: encode/decode, DcErrorMessage, EnvelopeError
 src/web_hello.rs       — Web HELLO handshake: NaCl-box encrypted JSON, capability negotiation
 src/web_signal.rs      — Web inner signaling payloads: {type,data,from,to} schema
 src/ipc/mod.rs         — IPC module root

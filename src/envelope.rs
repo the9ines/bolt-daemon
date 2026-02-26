@@ -38,6 +38,8 @@ pub struct DcErrorMessage {
 // ── Envelope error ──────────────────────────────────────────
 
 /// Error codes for envelope protocol violations.
+///
+/// Wire codes align with PROTOCOL_ENFORCEMENT.md Appendix A registry.
 #[derive(Debug)]
 pub enum EnvelopeError {
     /// Envelope received but capability not negotiated.
@@ -46,24 +48,40 @@ pub enum EnvelopeError {
     Invalid(String),
     /// Decryption failed (wrong key, tampered, etc).
     DecryptFail(String),
-    /// Received message is not a profile-envelope.
-    NotEnvelope,
+    /// Plaintext frame received in envelope-required session.
+    /// Appendix A: ENVELOPE_REQUIRED.
+    EnvelopeRequired,
     /// JSON parse error.
     ParseError(String),
-    /// Inner message protocol error (unknown type, malformed).
-    Protocol(String),
+    /// Inner message parse failure (valid JSON, invalid structure).
+    /// Appendix A: INVALID_MESSAGE.
+    InvalidMessage(String),
+    /// Inner message type field present but unrecognized.
+    /// Appendix A: UNKNOWN_MESSAGE_TYPE.
+    UnknownMessageType(String),
+    /// Message received in unexpected session state.
+    /// Appendix A: INVALID_STATE.
+    InvalidState(String),
+    /// Catch-all for violations not covered by a specific code.
+    /// Appendix A: PROTOCOL_VIOLATION.
+    ProtocolViolation(String),
 }
 
 impl EnvelopeError {
     /// Wire error code string for DcErrorMessage.
+    ///
+    /// Aligned with PROTOCOL_ENFORCEMENT.md Appendix A registry.
     pub fn code(&self) -> &'static str {
         match self {
             EnvelopeError::Unnegotiated => "ENVELOPE_UNNEGOTIATED",
             EnvelopeError::Invalid(_) => "ENVELOPE_INVALID",
             EnvelopeError::DecryptFail(_) => "ENVELOPE_DECRYPT_FAIL",
-            EnvelopeError::NotEnvelope => "INVALID_STATE",
+            EnvelopeError::EnvelopeRequired => "ENVELOPE_REQUIRED",
             EnvelopeError::ParseError(_) => "ENVELOPE_INVALID",
-            EnvelopeError::Protocol(_) => "INVALID_MESSAGE",
+            EnvelopeError::InvalidMessage(_) => "INVALID_MESSAGE",
+            EnvelopeError::UnknownMessageType(_) => "UNKNOWN_MESSAGE_TYPE",
+            EnvelopeError::InvalidState(_) => "INVALID_STATE",
+            EnvelopeError::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
         }
     }
 }
@@ -80,14 +98,23 @@ impl fmt::Display for EnvelopeError {
             EnvelopeError::DecryptFail(detail) => {
                 write!(f, "envelope decryption failed: {detail}")
             }
-            EnvelopeError::NotEnvelope => {
-                write!(f, "expected profile-envelope, got different message type")
+            EnvelopeError::EnvelopeRequired => {
+                write!(f, "plaintext frame in envelope-required session")
             }
             EnvelopeError::ParseError(detail) => {
                 write!(f, "envelope parse error: {detail}")
             }
-            EnvelopeError::Protocol(detail) => {
-                write!(f, "inner message protocol error: {detail}")
+            EnvelopeError::InvalidMessage(detail) => {
+                write!(f, "inner message parse failure: {detail}")
+            }
+            EnvelopeError::UnknownMessageType(detail) => {
+                write!(f, "unrecognized inner message type: {detail}")
+            }
+            EnvelopeError::InvalidState(detail) => {
+                write!(f, "message in unexpected session state: {detail}")
+            }
+            EnvelopeError::ProtocolViolation(detail) => {
+                write!(f, "protocol violation: {detail}")
             }
         }
     }
@@ -146,7 +173,14 @@ pub fn decode_envelope(raw: &[u8], session: &SessionContext) -> Result<Vec<u8>, 
     let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     if msg_type != "profile-envelope" {
-        return Err(EnvelopeError::NotEnvelope);
+        // Appendix A: ENVELOPE_REQUIRED when envelope was negotiated but
+        // plaintext/non-envelope frame arrives. INVALID_STATE otherwise.
+        if session.envelope_v1_negotiated() {
+            return Err(EnvelopeError::EnvelopeRequired);
+        }
+        return Err(EnvelopeError::InvalidState(format!(
+            "expected profile-envelope, got '{msg_type}'"
+        )));
     }
 
     // Require capability negotiated
@@ -194,10 +228,14 @@ pub fn route_inner_message(
     inner: &[u8],
     session: &SessionContext,
 ) -> Result<Option<Vec<u8>>, EnvelopeError> {
-    use crate::dc_messages::{encode_dc_message, now_ms, parse_dc_message, DcMessage};
+    use crate::dc_messages::{
+        encode_dc_message, now_ms, parse_dc_message, DcMessage, DcParseError,
+    };
 
-    let msg =
-        parse_dc_message(inner).map_err(|e| EnvelopeError::Protocol(format!("parse: {e}")))?;
+    let msg = parse_dc_message(inner).map_err(|e| match e {
+        DcParseError::UnknownType(ref t) => EnvelopeError::UnknownMessageType(t.clone()),
+        _ => EnvelopeError::InvalidMessage(e.to_string()),
+    })?;
 
     match msg {
         DcMessage::Ping { ts_ms } => {
@@ -206,7 +244,7 @@ pub fn route_inner_message(
                 reply_to_ms: ts_ms,
             };
             let pong_json = encode_dc_message(&pong)
-                .map_err(|e| EnvelopeError::Protocol(format!("encode pong: {e}")))?;
+                .map_err(|e| EnvelopeError::ProtocolViolation(format!("encode pong: {e}")))?;
             let envelope_bytes = encode_envelope(&pong_json, session)?;
             eprintln!("[INTEROP-4] recv ping ts={ts_ms}, sent pong");
             Ok(Some(envelope_bytes))
@@ -223,7 +261,7 @@ pub fn route_inner_message(
                 text: format!("echo: {text}"),
             };
             let echo_json = encode_dc_message(&echo)
-                .map_err(|e| EnvelopeError::Protocol(format!("encode echo: {e}")))?;
+                .map_err(|e| EnvelopeError::ProtocolViolation(format!("encode echo: {e}")))?;
             let envelope_bytes = encode_envelope(&echo_json, session)?;
             eprintln!("[INTEROP-4] sent echo");
             Ok(Some(envelope_bytes))
@@ -407,13 +445,26 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_non_envelope_type() {
+    fn decode_rejects_non_envelope_type_with_envelope_required() {
+        // Session has envelope negotiated → plaintext/non-envelope = ENVELOPE_REQUIRED
         let json = r#"{"type":"file-chunk","data":{}}"#;
         let kp = generate_identity_keypair();
         let remote_pk = generate_identity_keypair().public_key;
         let session =
             SessionContext::new(kp, remote_pk, vec!["bolt.profile-envelope-v1".to_string()])
                 .unwrap();
+        let result = decode_envelope(json.as_bytes(), &session);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "ENVELOPE_REQUIRED");
+    }
+
+    #[test]
+    fn decode_rejects_non_envelope_type_without_cap_with_invalid_state() {
+        // Session has NO envelope negotiated → wrong type = INVALID_STATE
+        let json = r#"{"type":"file-chunk","data":{}}"#;
+        let kp = generate_identity_keypair();
+        let remote_pk = generate_identity_keypair().public_key;
+        let session = SessionContext::new(kp, remote_pk, vec![]).unwrap();
         let result = decode_envelope(json.as_bytes(), &session);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "INVALID_STATE");

@@ -6,15 +6,14 @@
 |-------|-------|
 | Tag (main) | `daemon-v0.2.4-interop-4-min-msgset` |
 | Commit (main) | `719752d` (merge of `d7a79c4`) |
-| Tag (feature) | `daemon-v0.2.5-h3-golden-vectors` |
-| Commit (feature) | `3751118` |
-| Branch | `feature/h4-panic-elimination` (current), `feature/h3-golden-vectors` (H3 tagged) |
-| Phase | H4 — Panic surface elimination (in-flight) |
+| Tag (feature) | `daemon-v0.2.7-h5-downgrade-validation` |
+| Commit (feature) | *(see git log)* |
+| Branch | `feature/h5-downgrade-validation` (current) |
+| Phase | H5 — Downgrade resistance & enforcement validation (complete) |
 
 ## Test Status
 
-- 215+ tests (with `--features test-support`, on feature branch)
-- 210 tests (main, without test-support feature)
+- 262 tests (51 lib + 146 main + 15 relay + 50 H5 integration)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -24,8 +23,9 @@
 | Phase | Status | Notes |
 |-------|--------|-------|
 | H3 | DONE | Golden vector tests, `daemon-v0.2.5-h3-golden-vectors` (`3751118`), feature branch |
-| H4 | In-flight | Panic surface elimination, `feature/h4-panic-elimination` |
-| H5 | Planned | Downgrade resistance + error code validation |
+| H4 | DONE | Panic surface elimination, `daemon-v0.2.6-h4-panic-elimination` (`678c808`) |
+| H5 | DONE | Downgrade resistance + error code alignment (R7), `daemon-v0.2.7-h5-downgrade-validation` |
+| H6 | Planned | Merge discipline, CI hooks, drift checks |
 
 ## Daemon Modes
 
@@ -81,9 +81,31 @@
 - Profile Envelope v1: `{"type":"profile-envelope","version":1,"encoding":"base64","payload":"<sealed>"}`
 - Encryption: NaCl box via bolt_core::crypto (same primitives as HELLO)
 - Post-HELLO DC recv loop: decode envelope → minimal router (error → Err, unhandled → log+drop)
-- No-downgrade: envelope cap required in web_dc_v1; non-envelope messages = protocol violation
+- No-downgrade: envelope cap required in web_dc_v1; non-envelope messages = ENVELOPE_REQUIRED
 - Error framing: `{"type":"error","code":"<CODE>","message":"<detail>"}` sent on DC before disconnect
+- Wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A (H5)
 - Log markers: `[INTEROP-3]`, `[INTEROP-3_NO_ENVELOPE_CAP]`, `[INTEROP-3_ENVELOPE_ERR]`, `[INTEROP-3_UNHANDLED]`
+
+## Error Code Registry Alignment (H5)
+
+Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
+
+| Appendix A Code | Daemon Error Type | Status |
+|----------------|-------------------|--------|
+| ENVELOPE_REQUIRED | `EnvelopeError::EnvelopeRequired` | Emitted |
+| ENVELOPE_INVALID | `EnvelopeError::Invalid` / `ParseError` | Emitted |
+| ENVELOPE_DECRYPT_FAIL | `EnvelopeError::DecryptFail` | Emitted |
+| ENVELOPE_UNNEGOTIATED | `EnvelopeError::Unnegotiated` | Emitted |
+| HELLO_PARSE_ERROR | `HelloError::ParseError` | Emitted |
+| HELLO_DECRYPT_FAIL | `HelloError::DecryptFail` | Emitted |
+| HELLO_SCHEMA_ERROR | `HelloError::SchemaError` | Emitted |
+| KEY_MISMATCH | `HelloError::KeyMismatch` | Emitted |
+| DUPLICATE_HELLO | `HelloError::DuplicateHello` | Emitted |
+| INVALID_MESSAGE | `EnvelopeError::InvalidMessage` | Emitted |
+| UNKNOWN_MESSAGE_TYPE | `EnvelopeError::UnknownMessageType` | Emitted |
+| INVALID_STATE | `EnvelopeError::InvalidState` | Emitted |
+| PROTOCOL_VIOLATION | `EnvelopeError::ProtocolViolation` / `HelloError::DowngradeAttempt` | Emitted |
+| LIMIT_EXCEEDED | *(none)* | Deferred — no daemon rate-limit/size-cap infrastructure |
 
 ## Web HELLO Handshake (INTEROP-2)
 

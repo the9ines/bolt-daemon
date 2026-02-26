@@ -2,6 +2,57 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## H5 — Downgrade Resistance & Enforcement Validation
+
+Align daemon wire error codes with PROTOCOL_ENFORCEMENT.md Appendix A
+registry (14 codes). Prove envelope-required mode cannot be bypassed,
+WebHelloV1 cannot be downgraded, and fail-closed state progression holds.
+
+Audit Item: R7 — Error Code Registry Alignment.
+
+### Added
+- `HelloError` enum in `web_hello.rs` — typed HELLO-phase error codes:
+  HELLO_PARSE_ERROR, HELLO_DECRYPT_FAIL, HELLO_SCHEMA_ERROR, KEY_MISMATCH,
+  DUPLICATE_HELLO, PROTOCOL_VIOLATION (downgrade attempt)
+- `parse_hello_typed()` function — returns `Result<WebHelloInner, HelloError>`
+  with typed error codes per Appendix A
+- `DcParseError` enum in `dc_messages.rs` — distinguishes `UnknownType`
+  (UNKNOWN_MESSAGE_TYPE) from `InvalidMessage` (INVALID_MESSAGE) and `NotUtf8`
+- `EnvelopeError::EnvelopeRequired` — plaintext frame in envelope-required session
+- `EnvelopeError::UnknownMessageType` — unrecognized inner message type field
+- `EnvelopeError::InvalidState` — message in unexpected session state
+- `EnvelopeError::ProtocolViolation` — catch-all for violations not covered by specific codes
+- `tests/h5_downgrade_validation.rs` — 50 integration tests across 6 sections:
+  envelope enforcement, downgrade guard, error code strictness, state machine
+  integrity, downgrade resistance, legacy mode boundary
+
+### Changed
+- `EnvelopeError` — removed `NotEnvelope` (replaced by `EnvelopeRequired`),
+  removed `Protocol(String)` (split into `InvalidMessage`, `UnknownMessageType`,
+  `InvalidState`, `ProtocolViolation`)
+- `decode_envelope()` — non-envelope frame now returns `EnvelopeRequired`
+  (when envelope negotiated) or `InvalidState` (when not negotiated)
+- `route_inner_message()` — maps `DcParseError::UnknownType` to
+  `EnvelopeError::UnknownMessageType`, other parse errors to `InvalidMessage`
+- `parse_dc_message()` — returns `Result<DcMessage, DcParseError>` (was `Result<DcMessage, String>`)
+  with two-phase parsing: extract type field, check against known types, then full parse
+- `parse_hello_message()` — delegates to `parse_hello_typed()` for typed error handling
+- `HelloState` — visibility widened from `pub(crate)` to `pub` for test-support re-export
+- `lib.rs` test_support — expanded exports: EnvelopeError, HelloError, HelloState,
+  DcMessage, DcParseError, encode/decode helpers
+
+### Wire Code Alignment
+- 13 of 14 Appendix A codes now emitted by daemon
+- LIMIT_EXCEEDED deferred (no daemon rate-limit/size-cap infrastructure)
+
+### Tests
+- 262 total (51 lib + 146 main + 15 relay + 50 H5 integration)
+
+**Tag:** `daemon-v0.2.7-h5-downgrade-validation`
+**Branch:** `feature/h5-downgrade-validation`
+
+---
+
 ## H3 — Golden Vector Integration Tests (3751118)
 
 Add HELLO-open and envelope-open golden vector tests consuming shared

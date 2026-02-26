@@ -53,7 +53,13 @@ fn main() {
         }
     };
 
-    let read_stream = stream.try_clone().expect("clone stream");
+    let read_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: failed to clone stream: {e}");
+            std::process::exit(1);
+        }
+    };
     let mut writer = stream;
     let reader = BufReader::new(read_stream);
 
@@ -104,7 +110,13 @@ fn main() {
                         "note": "auto-reply from bolt-ipc-client"
                     }
                 });
-                let mut reply_line = serde_json::to_string(&reply).unwrap();
+                let mut reply_line = match serde_json::to_string(&reply) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[ipc-client] FATAL: serialize reply: {e}");
+                        break;
+                    }
+                };
                 reply_line.push('\n');
                 if let Err(e) = writer.write_all(reply_line.as_bytes()) {
                     eprintln!("[ipc-client] write error: {e}");
@@ -131,7 +143,13 @@ fn main() {
                         "note": "auto-reply from bolt-ipc-client"
                     }
                 });
-                let mut reply_line = serde_json::to_string(&reply).unwrap();
+                let mut reply_line = match serde_json::to_string(&reply) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[ipc-client] FATAL: serialize reply: {e}");
+                        break;
+                    }
+                };
                 reply_line.push('\n');
                 if let Err(e) = writer.write_all(reply_line.as_bytes()) {
                     eprintln!("[ipc-client] write error: {e}");

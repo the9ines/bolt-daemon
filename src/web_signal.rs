@@ -154,7 +154,7 @@ pub fn encode_web_offer(
     from_peer: &str,
     to_peer: &str,
     identity_pk_b64: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, serde_json::Error> {
     let payload = WebSignalPayload {
         msg_type: "offer".to_string(),
         data: serde_json::to_value(WebOfferData {
@@ -164,12 +164,11 @@ pub fn encode_web_offer(
             },
             public_key: identity_pk_b64.map(|s| s.to_string()),
             peer_code: Some(from_peer.to_string()),
-        })
-        .unwrap(),
+        })?,
         from: from_peer.to_string(),
         to: to_peer.to_string(),
     };
-    serde_json::to_value(payload).unwrap()
+    serde_json::to_value(payload)
 }
 
 /// Encode an SDP answer into a web-schema payload.
@@ -178,7 +177,7 @@ pub fn encode_web_answer(
     from_peer: &str,
     to_peer: &str,
     identity_pk_b64: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, serde_json::Error> {
     let payload = WebSignalPayload {
         msg_type: "answer".to_string(),
         data: serde_json::to_value(WebAnswerData {
@@ -188,12 +187,11 @@ pub fn encode_web_answer(
             },
             public_key: identity_pk_b64.map(|s| s.to_string()),
             peer_code: Some(from_peer.to_string()),
-        })
-        .unwrap(),
+        })?,
         from: from_peer.to_string(),
         to: to_peer.to_string(),
     };
-    serde_json::to_value(payload).unwrap()
+    serde_json::to_value(payload)
 }
 
 /// Encode a single ICE candidate into a web-schema payload.
@@ -201,7 +199,7 @@ pub fn encode_web_ice_candidate(
     candidate: &CandidateInfo,
     from_peer: &str,
     to_peer: &str,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, serde_json::Error> {
     let payload = WebSignalPayload {
         msg_type: "ice-candidate".to_string(),
         data: serde_json::to_value(WebIceCandidateData {
@@ -209,12 +207,11 @@ pub fn encode_web_ice_candidate(
             sdp_mid: Some(candidate.mid.clone()),
             sdp_m_line_index: None,
             username_fragment: None,
-        })
-        .unwrap(),
+        })?,
         from: from_peer.to_string(),
         to: to_peer.to_string(),
     };
-    serde_json::to_value(payload).unwrap()
+    serde_json::to_value(payload)
 }
 
 // ── Conversion helpers ──────────────────────────────────────
@@ -227,7 +224,7 @@ pub fn bundle_to_web_payloads(
     from_peer: &str,
     to_peer: &str,
     identity_pk_b64: Option<&str>,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
     let mut payloads = Vec::new();
 
     // SDP message
@@ -237,13 +234,13 @@ pub fn bundle_to_web_payloads(
             from_peer,
             to_peer,
             identity_pk_b64,
-        )),
+        )?),
         "answer" => payloads.push(encode_web_answer(
             &bundle.description,
             from_peer,
             to_peer,
             identity_pk_b64,
-        )),
+        )?),
         _ => {
             eprintln!("[INTEROP-1] WARNING: unknown bundle msg_type '{msg_type}' for web encoding");
         }
@@ -251,10 +248,10 @@ pub fn bundle_to_web_payloads(
 
     // Trickled ICE candidates
     for cand in &bundle.candidates {
-        payloads.push(encode_web_ice_candidate(cand, from_peer, to_peer));
+        payloads.push(encode_web_ice_candidate(cand, from_peer, to_peer)?);
     }
 
-    payloads
+    Ok(payloads)
 }
 
 /// Convert a parsed web offer/answer into a daemon `SdpInfo`.
@@ -304,7 +301,8 @@ mod tests {
             "peer-a",
             "peer-b",
             None,
-        );
+        )
+        .unwrap();
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["type"], "offer");
         assert_eq!(obj["from"], "peer-a");
@@ -324,7 +322,8 @@ mod tests {
             "peer-b",
             "peer-a",
             None,
-        );
+        )
+        .unwrap();
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["type"], "answer");
         assert_eq!(obj["from"], "peer-b");
@@ -343,7 +342,8 @@ mod tests {
             },
             "peer-a",
             "peer-b",
-        );
+        )
+        .unwrap();
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["type"], "ice-candidate");
         assert_eq!(obj["from"], "peer-a");
@@ -540,7 +540,8 @@ mod tests {
         };
 
         // Encode to web payloads
-        let payloads = bundle_to_web_payloads(&bundle, "offer", "from-peer", "to-peer", None);
+        let payloads =
+            bundle_to_web_payloads(&bundle, "offer", "from-peer", "to-peer", None).unwrap();
         assert_eq!(payloads.len(), 3); // 1 offer + 2 ice candidates
 
         // Parse back
@@ -572,7 +573,7 @@ mod tests {
             }],
         };
 
-        let payloads = bundle_to_web_payloads(&bundle, "answer", "b", "a", None);
+        let payloads = bundle_to_web_payloads(&bundle, "answer", "b", "a", None).unwrap();
         assert_eq!(payloads.len(), 2); // 1 answer + 1 ice candidate
 
         let answer = parse_web_payload(&payloads[0]).unwrap().unwrap();
@@ -601,7 +602,7 @@ mod tests {
         let sdp_info = parsed_signal_to_sdp_info(&parsed).unwrap();
 
         // Convert back to web
-        let re_encoded = encode_web_offer(&sdp_info, "a", "b", None);
+        let re_encoded = encode_web_offer(&sdp_info, "a", "b", None).unwrap();
         let re_parsed = parse_web_payload(&re_encoded).unwrap().unwrap();
         let re_sdp = parsed_signal_to_sdp_info(&re_parsed).unwrap();
         assert_eq!(re_sdp.sdp_type, "offer");
@@ -620,7 +621,8 @@ mod tests {
             "a",
             "b",
             Some("AAAA_test_pk"),
-        );
+        )
+        .unwrap();
         let data = payload["data"].as_object().unwrap();
         assert_eq!(data["publicKey"], "AAAA_test_pk");
     }
@@ -635,7 +637,8 @@ mod tests {
             "b",
             "a",
             Some("BBBB_test_pk"),
-        );
+        )
+        .unwrap();
         let data = payload["data"].as_object().unwrap();
         assert_eq!(data["publicKey"], "BBBB_test_pk");
     }
@@ -744,7 +747,7 @@ mod tests {
                 },
             ],
         };
-        let payloads = bundle_to_web_payloads(&bundle, "offer", "a", "b", None);
+        let payloads = bundle_to_web_payloads(&bundle, "offer", "a", "b", None).unwrap();
         assert_eq!(payloads.len(), 4); // 1 offer + 3 candidates
     }
 }

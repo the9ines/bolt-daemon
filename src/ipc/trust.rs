@@ -210,10 +210,14 @@ pub fn check_pairing_approval(
     };
 
     eprintln!("[PAIRING_REQUEST] emitting pairing.request for peer '{from_peer}' (request_id={request_id})");
-    server.emit_event(IpcMessage::new_event(
-        "pairing.request",
-        serde_json::to_value(&payload).unwrap(),
-    ));
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[PAIRING_DENIED] serialize pairing.request failed: {e} — fail-closed deny");
+            return false;
+        }
+    };
+    server.emit_event(IpcMessage::new_event("pairing.request", payload_value));
 
     // 4. Block for decision
     match server.await_decision(&request_id, DECISION_TIMEOUT) {

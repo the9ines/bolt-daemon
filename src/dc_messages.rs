@@ -30,10 +30,55 @@ pub enum DcMessage {
 
 // ── Parse / encode helpers ──────────────────────────────────
 
+/// Known inner message type strings.
+const KNOWN_TYPES: &[&str] = &["ping", "pong", "app_message"];
+
+/// Error detail for inner message parse operations.
+///
+/// Distinguishes "unrecognized type" from "parse failure" to emit the
+/// correct Appendix A wire code (UNKNOWN_MESSAGE_TYPE vs INVALID_MESSAGE).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DcParseError {
+    /// Inner message is not valid UTF-8.
+    NotUtf8,
+    /// Inner message is not valid JSON or missing required fields.
+    InvalidMessage(String),
+    /// Inner message has a `type` field but the value is not recognized.
+    UnknownType(String),
+}
+
+impl std::fmt::Display for DcParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DcParseError::NotUtf8 => write!(f, "inner message is not UTF-8"),
+            DcParseError::InvalidMessage(detail) => {
+                write!(f, "inner message parse error: {detail}")
+            }
+            DcParseError::UnknownType(t) => write!(f, "unrecognized inner message type: {t}"),
+        }
+    }
+}
+
 /// Parse a decrypted inner message from bytes.
-pub fn parse_dc_message(bytes: &[u8]) -> Result<DcMessage, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "inner message is not UTF-8".to_string())?;
-    serde_json::from_str(text).map_err(|e| format!("inner message parse error: {e}"))
+///
+/// Distinguishes unknown type (valid JSON with unrecognized `type` field)
+/// from parse failure (invalid JSON or missing required fields) per
+/// PROTOCOL_ENFORCEMENT.md Appendix A.
+pub fn parse_dc_message(bytes: &[u8]) -> Result<DcMessage, DcParseError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| DcParseError::NotUtf8)?;
+
+    // First: try to extract the type field to distinguish unknown-type from parse-error.
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| DcParseError::InvalidMessage(e.to_string()))?;
+
+    if let Some(type_str) = value.get("type").and_then(|v| v.as_str()) {
+        if !KNOWN_TYPES.contains(&type_str) {
+            return Err(DcParseError::UnknownType(type_str.to_string()));
+        }
+    }
+
+    // Type is known (or absent — serde will reject missing "type" as parse error).
+    serde_json::from_value(value).map_err(|e| DcParseError::InvalidMessage(e.to_string()))
 }
 
 /// Encode a DcMessage to JSON bytes (ready for envelope encryption).
@@ -103,21 +148,31 @@ mod tests {
     fn parse_invalid_json_fails() {
         let result = parse_dc_message(b"not json");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("parse error"));
+        assert!(
+            matches!(result.unwrap_err(), DcParseError::InvalidMessage(_)),
+            "expected InvalidMessage for bad JSON"
+        );
     }
 
     #[test]
     fn parse_non_utf8_fails() {
         let result = parse_dc_message(&[0xFF, 0xFE]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not UTF-8"));
+        assert!(
+            matches!(result.unwrap_err(), DcParseError::NotUtf8),
+            "expected NotUtf8 for binary data"
+        );
     }
 
     #[test]
-    fn parse_unknown_type_fails() {
+    fn parse_unknown_type_returns_unknown_type_error() {
         let json = r#"{"type":"file-chunk","data":{}}"#;
         let result = parse_dc_message(json.as_bytes());
         assert!(result.is_err());
+        match result.unwrap_err() {
+            DcParseError::UnknownType(t) => assert_eq!(t, "file-chunk"),
+            other => panic!("expected UnknownType, got: {other:?}"),
+        }
     }
 
     #[test]

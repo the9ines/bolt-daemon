@@ -76,13 +76,14 @@ pub struct WebHelloInner {
 /// Tracks whether the HELLO exchange has completed.
 /// Rejects duplicate HELLOs (fail-closed).
 /// Wired into SessionContext at runtime (INTEROP-3).
-pub(crate) struct HelloState {
+#[derive(Default)]
+pub struct HelloState {
     completed: bool,
 }
 
 impl HelloState {
     pub fn new() -> Self {
-        Self { completed: false }
+        Self::default()
     }
 
     /// Mark HELLO as completed. Returns Err if already completed.
@@ -99,6 +100,61 @@ impl HelloState {
         self.completed
     }
 }
+
+// ── HELLO-phase error codes ─────────────────────────────────
+
+/// Error codes for HELLO-phase protocol violations.
+///
+/// Wire codes align with PROTOCOL_ENFORCEMENT.md Appendix A registry.
+/// Parallel to `EnvelopeError` but for the HELLO exchange phase.
+#[derive(Debug)]
+pub enum HelloError {
+    /// HELLO outer frame unparseable (not UTF-8, not JSON, wrong outer type).
+    ParseError(String),
+    /// HELLO sealed payload fails decryption (wrong key, tampered).
+    DecryptFail(String),
+    /// HELLO inner payload missing required fields or wrong types.
+    SchemaError(String),
+    /// Identity key does not match pinned key (TOFU violation).
+    KeyMismatch(String),
+    /// Duplicate HELLO received after exchange already completed.
+    DuplicateHello,
+    /// Legacy downgrade attempt: raw `bolt-hello-v1` payload in WebHelloV1 mode.
+    DowngradeAttempt,
+}
+
+impl HelloError {
+    /// Wire error code string for DcErrorMessage.
+    ///
+    /// Aligned with PROTOCOL_ENFORCEMENT.md Appendix A registry.
+    pub fn code(&self) -> &'static str {
+        match self {
+            HelloError::ParseError(_) => "HELLO_PARSE_ERROR",
+            HelloError::DecryptFail(_) => "HELLO_DECRYPT_FAIL",
+            HelloError::SchemaError(_) => "HELLO_SCHEMA_ERROR",
+            HelloError::KeyMismatch(_) => "KEY_MISMATCH",
+            HelloError::DuplicateHello => "DUPLICATE_HELLO",
+            HelloError::DowngradeAttempt => "PROTOCOL_VIOLATION",
+        }
+    }
+}
+
+impl std::fmt::Display for HelloError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HelloError::ParseError(detail) => write!(f, "HELLO parse error: {detail}"),
+            HelloError::DecryptFail(detail) => write!(f, "HELLO decrypt failure: {detail}"),
+            HelloError::SchemaError(detail) => write!(f, "HELLO schema error: {detail}"),
+            HelloError::KeyMismatch(detail) => write!(f, "identity key mismatch: {detail}"),
+            HelloError::DuplicateHello => write!(f, "duplicate HELLO — exactly-once violation"),
+            HelloError::DowngradeAttempt => {
+                write!(f, "legacy 'bolt-hello-v1' payload — downgrade refused")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HelloError {}
 
 // ── Key helpers ─────────────────────────────────────────────
 
@@ -142,33 +198,32 @@ pub fn build_hello_message(
     Ok(msg)
 }
 
-/// Parse and decrypt a received web HELLO message from raw DataChannel bytes.
+/// Parse and decrypt a received web HELLO message with typed error codes.
 ///
-/// Fail-closed: any parse, decrypt, or schema error returns Err.
-pub fn parse_hello_message(
+/// Returns `HelloError` variants aligned with PROTOCOL_ENFORCEMENT.md
+/// Appendix A (HELLO_PARSE_ERROR, HELLO_DECRYPT_FAIL, HELLO_SCHEMA_ERROR).
+/// Fail-closed: any parse, decrypt, or schema error is fatal.
+pub fn parse_hello_typed(
     raw: &[u8],
     remote_public_key: &[u8; 32],
     local_keypair: &KeyPair,
-) -> Result<WebHelloInner, Box<dyn std::error::Error>> {
+) -> Result<WebHelloInner, HelloError> {
     // No-downgrade check
     if raw == crate::HELLO_PAYLOAD {
-        return Err(
-            "[INTEROP-2_NO_DOWNGRADE] received legacy 'bolt-hello-v1' — refusing downgrade".into(),
-        );
+        return Err(HelloError::DowngradeAttempt);
     }
 
     let text = std::str::from_utf8(raw)
-        .map_err(|_| "[INTEROP-2_HELLO_FAIL] message is not UTF-8".to_string())?;
+        .map_err(|_| HelloError::ParseError("message is not UTF-8".to_string()))?;
 
     let outer: WebHelloOuter = serde_json::from_str(text)
-        .map_err(|e| format!("[INTEROP-2_HELLO_FAIL] outer parse: {}", e))?;
+        .map_err(|e| HelloError::ParseError(format!("outer parse: {e}")))?;
 
     if outer.msg_type != "hello" {
-        return Err(format!(
-            "[INTEROP-2_HELLO_FAIL] outer type '{}' != 'hello'",
+        return Err(HelloError::ParseError(format!(
+            "outer type '{}' != 'hello'",
             outer.msg_type
-        )
-        .into());
+        )));
     }
 
     let plaintext = bolt_core::crypto::open_box_payload(
@@ -176,24 +231,42 @@ pub fn parse_hello_message(
         remote_public_key,
         &local_keypair.secret_key,
     )
-    .map_err(|e| format!("[INTEROP-2_HELLO_FAIL] decrypt: {}", e))?;
+    .map_err(|e| HelloError::DecryptFail(e.to_string()))?;
 
     let inner: WebHelloInner = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("[INTEROP-2_HELLO_FAIL] inner parse: {}", e))?;
+        .map_err(|e| HelloError::SchemaError(format!("inner parse: {e}")))?;
 
     if inner.msg_type != "hello" {
-        return Err(format!(
-            "[INTEROP-2_HELLO_FAIL] inner type '{}' != 'hello'",
+        return Err(HelloError::SchemaError(format!(
+            "inner type '{}' != 'hello'",
             inner.msg_type
-        )
-        .into());
+        )));
     }
 
     if inner.version != 1 {
-        return Err(format!("[INTEROP-2_HELLO_FAIL] version {} != 1", inner.version).into());
+        return Err(HelloError::SchemaError(format!(
+            "version {} != 1",
+            inner.version
+        )));
     }
 
     Ok(inner)
+}
+
+/// Parse and decrypt a received web HELLO message from raw DataChannel bytes.
+///
+/// Delegates to `parse_hello_typed` for typed error handling, then converts
+/// to `Box<dyn Error>` for backward compatibility with existing callers.
+/// Fail-closed: any parse, decrypt, or schema error returns Err.
+pub fn parse_hello_message(
+    raw: &[u8],
+    remote_public_key: &[u8; 32],
+    local_keypair: &KeyPair,
+) -> Result<WebHelloInner, Box<dyn std::error::Error>> {
+    parse_hello_typed(raw, remote_public_key, local_keypair).map_err(|e| {
+        let msg = format!("[INTEROP-2_HELLO_FAIL] {e}");
+        Box::<dyn std::error::Error>::from(msg)
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────
@@ -339,7 +412,7 @@ mod tests {
         let kp = generate_identity_keypair();
         let result = parse_hello_message(b"bolt-hello-v1", &kp.public_key, &kp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NO_DOWNGRADE"));
+        assert!(result.unwrap_err().to_string().contains("downgrade"));
     }
 
     #[test]

@@ -312,8 +312,13 @@ fn send_web_payloads(
     from_peer: &str,
     identity_pk_b64: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payloads =
-        crate::web_signal::bundle_to_web_payloads(bundle, sdp_type, from_peer, to, identity_pk_b64);
+    let payloads = crate::web_signal::bundle_to_web_payloads(
+        bundle,
+        sdp_type,
+        from_peer,
+        to,
+        identity_pk_b64,
+    )?;
 
     for (i, payload) in payloads.iter().enumerate() {
         let msg = ClientMessage::Signal {
@@ -741,7 +746,9 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
         // INTEROP-2: Encrypted web HELLO
-        let local_kp = local_keypair.as_ref().unwrap();
+        let local_kp = local_keypair
+            .as_ref()
+            .ok_or("[INTEROP-2_HELLO_FAIL] identity keypair missing for web HELLO (offerer)")?;
         let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
             "[INTEROP-2_HELLO_FAIL] no remote identity key in answer signal — cannot encrypt HELLO",
         )?;
@@ -771,7 +778,7 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
 
         // ── INTEROP-3: Session context + DC envelope loop ────
         let session =
-            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone());
+            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {
@@ -1085,7 +1092,9 @@ pub fn run_answerer_rendezvous(
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
         // INTEROP-2: Encrypted web HELLO (answerer receives first, then sends)
-        let local_kp = local_keypair.as_ref().unwrap();
+        let local_kp = local_keypair
+            .as_ref()
+            .ok_or("[INTEROP-2_HELLO_FAIL] identity keypair missing for web HELLO (answerer)")?;
         let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
             "[INTEROP-2_HELLO_FAIL] no remote identity key in offer signal — cannot encrypt HELLO",
         )?;
@@ -1115,7 +1124,7 @@ pub fn run_answerer_rendezvous(
 
         // ── INTEROP-3: Session context + DC envelope loop ────
         let session =
-            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone());
+            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {
@@ -1203,7 +1212,7 @@ pub(crate) fn run_rendezvous_session_with_exchange<F>(
 where
     F: for<'a> FnOnce(SmokeDcContext<'a>) -> Result<(), Box<dyn std::error::Error>>,
 {
-    match args.role.as_ref().expect("role required for rendezvous") {
+    match args.role.as_ref().ok_or("role required for rendezvous")? {
         crate::Role::Offerer => offerer_with_exchange(args, exchange),
         crate::Role::Answerer => answerer_with_exchange(args, exchange),
     }

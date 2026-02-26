@@ -2,6 +2,19 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## I5 — Interop Error Framing Fix (600fef4)
+
+Post-envelope error framing divergence: error messages sent before
+disconnect were plaintext even after envelope-v1 negotiation. Added
+`build_error_payload()` helper that wraps errors in profile-envelope
+when session has envelope-v1 negotiated, falls back to plaintext for
+pre-HELLO or no-capability sessions. All 4 error send sites in
+rendezvous.rs updated.
+
+**Tag:** `daemon-v0.2.11-interop-error-framing`
+
+---
+
 ## H6 — CI Enforcement (398a63d)
 
 Clippy -W→-D warnings, test-support feature gate, panic checker script.

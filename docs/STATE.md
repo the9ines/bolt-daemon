@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.10-h3-h6-mainline` |
-| Commit (main) | *(see git log)* |
+| Tag (main) | `daemon-v0.2.11-interop-error-framing` |
+| Commit (main) | `600fef4` |
 | Branch | `main` |
-| Phase | Mainline convergence — H3/H4/H3.1/H5/H6 merged |
+| Phase | I5 interop error framing fix |
 
 ## Test Status
 
-- 262+ tests (51 lib + 146 main + 15 relay + 50 H5 integration)
+- 271 tests with test-support (55 lib + 146 main + 15 relay + 5 vectors + 50 H5 integration)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -82,6 +82,7 @@
 - Post-HELLO DC recv loop: decode envelope → minimal router (error → Err, unhandled → log+drop)
 - No-downgrade: envelope cap required in web_dc_v1; non-envelope messages = ENVELOPE_REQUIRED
 - Error framing: `{"type":"error","code":"<CODE>","message":"<detail>"}` sent on DC before disconnect
+- Error framing (I5): `build_error_payload()` wraps errors in profile-envelope when envelope-v1 negotiated
 - Wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A (H5)
 - Log markers: `[INTEROP-3]`, `[INTEROP-3_NO_ENVELOPE_CAP]`, `[INTEROP-3_ENVELOPE_ERR]`, `[INTEROP-3_UNHANDLED]`
 

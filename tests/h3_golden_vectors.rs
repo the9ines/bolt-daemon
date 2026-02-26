@@ -1,6 +1,8 @@
 //! H3 golden vector tests for bolt-daemon.
 //!
-//! Reads the SAME vector JSON files from bolt-core-sdk (no duplication).
+//! Vectors are vendored into `tests/vectors/` and embedded at compile time
+//! via `include_str!`. No sibling repo access required at build or runtime.
+//!
 //! Exercises parse_hello_message and decode_envelope against precomputed
 //! sealed payloads, verifying cross-implementation parity.
 //!
@@ -10,18 +12,10 @@
 #![allow(non_snake_case)]
 
 use serde::Deserialize;
-use std::path::PathBuf;
 
-fn vectors_dir() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("..")
-        .join("bolt-core-sdk")
-        .join("ts")
-        .join("bolt-core")
-        .join("__tests__")
-        .join("vectors")
-}
+const HELLO_VECTORS_JSON: &str = include_str!("vectors/web-hello-open.vectors.json");
+const ENVELOPE_VECTORS_JSON: &str = include_str!("vectors/envelope-open.vectors.json");
+const SAS_VECTORS_JSON: &str = include_str!("vectors/sas.vectors.json");
 
 fn hex_to_32(hex: &str) -> [u8; 32] {
     let bytes = bolt_core::encoding::from_hex(hex).expect("invalid hex");
@@ -81,15 +75,27 @@ struct EnvelopeFrame {
     payload: String,
 }
 
+// ── SAS vector schema (sanity parse) ─────────────────────
+
+#[derive(Deserialize)]
+struct SasVectors {
+    version: u32,
+    cases: Vec<SasCase>,
+}
+
+#[derive(Deserialize)]
+struct SasCase {
+    name: String,
+    #[allow(dead_code)]
+    expected_sas: String,
+}
+
 // ── HELLO open tests (exercises open_box_payload path) ───
 
 #[test]
 fn hello_open_golden_vectors_via_open_box_payload() {
-    let path = vectors_dir().join("web-hello-open.vectors.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     let vecs: HelloVectors =
-        serde_json::from_str(&data).expect("hello open vectors failed to parse");
+        serde_json::from_str(HELLO_VECTORS_JSON).expect("hello open vectors failed to parse");
 
     assert_eq!(vecs.version, 1);
 
@@ -127,11 +133,8 @@ fn hello_open_golden_vectors_via_open_box_payload() {
 fn hello_open_golden_vectors_via_parse_hello_message() {
     use bolt_daemon::test_support::parse_hello_message;
 
-    let path = vectors_dir().join("web-hello-open.vectors.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     let vecs: HelloVectors =
-        serde_json::from_str(&data).expect("hello open vectors failed to parse");
+        serde_json::from_str(HELLO_VECTORS_JSON).expect("hello open vectors failed to parse");
 
     for case in &vecs.cases {
         let sender_pk = hex_to_32(&case.sender_public_hex);
@@ -176,11 +179,8 @@ fn hello_open_golden_vectors_via_parse_hello_message() {
 
 #[test]
 fn envelope_open_golden_vectors_via_open_box_payload() {
-    let path = vectors_dir().join("envelope-open.vectors.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     let vecs: EnvelopeVectors =
-        serde_json::from_str(&data).expect("envelope open vectors failed to parse");
+        serde_json::from_str(ENVELOPE_VECTORS_JSON).expect("envelope open vectors failed to parse");
 
     assert_eq!(vecs.version, 1);
 
@@ -218,11 +218,8 @@ fn envelope_open_golden_vectors_via_open_box_payload() {
 fn envelope_open_golden_vectors_via_decode_envelope() {
     use bolt_daemon::test_support::{decode_envelope, SessionContext};
 
-    let path = vectors_dir().join("envelope-open.vectors.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
     let vecs: EnvelopeVectors =
-        serde_json::from_str(&data).expect("envelope open vectors failed to parse");
+        serde_json::from_str(ENVELOPE_VECTORS_JSON).expect("envelope open vectors failed to parse");
 
     for case in &vecs.cases {
         let sender_pk = hex_to_32(&case.sender_public_hex);
@@ -261,18 +258,25 @@ fn envelope_open_golden_vectors_via_decode_envelope() {
     }
 }
 
-// ── Vector file existence checks ─────────────────────────
+// ── SAS vector sanity check ─────────────────────────────
 
 #[test]
-fn h3_vector_files_accessible_from_daemon() {
-    let dir = vectors_dir();
-    let files = [
-        "sas.vectors.json",
-        "web-hello-open.vectors.json",
-        "envelope-open.vectors.json",
-    ];
-    for filename in &files {
-        let path = dir.join(filename);
-        assert!(path.exists(), "vector file not found at {}", path.display());
+fn sas_vectors_parse_successfully() {
+    let vecs: SasVectors =
+        serde_json::from_str(SAS_VECTORS_JSON).expect("sas vectors failed to parse");
+
+    assert_eq!(vecs.version, 1);
+    assert!(
+        !vecs.cases.is_empty(),
+        "sas vectors must contain at least one case"
+    );
+
+    for case in &vecs.cases {
+        assert!(!case.name.is_empty(), "sas case name must not be empty");
+        assert!(
+            !case.expected_sas.is_empty(),
+            "sas expected_sas must not be empty for case '{}'",
+            case.name
+        );
     }
 }

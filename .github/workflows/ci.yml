@@ -31,13 +31,21 @@ jobs:
         working-directory: bolt-daemon
         run: cargo fmt --check
 
-      - name: cargo clippy
+      - name: cargo clippy (deny warnings)
         working-directory: bolt-daemon
-        run: cargo clippy -- -W clippy::all
+        run: cargo clippy -- -D warnings
 
       - name: cargo test
         working-directory: bolt-daemon
         run: cargo test
+
+      - name: cargo test (test-support feature)
+        working-directory: bolt-daemon
+        run: cargo test --features test-support
+
+      - name: check no panic in production code
+        working-directory: bolt-daemon
+        run: bash scripts/check_no_panic.sh
 
       - name: E2E rendezvous harness
         working-directory: bolt-daemon

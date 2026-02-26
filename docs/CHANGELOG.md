@@ -2,6 +2,38 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## P1 — Inbound Error Validation Hardening (8c45819)
+
+Strict structural + registry validation for inbound `{type:"error"}`
+messages in the post-HELLO DataChannel path. Unknown or malformed error
+codes from remote peers are now treated as `PROTOCOL_VIOLATION` with
+disconnect, rather than being misclassified as `UNKNOWN_MESSAGE_TYPE`.
+
+### Added
+- `CANONICAL_ERROR_CODES` constant — 8 wire codes from Appendix A registry
+- `validate_inbound_error()` — single validator helper for inbound errors:
+  validates `code` exists + is string + is in registry; validates `message`
+  is string if present
+- P1 intercept in `route_inner_message()` — pre-parses inner JSON to
+  intercept `type:"error"` before DcMessage serde dispatch
+- `"error"` added to `KNOWN_TYPES` in dc_messages.rs (defense-in-depth)
+- 5 new tests: known code accepted, unknown code rejected, missing code
+  rejected, non-string code rejected, non-string message rejected
+
+### Invariants
+- All inbound error validation routes through `validate_inbound_error()`
+- No envelope decode logic changed
+- No pre-HELLO plaintext handling changed
+- All existing H5 downgrade tests remain green
+
+### Tests
+- 276 total with test-support (60 lib + 146 main + 15 relay + 5 vectors + 50 H5)
+- Delta: +5 (from 271)
+
+**Tag:** `daemon-v0.2.12-p1-inbound-error-validation`
+
+---
+
 ## I5 — Interop Error Framing Fix (600fef4)
 
 Post-envelope error framing divergence: error messages sent before

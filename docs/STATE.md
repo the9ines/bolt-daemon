@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.11-interop-error-framing` |
-| Commit (main) | `600fef4` |
+| Tag (main) | `daemon-v0.2.12-p1-inbound-error-validation` |
+| Commit (main) | `8c45819` |
 | Branch | `main` |
-| Phase | I5 interop error framing fix |
+| Phase | P1 inbound error validation hardening |
 
 ## Test Status
 
-- 271 tests with test-support (55 lib + 146 main + 15 relay + 5 vectors + 50 H5 integration)
+- 276 tests with test-support (60 lib + 146 main + 15 relay + 5 vectors + 50 H5 integration)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -25,6 +25,7 @@
 | H4 | DONE-MERGED | Panic surface elimination, `daemon-v0.2.6-h4-panic-elimination` (`678c808`) |
 | H5 | DONE-MERGED | Downgrade resistance + error code alignment (R7), `daemon-v0.2.7-h5-downgrade-validation` |
 | H6 | DONE-MERGED | CI enforcement, `daemon-v0.2.9-h6-ci-enforcement` (`398a63d`) |
+| P1 | DONE | Inbound error validation hardening, `daemon-v0.2.12-p1-inbound-error-validation` (`8c45819`) |
 
 ## Daemon Modes
 
@@ -71,8 +72,10 @@
 - Answerer responds: ping → pong reply, app_message → echo
 - All sends go through encode_envelope (NaCl box encrypted)
 - route_inner_message() in envelope.rs handles dispatch
+- Inbound error validation (P1): `validate_inbound_error()` validates `{type:"error"}` messages
+  against `CANONICAL_ERROR_CODES` registry. Unknown/malformed codes → PROTOCOL_VIOLATION + disconnect.
 - E2E script: `scripts/e2e_interop_4_local.sh`
-- Log markers: `[INTEROP-4]`
+- Log markers: `[INTEROP-4]`, `[P1_REMOTE_ERROR]`
 
 ## Session Context + Profile Envelope v1 (INTEROP-3)
 

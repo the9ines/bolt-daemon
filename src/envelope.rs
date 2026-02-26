@@ -122,6 +122,79 @@ impl fmt::Display for EnvelopeError {
 
 impl std::error::Error for EnvelopeError {}
 
+// ── Canonical error code registry ──────────────────────────
+
+/// Canonical error codes from PROTOCOL_ENFORCEMENT.md Appendix A.
+///
+/// Used to validate inbound remote error messages. Only codes in this
+/// registry are accepted; all others are protocol violations.
+pub const CANONICAL_ERROR_CODES: &[&str] = &[
+    "ENVELOPE_UNNEGOTIATED",
+    "ENVELOPE_INVALID",
+    "ENVELOPE_DECRYPT_FAIL",
+    "ENVELOPE_REQUIRED",
+    "INVALID_MESSAGE",
+    "UNKNOWN_MESSAGE_TYPE",
+    "INVALID_STATE",
+    "PROTOCOL_VIOLATION",
+];
+
+/// Validate an inbound remote error message against the canonical registry.
+///
+/// Checks:
+/// - `code` field exists and is a non-empty string
+/// - `code` matches a registered canonical error code
+/// - `message` field, if present, is a string
+///
+/// Returns validated (code, message) on success.
+/// Returns `EnvelopeError::ProtocolViolation` on any validation failure.
+pub fn validate_inbound_error(
+    value: &serde_json::Value,
+) -> Result<(String, Option<String>), EnvelopeError> {
+    // code: must exist, must be a string, must be in registry
+    let code = match value.get("code") {
+        Some(v) => match v.as_str() {
+            Some(s) if !s.is_empty() => s,
+            Some(_) => {
+                return Err(EnvelopeError::ProtocolViolation(
+                    "inbound error: empty 'code' field".to_string(),
+                ))
+            }
+            None => {
+                return Err(EnvelopeError::ProtocolViolation(
+                    "inbound error: 'code' field is not a string".to_string(),
+                ))
+            }
+        },
+        None => {
+            return Err(EnvelopeError::ProtocolViolation(
+                "inbound error: missing 'code' field".to_string(),
+            ))
+        }
+    };
+
+    if !CANONICAL_ERROR_CODES.contains(&code) {
+        return Err(EnvelopeError::ProtocolViolation(format!(
+            "inbound error: unknown error code '{code}'"
+        )));
+    }
+
+    // message: optional, but if present must be a string
+    let message = match value.get("message") {
+        Some(v) => match v.as_str() {
+            Some(m) => Some(m.to_string()),
+            None => {
+                return Err(EnvelopeError::ProtocolViolation(
+                    "inbound error: 'message' field is not a string".to_string(),
+                ))
+            }
+        },
+        None => None,
+    };
+
+    Ok((code.to_string(), message))
+}
+
 // ── Encode ──────────────────────────────────────────────────
 
 /// Encrypt inner JSON bytes and wrap in a Profile Envelope v1.
@@ -218,12 +291,16 @@ pub fn decode_envelope(raw: &[u8], session: &SessionContext) -> Result<Vec<u8>, 
 
 // ── Inner message router ────────────────────────────────────
 
-/// Route a decrypted inner message: handle ping/pong/app_message.
+/// Route a decrypted inner message: handle ping/pong/app_message/error.
 ///
 /// Returns `Ok(Some(envelope_bytes))` if a reply should be sent on the DC,
 /// `Ok(None)` if no reply is needed, or `Err` on protocol violation.
 ///
 /// All reply bytes are already envelope-encrypted and ready for `dc.send()`.
+///
+/// Inbound error messages (`type: "error"`) are intercepted and validated
+/// via `validate_inbound_error()` before the DcMessage dispatch path.
+/// Unknown or malformed error codes become `PROTOCOL_VIOLATION` + disconnect.
 pub fn route_inner_message(
     inner: &[u8],
     session: &SessionContext,
@@ -231,6 +308,20 @@ pub fn route_inner_message(
     use crate::dc_messages::{
         encode_dc_message, now_ms, parse_dc_message, DcMessage, DcParseError,
     };
+
+    // ── P1: intercept inbound error messages ──────────────────
+    // Pre-parse to check type field before DcMessage dispatch.
+    // Error messages are validated via validate_inbound_error(),
+    // not through the DcMessage serde path.
+    let pre_value: serde_json::Value = serde_json::from_slice(inner)
+        .map_err(|e| EnvelopeError::InvalidMessage(format!("inner JSON parse: {e}")))?;
+
+    if pre_value.get("type").and_then(|v| v.as_str()) == Some("error") {
+        let (code, message) = validate_inbound_error(&pre_value)?;
+        eprintln!("[P1_REMOTE_ERROR] validated remote error: code={code}, message={message:?}");
+        return Ok(None);
+    }
+    // ── end P1 intercept ──────────────────────────────────────
 
     let msg = parse_dc_message(inner).map_err(|e| match e {
         DcParseError::UnknownType(ref t) => EnvelopeError::UnknownMessageType(t.clone()),
@@ -552,5 +643,52 @@ mod tests {
         let inner: serde_json::Value = serde_json::from_slice(&inner_bytes).unwrap();
         assert_eq!(inner["type"], "error");
         assert_ne!(inner["type"], "profile-envelope");
+    }
+
+    // ── P1: inbound error validation tests ────────────────────
+
+    #[test]
+    fn route_inbound_error_known_code_accepted() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"ENVELOPE_INVALID","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "remote errors produce no reply");
+    }
+
+    #[test]
+    fn route_inbound_error_unknown_code_rejected() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"BOGUS_CODE","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "PROTOCOL_VIOLATION");
+    }
+
+    #[test]
+    fn route_inbound_error_missing_code_rejected() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","message":"no code field"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "PROTOCOL_VIOLATION");
+    }
+
+    #[test]
+    fn route_inbound_error_non_string_code_rejected() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":42,"message":"numeric code"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "PROTOCOL_VIOLATION");
+    }
+
+    #[test]
+    fn route_inbound_error_non_string_message_rejected() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"ENVELOPE_INVALID","message":42}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "PROTOCOL_VIOLATION");
     }
 }

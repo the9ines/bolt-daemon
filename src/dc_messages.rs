@@ -31,7 +31,11 @@ pub enum DcMessage {
 // ── Parse / encode helpers ──────────────────────────────────
 
 /// Known inner message type strings.
-const KNOWN_TYPES: &[&str] = &["ping", "pong", "app_message"];
+///
+/// Includes `"error"` so that inbound remote errors are not reported as
+/// `UnknownType` — they are intercepted and validated in
+/// `route_inner_message()` before reaching `parse_dc_message()`.
+const KNOWN_TYPES: &[&str] = &["ping", "pong", "app_message", "error"];
 
 /// Error detail for inner message parse operations.
 ///

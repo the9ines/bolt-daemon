@@ -851,16 +851,23 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
                         Ok(None) => {}
                         Err(e) => {
                             eprintln!("[INTEROP-4] route error: {e}");
-                            let err_msg =
-                                crate::envelope::make_error_message(e.code(), &e.to_string());
-                            let _ = dc.send(&err_msg);
+                            let err_payload = crate::envelope::build_error_payload(
+                                e.code(),
+                                &e.to_string(),
+                                Some(&session),
+                            );
+                            let _ = dc.send(&err_payload);
                             return Err(format!("[INTEROP-4] {e}").into());
                         }
                     },
                     Err(e) => {
                         eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        let err_msg = crate::envelope::make_error_message(e.code(), &e.to_string());
-                        let _ = dc.send(&err_msg);
+                        let err_payload = crate::envelope::build_error_payload(
+                            e.code(),
+                            &e.to_string(),
+                            Some(&session),
+                        );
+                        let _ = dc.send(&err_payload);
                         return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());
                     }
                 }
@@ -1153,16 +1160,23 @@ pub fn run_answerer_rendezvous(
                         Ok(None) => {}
                         Err(e) => {
                             eprintln!("[INTEROP-4] route error: {e}");
-                            let err_msg =
-                                crate::envelope::make_error_message(e.code(), &e.to_string());
-                            let _ = dc.send(&err_msg);
+                            let err_payload = crate::envelope::build_error_payload(
+                                e.code(),
+                                &e.to_string(),
+                                Some(&session),
+                            );
+                            let _ = dc.send(&err_payload);
                             return Err(format!("[INTEROP-4] {e}").into());
                         }
                     },
                     Err(e) => {
                         eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        let err_msg = crate::envelope::make_error_message(e.code(), &e.to_string());
-                        let _ = dc.send(&err_msg);
+                        let err_payload = crate::envelope::build_error_payload(
+                            e.code(),
+                            &e.to_string(),
+                            Some(&session),
+                        );
+                        let _ = dc.send(&err_payload);
                         return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());
                     }
                 }

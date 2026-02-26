@@ -285,6 +285,25 @@ pub fn make_error_message(code: &str, message: &str) -> Vec<u8> {
     })
 }
 
+/// Build an error message, wrapping in profile-envelope-v1 when negotiated.
+///
+/// If `session` is `Some` and envelope-v1 was negotiated, the error JSON
+/// becomes the inner payload of an encrypted envelope. Otherwise the error
+/// is sent as plaintext (pre-HELLO or no envelope capability).
+///
+/// Returns bytes ready for `dc.send()`.
+pub fn build_error_payload(code: &str, message: &str, session: Option<&SessionContext>) -> Vec<u8> {
+    let error_bytes = make_error_message(code, message);
+    match session {
+        Some(s) if s.envelope_v1_negotiated() => {
+            // Wrap in envelope. On encode failure, fall back to plaintext
+            // (better to send something than nothing before disconnect).
+            encode_envelope(&error_bytes, s).unwrap_or(error_bytes)
+        }
+        _ => error_bytes,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -480,5 +499,58 @@ mod tests {
         let result = decode_envelope(&[0xFF, 0xFE], &session);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "ENVELOPE_INVALID");
+    }
+
+    // ── I5: build_error_payload tests ──────────────────────
+
+    #[test]
+    fn build_error_payload_wraps_when_envelope_negotiated() {
+        let (sess_a, sess_b) = make_session_pair();
+        let payload = build_error_payload("TEST_ERROR", "test message", Some(&sess_a));
+        // Should be a valid profile-envelope JSON
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["type"], "profile-envelope");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["encoding"], "base64");
+        // Decrypt and verify inner is a valid error message
+        let inner = decode_envelope(&payload, &sess_b).unwrap();
+        let parsed: DcErrorMessage = serde_json::from_slice(&inner).unwrap();
+        assert_eq!(parsed.msg_type, "error");
+        assert_eq!(parsed.code, "TEST_ERROR");
+        assert_eq!(parsed.message, "test message");
+    }
+
+    #[test]
+    fn build_error_payload_plaintext_when_no_session() {
+        let payload = build_error_payload("PRE_HELLO_ERR", "no session yet", None);
+        let parsed: DcErrorMessage = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed.msg_type, "error");
+        assert_eq!(parsed.code, "PRE_HELLO_ERR");
+        assert_eq!(parsed.message, "no session yet");
+    }
+
+    #[test]
+    fn build_error_payload_plaintext_when_no_envelope_cap() {
+        let kp = generate_identity_keypair();
+        let remote_pk = generate_identity_keypair().public_key;
+        let session = SessionContext::new(kp, remote_pk, vec![]).unwrap();
+        let payload = build_error_payload("TEST_ERROR", "no cap", Some(&session));
+        let parsed: DcErrorMessage = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed.msg_type, "error");
+        assert_eq!(parsed.code, "TEST_ERROR");
+    }
+
+    #[test]
+    fn build_error_payload_no_double_wrapping() {
+        let (sess_a, sess_b) = make_session_pair();
+        let payload = build_error_payload("DOUBLE_WRAP_CHECK", "check", Some(&sess_a));
+        // Outer must be profile-envelope
+        let outer: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(outer["type"], "profile-envelope");
+        // Inner must be error, NOT another profile-envelope
+        let inner_bytes = decode_envelope(&payload, &sess_b).unwrap();
+        let inner: serde_json::Value = serde_json::from_slice(&inner_bytes).unwrap();
+        assert_eq!(inner["type"], "error");
+        assert_ne!(inner["type"], "profile-envelope");
     }
 }

@@ -124,18 +124,35 @@ impl std::error::Error for EnvelopeError {}
 
 // ── Canonical error code registry ──────────────────────────
 
-/// Canonical error codes from PROTOCOL_ENFORCEMENT.md Appendix A.
+/// Canonical wire error code registry — 22 codes (11 PROTOCOL + 11 ENFORCEMENT).
 ///
-/// Used to validate inbound remote error messages. Only codes in this
-/// registry are accepted; all others are protocol violations.
+/// Source: PROTOCOL.md §10 (v0.1.3-spec). Every error frame sent on the wire
+/// MUST use a code from this array. Implementations MUST reject inbound error
+/// frames carrying codes not listed here (→ PROTOCOL_VIOLATION + disconnect).
 pub const CANONICAL_ERROR_CODES: &[&str] = &[
-    "ENVELOPE_UNNEGOTIATED",
-    "ENVELOPE_INVALID",
-    "ENVELOPE_DECRYPT_FAIL",
+    // PROTOCOL class (11)
+    "VERSION_MISMATCH",
+    "ENCRYPTION_FAILED",
+    "INTEGRITY_FAILED",
+    "REPLAY_DETECTED",
+    "TRANSFER_FAILED",
+    "LIMIT_EXCEEDED",
+    "CONNECTION_LOST",
+    "PEER_NOT_FOUND",
+    "ALREADY_CONNECTED",
+    "INVALID_STATE",
+    "KEY_MISMATCH",
+    // ENFORCEMENT class (11)
+    "DUPLICATE_HELLO",
     "ENVELOPE_REQUIRED",
+    "ENVELOPE_UNNEGOTIATED",
+    "ENVELOPE_DECRYPT_FAIL",
+    "ENVELOPE_INVALID",
+    "HELLO_PARSE_ERROR",
+    "HELLO_DECRYPT_FAIL",
+    "HELLO_SCHEMA_ERROR",
     "INVALID_MESSAGE",
     "UNKNOWN_MESSAGE_TYPE",
-    "INVALID_STATE",
     "PROTOCOL_VIOLATION",
 ];
 
@@ -690,5 +707,98 @@ mod tests {
         let result = route_inner_message(error_json.as_bytes(), &sess_a);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "PROTOCOL_VIOLATION");
+    }
+
+    // ── PROTO-HARDEN-2A: registry expansion tests ────────────
+
+    #[test]
+    fn canonical_registry_has_exactly_22_codes() {
+        assert_eq!(CANONICAL_ERROR_CODES.len(), 22);
+    }
+
+    #[test]
+    fn canonical_registry_all_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for code in CANONICAL_ERROR_CODES {
+            assert!(seen.insert(*code), "duplicate code: {code}");
+        }
+    }
+
+    #[test]
+    fn route_inbound_error_duplicate_hello_accepted() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"DUPLICATE_HELLO","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn route_inbound_error_envelope_required_accepted() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"ENVELOPE_REQUIRED","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn route_inbound_error_hello_decrypt_fail_accepted() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"HELLO_DECRYPT_FAIL","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn route_inbound_error_protocol_violation_accepted() {
+        let (sess_a, _) = make_session_pair();
+        let error_json = r#"{"type":"error","code":"PROTOCOL_VIOLATION","message":"test"}"#;
+        let result = route_inner_message(error_json.as_bytes(), &sess_a);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn route_inbound_error_all_protocol_class_codes_accepted() {
+        let protocol_codes = [
+            "VERSION_MISMATCH",
+            "ENCRYPTION_FAILED",
+            "INTEGRITY_FAILED",
+            "REPLAY_DETECTED",
+            "TRANSFER_FAILED",
+            "LIMIT_EXCEEDED",
+            "CONNECTION_LOST",
+            "PEER_NOT_FOUND",
+            "ALREADY_CONNECTED",
+            "INVALID_STATE",
+            "KEY_MISMATCH",
+        ];
+        let (sess_a, _) = make_session_pair();
+        for code in protocol_codes {
+            let json = format!(r#"{{"type":"error","code":"{code}","message":"test"}}"#);
+            let result = route_inner_message(json.as_bytes(), &sess_a);
+            assert!(result.is_ok(), "PROTOCOL code {code} should be accepted");
+        }
+    }
+
+    #[test]
+    fn route_inbound_error_all_enforcement_class_codes_accepted() {
+        let enforcement_codes = [
+            "DUPLICATE_HELLO",
+            "ENVELOPE_REQUIRED",
+            "ENVELOPE_UNNEGOTIATED",
+            "ENVELOPE_DECRYPT_FAIL",
+            "ENVELOPE_INVALID",
+            "HELLO_PARSE_ERROR",
+            "HELLO_DECRYPT_FAIL",
+            "HELLO_SCHEMA_ERROR",
+            "INVALID_MESSAGE",
+            "UNKNOWN_MESSAGE_TYPE",
+            "PROTOCOL_VIOLATION",
+        ];
+        let (sess_a, _) = make_session_pair();
+        for code in enforcement_codes {
+            let json = format!(r#"{{"type":"error","code":"{code}","message":"test"}}"#);
+            let result = route_inner_message(json.as_bytes(), &sess_a);
+            assert!(result.is_ok(), "ENFORCEMENT code {code} should be accepted");
+        }
     }
 }

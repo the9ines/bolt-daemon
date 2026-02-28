@@ -9,6 +9,8 @@ pub mod dc_messages;
 #[doc(hidden)]
 pub mod envelope;
 #[doc(hidden)]
+pub mod identity_store;
+#[doc(hidden)]
 pub mod session;
 #[doc(hidden)]
 pub mod web_hello;
@@ -41,4 +43,10 @@ pub mod test_support {
 
     // Inner messages
     pub use crate::dc_messages::{encode_dc_message, parse_dc_message, DcMessage, DcParseError};
+
+    // Identity store
+    pub use crate::identity_store::{
+        ensure_parent_dir_secure, load_or_create_identity, resolve_identity_path,
+        validate_file_mode_0600, IdentityStoreError,
+    };
 }

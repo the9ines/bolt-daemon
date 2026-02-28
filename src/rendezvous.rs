@@ -546,7 +546,7 @@ pub(crate) struct SmokeDcContext<'a> {
 ///
 /// INVARIANT: `--signal rendezvous` is required. No fallback to file mode.
 /// If the server is down or peer is unreachable, exit 1.
-pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::IdentityKeyPair) -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed: these are validated in parse_args() but double-check here
     let room = args
         .room
@@ -574,14 +574,13 @@ pub fn run_offerer_rendezvous(args: &Args) -> Result<(), Box<dyn std::error::Err
         eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
     }
 
-    // Generate identity keypair for web HELLO (if enabled)
+    // Use persistent identity keypair for web HELLO (if enabled)
     let local_keypair = if use_web_hello {
-        let kp = bolt_core::identity::generate_identity_keypair();
         eprintln!(
-            "[INTEROP-2] identity keypair generated (pk={})",
-            bolt_core::encoding::to_base64(&kp.public_key)
+            "[INTEROP-2] using persistent identity (pk={})",
+            bolt_core::encoding::to_base64(&identity.public_key)
         );
-        Some(kp)
+        Some(identity.clone())
     } else {
         None
     };
@@ -909,6 +908,7 @@ pub fn run_answerer_rendezvous(
     args: &Args,
     ipc_server: Option<&crate::ipc::server::IpcServer>,
     trust_path: &std::path::Path,
+    identity: &bolt_core::identity::IdentityKeyPair,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed: these are validated in parse_args() but double-check here
     let room = args
@@ -937,14 +937,13 @@ pub fn run_answerer_rendezvous(
         eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
     }
 
-    // Generate identity keypair for web HELLO (if enabled)
+    // Use persistent identity keypair for web HELLO (if enabled)
     let local_keypair = if use_web_hello {
-        let kp = bolt_core::identity::generate_identity_keypair();
         eprintln!(
-            "[INTEROP-2] identity keypair generated (pk={})",
-            bolt_core::encoding::to_base64(&kp.public_key)
+            "[INTEROP-2] using persistent identity (pk={})",
+            bolt_core::encoding::to_base64(&identity.public_key)
         );
-        Some(kp)
+        Some(identity.clone())
     } else {
         None
     };

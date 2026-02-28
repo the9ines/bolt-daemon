@@ -17,7 +17,7 @@
 
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
-pub(crate) use bolt_daemon::{dc_messages, envelope, session, web_hello, HELLO_PAYLOAD};
+pub(crate) use bolt_daemon::{dc_messages, envelope, identity_store, session, web_hello, HELLO_PAYLOAD};
 
 mod ice_filter;
 pub(crate) mod ipc;
@@ -1192,6 +1192,23 @@ fn main() {
             };
             let trust_path = default_trust_path();
 
+            // Load persistent identity once, before role dispatch.
+            // Both rendezvous paths share the same long-lived keypair.
+            let identity_path = match identity_store::resolve_identity_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[bolt-daemon] FATAL: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let identity = match identity_store::load_or_create_identity(&identity_path) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    eprintln!("[bolt-daemon] FATAL: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
             let role = match args.role.as_ref() {
                 Some(r) => r,
                 None => {
@@ -1203,10 +1220,10 @@ fn main() {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
                 (Role::Offerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_offerer_rendezvous(&args)
+                    rendezvous::run_offerer_rendezvous(&args, &identity)
                 }
                 (Role::Answerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_answerer_rendezvous(&args, ipc_server.as_ref(), &trust_path)
+                    rendezvous::run_answerer_rendezvous(&args, ipc_server.as_ref(), &trust_path, &identity)
                 }
             };
             match result {

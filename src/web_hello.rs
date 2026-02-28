@@ -177,18 +177,23 @@ pub fn decode_public_key(b64: &str) -> Result<[u8; 32], Box<dyn std::error::Erro
 // ── Build / Parse ───────────────────────────────────────────
 
 /// Build an encrypted web HELLO message (JSON string ready to send on DC).
+///
+/// `identity_pk` — persistent identity public key (placed in HELLO inner field).
+/// `session_kp` — ephemeral session keypair (secret used for NaCl box sealing).
+/// `remote_public_key` — remote peer's session/ephemeral public key.
 pub fn build_hello_message(
-    local_keypair: &KeyPair,
+    identity_pk: &[u8; 32],
+    session_kp: &KeyPair,
     remote_public_key: &[u8; 32],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let inner = WebHelloInner {
         msg_type: "hello".to_string(),
         version: 1,
-        identity_public_key: to_base64(&local_keypair.public_key),
+        identity_public_key: to_base64(identity_pk),
         capabilities: daemon_capabilities(),
     };
     let inner_json = serde_json::to_vec(&inner)?;
-    let sealed = seal_box_payload(&inner_json, remote_public_key, &local_keypair.secret_key)
+    let sealed = seal_box_payload(&inner_json, remote_public_key, &session_kp.secret_key)
         .map_err(|e| format!("[INTEROP-2_HELLO_FAIL] seal: {}", e))?;
     let outer = WebHelloOuter {
         msg_type: "hello".to_string(),
@@ -200,13 +205,16 @@ pub fn build_hello_message(
 
 /// Parse and decrypt a received web HELLO message with typed error codes.
 ///
+/// `remote_public_key` — remote peer's session/ephemeral public key.
+/// `session_kp` — local ephemeral session keypair (secret used for NaCl box opening).
+///
 /// Returns `HelloError` variants aligned with PROTOCOL_ENFORCEMENT.md
 /// Appendix A (HELLO_PARSE_ERROR, HELLO_DECRYPT_FAIL, HELLO_SCHEMA_ERROR).
 /// Fail-closed: any parse, decrypt, or schema error is fatal.
 pub fn parse_hello_typed(
     raw: &[u8],
     remote_public_key: &[u8; 32],
-    local_keypair: &KeyPair,
+    session_kp: &KeyPair,
 ) -> Result<WebHelloInner, HelloError> {
     // No-downgrade check
     if raw == crate::HELLO_PAYLOAD {
@@ -229,7 +237,7 @@ pub fn parse_hello_typed(
     let plaintext = bolt_core::crypto::open_box_payload(
         &outer.payload,
         remote_public_key,
-        &local_keypair.secret_key,
+        &session_kp.secret_key,
     )
     .map_err(|e| HelloError::DecryptFail(e.to_string()))?;
 
@@ -255,15 +263,18 @@ pub fn parse_hello_typed(
 
 /// Parse and decrypt a received web HELLO message from raw DataChannel bytes.
 ///
+/// `remote_public_key` — remote peer's session/ephemeral public key.
+/// `session_kp` — local ephemeral session keypair (secret used for NaCl box opening).
+///
 /// Delegates to `parse_hello_typed` for typed error handling, then converts
 /// to `Box<dyn Error>` for backward compatibility with existing callers.
 /// Fail-closed: any parse, decrypt, or schema error returns Err.
 pub fn parse_hello_message(
     raw: &[u8],
     remote_public_key: &[u8; 32],
-    local_keypair: &KeyPair,
+    session_kp: &KeyPair,
 ) -> Result<WebHelloInner, Box<dyn std::error::Error>> {
-    parse_hello_typed(raw, remote_public_key, local_keypair).map_err(|e| {
+    parse_hello_typed(raw, remote_public_key, session_kp).map_err(|e| {
         let msg = format!("[INTEROP-2_HELLO_FAIL] {e}");
         Box::<dyn std::error::Error>::from(msg)
     })
@@ -362,10 +373,11 @@ mod tests {
 
     #[test]
     fn build_hello_produces_valid_json() {
-        let kp_a = generate_identity_keypair();
-        let kp_b = generate_identity_keypair();
+        let identity = generate_identity_keypair();
+        let session_kp = bolt_core::crypto::generate_ephemeral_keypair();
+        let remote_session = bolt_core::crypto::generate_ephemeral_keypair();
 
-        let msg = build_hello_message(&kp_a, &kp_b.public_key).unwrap();
+        let msg = build_hello_message(&identity.public_key, &session_kp, &remote_session.public_key).unwrap();
         let outer: WebHelloOuter = serde_json::from_str(&msg).unwrap();
         assert_eq!(outer.msg_type, "hello");
         assert!(!outer.payload.is_empty());
@@ -373,17 +385,18 @@ mod tests {
 
     #[test]
     fn full_message_roundtrip() {
-        let kp_a = generate_identity_keypair();
-        let kp_b = generate_identity_keypair();
+        let identity_a = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
 
-        // A builds HELLO for B
-        let msg = build_hello_message(&kp_a, &kp_b.public_key).unwrap();
+        // A builds HELLO for B (identity_a.pk in inner, sealed with session_a.sk)
+        let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
 
-        // B parses HELLO from A
-        let inner = parse_hello_message(msg.as_bytes(), &kp_a.public_key, &kp_b).unwrap();
+        // B parses HELLO from A (opens with session_b.sk, sender is session_a.pk)
+        let inner = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_b).unwrap();
         assert_eq!(inner.msg_type, "hello");
         assert_eq!(inner.version, 1);
-        assert_eq!(inner.identity_public_key, to_base64(&kp_a.public_key));
+        assert_eq!(inner.identity_public_key, to_base64(&identity_a.public_key));
         assert!(inner
             .capabilities
             .contains(&"bolt.profile-envelope-v1".to_string()));
@@ -391,18 +404,20 @@ mod tests {
 
     #[test]
     fn full_bidirectional_roundtrip() {
-        let kp_a = generate_identity_keypair();
-        let kp_b = generate_identity_keypair();
+        let identity_a = generate_identity_keypair();
+        let identity_b = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
 
         // A → B
-        let msg_a = build_hello_message(&kp_a, &kp_b.public_key).unwrap();
-        let inner_a = parse_hello_message(msg_a.as_bytes(), &kp_a.public_key, &kp_b).unwrap();
-        assert_eq!(inner_a.identity_public_key, to_base64(&kp_a.public_key));
+        let msg_a = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+        let inner_a = parse_hello_message(msg_a.as_bytes(), &session_a.public_key, &session_b).unwrap();
+        assert_eq!(inner_a.identity_public_key, to_base64(&identity_a.public_key));
 
         // B → A
-        let msg_b = build_hello_message(&kp_b, &kp_a.public_key).unwrap();
-        let inner_b = parse_hello_message(msg_b.as_bytes(), &kp_b.public_key, &kp_a).unwrap();
-        assert_eq!(inner_b.identity_public_key, to_base64(&kp_b.public_key));
+        let msg_b = build_hello_message(&identity_b.public_key, &session_b, &session_a.public_key).unwrap();
+        let inner_b = parse_hello_message(msg_b.as_bytes(), &session_b.public_key, &session_a).unwrap();
+        assert_eq!(inner_b.identity_public_key, to_base64(&identity_b.public_key));
     }
 
     // ── Failure tests ───────────────────────────────────────
@@ -437,15 +452,16 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_encryption_key() {
-        let kp_a = generate_identity_keypair();
-        let kp_b = generate_identity_keypair();
-        let kp_c = generate_identity_keypair();
+        let identity_a = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_c = bolt_core::crypto::generate_ephemeral_keypair();
 
-        // A encrypts for B
-        let msg = build_hello_message(&kp_a, &kp_b.public_key).unwrap();
+        // A encrypts for B (session keys)
+        let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
 
-        // C tries to decrypt (wrong key)
-        let result = parse_hello_message(msg.as_bytes(), &kp_a.public_key, &kp_c);
+        // C tries to decrypt (wrong session key)
+        let result = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_c);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

@@ -574,17 +574,20 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
         eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
     }
 
-    // Use persistent identity keypair for web HELLO (if enabled)
-    let local_keypair = if use_web_hello {
+    // Generate ephemeral session keypair for signaling + sealing (per session).
+    // Persistent identity is used ONLY for identityPublicKey in HELLO inner field.
+    let session_kp = if use_web_hello {
+        let kp = bolt_core::crypto::generate_ephemeral_keypair();
         eprintln!(
-            "[INTEROP-2] using persistent identity (pk={})",
+            "[SA1] session ephemeral pk={}, persistent identity pk={}",
+            bolt_core::encoding::to_base64(&kp.public_key),
             bolt_core::encoding::to_base64(&identity.public_key)
         );
-        Some(identity.clone())
+        Some(kp)
     } else {
         None
     };
-    let local_pk_b64 = local_keypair
+    let local_pk_b64 = session_kp
         .as_ref()
         .map(|kp| bolt_core::encoding::to_base64(&kp.public_key));
 
@@ -744,40 +747,40 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
-        // INTEROP-2: Encrypted web HELLO
-        let local_kp = local_keypair
+        // SA1 Phase B: Separated identity (persistent) + session (ephemeral) keys
+        let local_session = session_kp
             .as_ref()
-            .ok_or("[INTEROP-2_HELLO_FAIL] identity keypair missing for web HELLO (offerer)")?;
+            .ok_or("[INTEROP-2_HELLO_FAIL] session keypair missing for web HELLO (offerer)")?;
         let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
-            "[INTEROP-2_HELLO_FAIL] no remote identity key in answer signal — cannot encrypt HELLO",
+            "[INTEROP-2_HELLO_FAIL] no remote session key in answer signal — cannot encrypt HELLO",
         )?;
         let remote_pk = crate::web_hello::decode_public_key(remote_pk_b64_str)?;
-        eprintln!("[INTEROP-2] remote identity pk: {}", remote_pk_b64_str);
+        eprintln!("[INTEROP-2] remote session pk: {}", remote_pk_b64_str);
 
-        // Send encrypted HELLO
-        let hello_msg = crate::web_hello::build_hello_message(local_kp, &remote_pk)?;
+        // Send encrypted HELLO (identity.pk in inner field, session_kp for sealing)
+        let hello_msg = crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
         dc.send(hello_msg.as_bytes())?;
         eprintln!("[INTEROP-2] sent encrypted HELLO");
 
-        // Receive + decrypt remote HELLO
+        // Receive + decrypt remote HELLO (session_kp for opening)
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or("phase timeout expired waiting for web HELLO")?;
         let response = dc_msg_rx.recv_timeout(remaining)?;
-        let remote_hello = crate::web_hello::parse_hello_message(&response, &remote_pk, local_kp)?;
+        let remote_hello = crate::web_hello::parse_hello_message(&response, &remote_pk, local_session)?;
 
         // Negotiate capabilities
         let local_caps = crate::web_hello::daemon_capabilities();
         let negotiated =
             crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
         eprintln!(
-            "[INTEROP-2] HELLO exchange complete — remote_pk={}, negotiated_caps={:?}",
+            "[INTEROP-2] HELLO exchange complete — remote_identity={}, negotiated_caps={:?}",
             remote_hello.identity_public_key, negotiated
         );
 
-        // ── INTEROP-3: Session context + DC envelope loop ────
+        // ── INTEROP-3: Session context uses ephemeral session keypair ────
         let session =
-            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone())?;
+            crate::session::SessionContext::new(local_session.clone(), remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {
@@ -937,17 +940,20 @@ pub fn run_answerer_rendezvous(
         eprintln!("[INTEROP-2] web_hello_v1 mode enabled — encrypted HELLO");
     }
 
-    // Use persistent identity keypair for web HELLO (if enabled)
-    let local_keypair = if use_web_hello {
+    // Generate ephemeral session keypair for signaling + sealing (per session).
+    // Persistent identity is used ONLY for identityPublicKey in HELLO inner field.
+    let session_kp = if use_web_hello {
+        let kp = bolt_core::crypto::generate_ephemeral_keypair();
         eprintln!(
-            "[INTEROP-2] using persistent identity (pk={})",
+            "[SA1] session ephemeral pk={}, persistent identity pk={}",
+            bolt_core::encoding::to_base64(&kp.public_key),
             bolt_core::encoding::to_base64(&identity.public_key)
         );
-        Some(identity.clone())
+        Some(kp)
     } else {
         None
     };
-    let local_pk_b64 = local_keypair
+    let local_pk_b64 = session_kp
         .as_ref()
         .map(|kp| bolt_core::encoding::to_base64(&kp.public_key));
 
@@ -1097,25 +1103,25 @@ pub fn run_answerer_rendezvous(
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
-        // INTEROP-2: Encrypted web HELLO (answerer receives first, then sends)
-        let local_kp = local_keypair
+        // SA1 Phase B: Separated identity (persistent) + session (ephemeral) keys
+        let local_session = session_kp
             .as_ref()
-            .ok_or("[INTEROP-2_HELLO_FAIL] identity keypair missing for web HELLO (answerer)")?;
+            .ok_or("[INTEROP-2_HELLO_FAIL] session keypair missing for web HELLO (answerer)")?;
         let remote_pk_b64_str = remote_pk_b64.as_deref().ok_or(
-            "[INTEROP-2_HELLO_FAIL] no remote identity key in offer signal — cannot encrypt HELLO",
+            "[INTEROP-2_HELLO_FAIL] no remote session key in offer signal — cannot encrypt HELLO",
         )?;
         let remote_pk = crate::web_hello::decode_public_key(remote_pk_b64_str)?;
-        eprintln!("[INTEROP-2] remote identity pk: {}", remote_pk_b64_str);
+        eprintln!("[INTEROP-2] remote session pk: {}", remote_pk_b64_str);
 
-        // Receive + decrypt remote HELLO
+        // Receive + decrypt remote HELLO (session_kp for opening)
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or("phase timeout expired waiting for web HELLO")?;
         let msg = ch.dc_msg_rx.recv_timeout(remaining)?;
-        let remote_hello = crate::web_hello::parse_hello_message(&msg, &remote_pk, local_kp)?;
+        let remote_hello = crate::web_hello::parse_hello_message(&msg, &remote_pk, local_session)?;
 
-        // Send encrypted HELLO reply
-        let hello_msg = crate::web_hello::build_hello_message(local_kp, &remote_pk)?;
+        // Send encrypted HELLO reply (identity.pk in inner field, session_kp for sealing)
+        let hello_msg = crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
         dc.send(hello_msg.as_bytes())?;
         eprintln!("[INTEROP-2] sent encrypted HELLO reply");
 
@@ -1124,13 +1130,13 @@ pub fn run_answerer_rendezvous(
         let negotiated =
             crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
         eprintln!(
-            "[INTEROP-2] HELLO exchange complete — remote_pk={}, negotiated_caps={:?}",
+            "[INTEROP-2] HELLO exchange complete — remote_identity={}, negotiated_caps={:?}",
             remote_hello.identity_public_key, negotiated
         );
 
-        // ── INTEROP-3: Session context + DC envelope loop ────
+        // ── INTEROP-3: Session context uses ephemeral session keypair ────
         let session =
-            crate::session::SessionContext::new(local_kp.clone(), remote_pk, negotiated.clone())?;
+            crate::session::SessionContext::new(local_session.clone(), remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {

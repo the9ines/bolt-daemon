@@ -417,11 +417,12 @@ fn appendix_a_hello_parse_error_for_wrong_outer_type() {
 
 #[test]
 fn appendix_a_hello_decrypt_fail_for_wrong_key() {
-    let kp_a = generate_identity_keypair();
-    let kp_b = generate_identity_keypair();
-    let kp_c = generate_identity_keypair();
-    let msg = build_hello_message(&kp_a, &kp_b.public_key).unwrap();
-    let err = parse_hello_typed(msg.as_bytes(), &kp_a.public_key, &kp_c).unwrap_err();
+    let identity_a = generate_identity_keypair();
+    let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+    let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+    let session_c = bolt_core::crypto::generate_ephemeral_keypair();
+    let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+    let err = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_c).unwrap_err();
     assert_eq!(err.code(), "HELLO_DECRYPT_FAIL");
 }
 

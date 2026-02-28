@@ -168,9 +168,12 @@ fn recv_with_deadline(
             MaybeTlsStream::Plain(tcp) => {
                 tcp.set_read_timeout(Some(read_timeout))?;
             }
+            // SA16: fail-closed — no TLS crate compiled in; if a TLS variant is
+            // added in the future, this arm forces an explicit timeout implementation
+            // rather than silently blocking indefinitely on ws.read().
+            #[allow(unreachable_patterns)]
             _ => {
-                // TLS stream — set_read_timeout not directly available,
-                // but tungstenite handles it via the underlying stream
+                return Err("read timeout not supported for this stream type — TLS timeout handler required".into());
             }
         }
 

@@ -34,6 +34,12 @@ pub enum InteropHelloMode {
 // ── Capabilities ────────────────────────────────────────────
 
 /// Daemon-advertised capabilities in web HELLO.
+///
+/// SA15: `bolt.file-hash` intentionally omitted. The daemon's DataChannel transfer
+/// path does not compute or verify SHA-256 file hashes during web-interop transfers.
+/// Advertising a capability without a working implementation would violate the
+/// "no false advertisement" invariant. File-hash support will be added when the
+/// daemon's transfer path implements it end-to-end.
 pub const DAEMON_CAPABILITIES: &[&str] = &["bolt.profile-envelope-v1"];
 
 /// Return daemon capabilities as owned Strings.
@@ -255,6 +261,14 @@ pub fn parse_hello_typed(
         return Err(HelloError::SchemaError(format!(
             "version {} != 1",
             inner.version
+        )));
+    }
+
+    // SA17: reject oversized capabilities array (max 32)
+    if inner.capabilities.len() > 32 {
+        return Err(HelloError::SchemaError(format!(
+            "capabilities length {} exceeds max 32",
+            inner.capabilities.len()
         )));
     }
 
@@ -530,5 +544,104 @@ mod tests {
         let result = decode_public_key(&b64);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("length"));
+    }
+
+    // ── SA15: bolt.file-hash intentionally omitted ──────────
+
+    #[test]
+    fn sa15_daemon_capabilities_no_file_hash() {
+        // bolt.file-hash is deliberately not advertised because the daemon's
+        // DataChannel transfer path does not implement file hash verification.
+        assert!(!DAEMON_CAPABILITIES.contains(&"bolt.file-hash"));
+        // bolt.profile-envelope-v1 IS advertised (implemented).
+        assert!(DAEMON_CAPABILITIES.contains(&"bolt.profile-envelope-v1"));
+    }
+
+    // ── SA17: max capabilities length enforcement ───────────
+
+    #[test]
+    fn sa17_capabilities_at_max_32_accepted() {
+        let identity = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+
+        // Build inner with exactly 32 capabilities
+        let caps: Vec<String> = (0..32).map(|i| format!("cap-{i}")).collect();
+        let inner = WebHelloInner {
+            msg_type: "hello".to_string(),
+            version: 1,
+            identity_public_key: to_base64(&identity.public_key),
+            capabilities: caps,
+        };
+        let plaintext = serde_json::to_vec(&inner).unwrap();
+        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let outer = WebHelloOuter {
+            msg_type: "hello".to_string(),
+            payload: sealed,
+        };
+        let msg = serde_json::to_string(&outer).unwrap();
+
+        let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().capabilities.len(), 32);
+    }
+
+    #[test]
+    fn sa17_capabilities_exceeding_32_rejected() {
+        let identity = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+
+        // Build inner with 33 capabilities (exceeds max)
+        let caps: Vec<String> = (0..33).map(|i| format!("cap-{i}")).collect();
+        let inner = WebHelloInner {
+            msg_type: "hello".to_string(),
+            version: 1,
+            identity_public_key: to_base64(&identity.public_key),
+            capabilities: caps,
+        };
+        let plaintext = serde_json::to_vec(&inner).unwrap();
+        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let outer = WebHelloOuter {
+            msg_type: "hello".to_string(),
+            payload: sealed,
+        };
+        let msg = serde_json::to_string(&outer).unwrap();
+
+        let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            HelloError::SchemaError(detail) => {
+                assert!(detail.contains("capabilities length"));
+                assert!(detail.contains("exceeds max 32"));
+            }
+            _ => panic!("expected SchemaError, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn sa17_empty_capabilities_accepted() {
+        let identity = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+
+        let inner = WebHelloInner {
+            msg_type: "hello".to_string(),
+            version: 1,
+            identity_public_key: to_base64(&identity.public_key),
+            capabilities: vec![],
+        };
+        let plaintext = serde_json::to_vec(&inner).unwrap();
+        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let outer = WebHelloOuter {
+            msg_type: "hello".to_string(),
+            payload: sealed,
+        };
+        let msg = serde_json::to_string(&outer).unwrap();
+
+        let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
+        assert!(result.is_ok());
+        assert!(result.unwrap().capabilities.is_empty());
     }
 }

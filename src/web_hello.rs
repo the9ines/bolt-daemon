@@ -272,6 +272,15 @@ pub fn parse_hello_typed(
         )));
     }
 
+    // N8: reject individual capability strings exceeding 64 bytes
+    for cap in &inner.capabilities {
+        if cap.len() > 64 {
+            return Err(HelloError::SchemaError(
+                "capability too long".into(),
+            ));
+        }
+    }
+
     Ok(inner)
 }
 
@@ -643,5 +652,67 @@ mod tests {
         let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
         assert!(result.is_ok());
         assert!(result.unwrap().capabilities.is_empty());
+    }
+
+    // ── N8: per-capability string length bound ──────────────
+
+    #[test]
+    fn n8_capability_65_bytes_rejected() {
+        let identity = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+
+        // Build inner with one capability of 65 bytes
+        let long_cap = "a".repeat(65);
+        let inner = WebHelloInner {
+            msg_type: "hello".to_string(),
+            version: 1,
+            identity_public_key: to_base64(&identity.public_key),
+            capabilities: vec![long_cap],
+        };
+        let plaintext = serde_json::to_vec(&inner).unwrap();
+        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let outer = WebHelloOuter {
+            msg_type: "hello".to_string(),
+            payload: sealed,
+        };
+        let msg = serde_json::to_string(&outer).unwrap();
+
+        let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            HelloError::SchemaError(detail) => {
+                assert!(detail.contains("capability too long"));
+            }
+            _ => panic!("expected SchemaError, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn n8_capability_64_bytes_accepted() {
+        let identity = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+
+        // Build inner with one capability of exactly 64 bytes
+        let cap_64 = "b".repeat(64);
+        let inner = WebHelloInner {
+            msg_type: "hello".to_string(),
+            version: 1,
+            identity_public_key: to_base64(&identity.public_key),
+            capabilities: vec![cap_64.clone()],
+        };
+        let plaintext = serde_json::to_vec(&inner).unwrap();
+        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let outer = WebHelloOuter {
+            msg_type: "hello".to_string(),
+            payload: sealed,
+        };
+        let msg = serde_json::to_string(&outer).unwrap();
+
+        let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().capabilities, vec![cap_64]);
     }
 }

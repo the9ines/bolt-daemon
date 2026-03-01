@@ -141,8 +141,12 @@ fn session_context_uses_ephemeral_keypair() {
     let session = generate_ephemeral_keypair();
     let remote_session = generate_ephemeral_keypair();
 
+    // N4: Capture Copy values before moving KeyPair (no clone needed).
+    let session_pk = session.public_key;
+    let session_sk = session.secret_key;
+
     let ctx = SessionContext::new(
-        session.clone(),
+        session,
         remote_session.public_key,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
@@ -150,11 +154,11 @@ fn session_context_uses_ephemeral_keypair() {
 
     // SessionContext local_keypair must be the ephemeral session key
     assert_eq!(
-        ctx.local_keypair.public_key, session.public_key,
+        ctx.local_keypair.public_key, session_pk,
         "SessionContext must hold ephemeral session keypair"
     );
     assert_eq!(
-        ctx.local_keypair.secret_key, session.secret_key,
+        ctx.local_keypair.secret_key, session_sk,
         "SessionContext secret key must be ephemeral session secret"
     );
     // ... and NOT the identity key
@@ -169,16 +173,20 @@ fn envelope_roundtrip_uses_ephemeral_session_keys() {
     let session_a = generate_ephemeral_keypair();
     let session_b = generate_ephemeral_keypair();
 
+    // N4: Capture public keys (Copy) before moving KeyPairs.
+    let pk_a = session_a.public_key;
+    let pk_b = session_b.public_key;
+
     let ctx_a = SessionContext::new(
-        session_a.clone(),
-        session_b.public_key,
+        session_a,
+        pk_b,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
 
     let ctx_b = SessionContext::new(
-        session_b.clone(),
-        session_a.public_key,
+        session_b,
+        pk_a,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
@@ -196,18 +204,22 @@ fn envelope_fails_with_identity_key_instead_of_session() {
     let session_a = generate_ephemeral_keypair();
     let session_b = generate_ephemeral_keypair();
 
+    // N4: Capture public keys (Copy) before moving KeyPairs.
+    let pk_a = session_a.public_key;
+    let pk_b = session_b.public_key;
+
     // A encodes with session_a
     let ctx_a = SessionContext::new(
-        session_a.clone(),
-        session_b.public_key,
+        session_a,
+        pk_b,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
 
     // Receiver constructs context with identity key (wrong) instead of session_b
     let ctx_wrong = SessionContext::new(
-        identity.clone(),
-        session_a.public_key,
+        identity,
+        pk_a,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
@@ -234,26 +246,30 @@ fn offerer_path_key_separation() {
     let session_a = generate_ephemeral_keypair();
     let session_b = generate_ephemeral_keypair();
 
+    // N4: Capture public keys (Copy) before moving KeyPairs.
+    let pk_a = session_a.public_key;
+    let pk_b = session_b.public_key;
+
     // Offerer builds HELLO: identity.pk in inner, session_a for sealing
     let msg = build_hello_message(
         &identity_a.public_key,
         &session_a,
-        &session_b.public_key,
+        &pk_b,
     )
     .unwrap();
 
     // Remote opens
-    let inner = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_b).unwrap();
+    let inner = parse_hello_message(msg.as_bytes(), &pk_a, &session_b).unwrap();
     assert_eq!(inner.identity_public_key, to_base64(&identity_a.public_key));
 
-    // SessionContext uses session key
+    // SessionContext uses session key — move ownership (no clone)
     let ctx = SessionContext::new(
-        session_a.clone(),
-        session_b.public_key,
+        session_a,
+        pk_b,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
-    assert_eq!(ctx.local_keypair.public_key, session_a.public_key);
+    assert_eq!(ctx.local_keypair.public_key, pk_a);
 }
 
 #[test]
@@ -262,27 +278,31 @@ fn answerer_path_key_separation() {
     let session_a = generate_ephemeral_keypair();
     let session_b = generate_ephemeral_keypair();
 
+    // N4: Capture public keys (Copy) before moving KeyPairs.
+    let pk_a = session_a.public_key;
+    let pk_b = session_b.public_key;
+
     // Answerer receives HELLO from offerer, then sends reply
     // Answerer builds HELLO reply: identity.pk in inner, session_b for sealing
     let msg = build_hello_message(
         &identity_b.public_key,
         &session_b,
-        &session_a.public_key,
+        &pk_a,
     )
     .unwrap();
 
     // Remote opens
-    let inner = parse_hello_message(msg.as_bytes(), &session_b.public_key, &session_a).unwrap();
+    let inner = parse_hello_message(msg.as_bytes(), &pk_b, &session_a).unwrap();
     assert_eq!(inner.identity_public_key, to_base64(&identity_b.public_key));
 
-    // SessionContext uses session key
+    // SessionContext uses session key — move ownership (no clone)
     let ctx = SessionContext::new(
-        session_b.clone(),
-        session_a.public_key,
+        session_b,
+        pk_a,
         vec!["bolt.profile-envelope-v1".to_string()],
     )
     .unwrap();
-    assert_eq!(ctx.local_keypair.public_key, session_b.public_key);
+    assert_eq!(ctx.local_keypair.public_key, pk_b);
 }
 
 // ── F) negative structural tests ────────────────────────────

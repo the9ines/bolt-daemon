@@ -579,7 +579,7 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
 
     // Generate ephemeral session keypair for signaling + sealing (per session).
     // Persistent identity is used ONLY for identityPublicKey in HELLO inner field.
-    let session_kp = if use_web_hello {
+    let mut session_kp = if use_web_hello {
         let kp = bolt_core::crypto::generate_ephemeral_keypair();
         eprintln!(
             "[SA1] session ephemeral pk={}, persistent identity pk={}",
@@ -782,8 +782,11 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
         );
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
+        // N4: Move ownership via .take() instead of cloning secret key material.
+        let owned_kp = session_kp.take()
+            .ok_or("[INTEROP-3_SESSION_MOVE] session keypair already consumed (offerer)")?;
         let session =
-            crate::session::SessionContext::new(local_session.clone(), remote_pk, negotiated.clone())?;
+            crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {
@@ -945,7 +948,7 @@ pub fn run_answerer_rendezvous(
 
     // Generate ephemeral session keypair for signaling + sealing (per session).
     // Persistent identity is used ONLY for identityPublicKey in HELLO inner field.
-    let session_kp = if use_web_hello {
+    let mut session_kp = if use_web_hello {
         let kp = bolt_core::crypto::generate_ephemeral_keypair();
         eprintln!(
             "[SA1] session ephemeral pk={}, persistent identity pk={}",
@@ -1138,8 +1141,11 @@ pub fn run_answerer_rendezvous(
         );
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
+        // N4: Move ownership via .take() instead of cloning secret key material.
+        let owned_kp = session_kp.take()
+            .ok_or("[INTEROP-3_SESSION_MOVE] session keypair already consumed (answerer)")?;
         let session =
-            crate::session::SessionContext::new(local_session.clone(), remote_pk, negotiated.clone())?;
+            crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {

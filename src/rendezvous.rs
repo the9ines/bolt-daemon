@@ -1124,7 +1124,31 @@ pub fn run_answerer_rendezvous(
             .checked_duration_since(Instant::now())
             .ok_or("phase timeout expired waiting for web HELLO")?;
         let msg = ch.dc_msg_rx.recv_timeout(remaining)?;
-        let remote_hello = crate::web_hello::parse_hello_message(&msg, &remote_pk, local_session)?;
+
+        // N7: Explicit HelloState guard — exactly-once enforcement
+        let mut hello_state = crate::web_hello::HelloState::new();
+
+        // N6: Typed error on HELLO parse/decrypt failure (sent before disconnect)
+        let remote_hello = match crate::web_hello::parse_hello_typed(&msg, &remote_pk, local_session) {
+            Ok(inner) => inner,
+            Err(e) => {
+                eprintln!(
+                    "[INTEROP-2_HELLO_FAIL] typed error → peer: {} {e}",
+                    e.code()
+                );
+
+                let err_payload =
+                    crate::envelope::build_error_payload(e.code(), &e.to_string(), None);
+
+                let _ = dc.send(&err_payload);
+
+                return Err(format!("[INTEROP-2_HELLO_FAIL] {e}").into());
+            }
+        };
+
+        hello_state
+            .mark_completed()
+            .map_err(Box::<dyn std::error::Error>::from)?;
 
         // Send encrypted HELLO reply (identity.pk in inner field, session_kp for sealing)
         let hello_msg = crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;

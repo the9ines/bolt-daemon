@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 /// Post-HELLO DataChannel message types (inside envelope).
 ///
 /// Tagged by `"type"` field to match web-side expectations.
+///
+/// Legacy messages (ping, pong, app_message) use snake_case fields on the wire.
+/// File transfer messages (B2) use camelCase fields per LOCALBOLT_PROFILE.md
+/// canonical JSON encoding (e.g., `transferId`, `chunkIndex`, `totalChunks`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum DcMessage {
@@ -26,6 +30,70 @@ pub enum DcMessage {
 
     #[serde(rename = "app_message")]
     AppMessage { text: String },
+
+    // ── B2: File transfer message types ─────────────────────────
+    // Wire format: LOCALBOLT_PROFILE.md § FILE_OFFER / FILE_CHUNK / etc.
+    // Field naming: camelCase per profile JSON encoding convention.
+    #[serde(rename = "file-offer")]
+    FileOffer {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        filename: String,
+        size: u64,
+        #[serde(rename = "totalChunks")]
+        total_chunks: u32,
+        #[serde(rename = "chunkSize")]
+        chunk_size: u32,
+        #[serde(rename = "fileHash")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_hash: Option<String>,
+    },
+
+    #[serde(rename = "file-accept")]
+    FileAccept {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
+
+    #[serde(rename = "file-chunk")]
+    FileChunk {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        #[serde(rename = "chunkIndex")]
+        chunk_index: u32,
+        #[serde(rename = "totalChunks")]
+        total_chunks: u32,
+        payload: String,
+    },
+
+    #[serde(rename = "file-finish")]
+    FileFinish {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        #[serde(rename = "fileHash")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_hash: Option<String>,
+    },
+
+    #[serde(rename = "pause")]
+    Pause {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
+
+    #[serde(rename = "resume")]
+    Resume {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
+
+    #[serde(rename = "cancel")]
+    Cancel {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+        #[serde(rename = "cancelledBy")]
+        cancelled_by: String,
+    },
 }
 
 // ── Parse / encode helpers ──────────────────────────────────
@@ -35,7 +103,20 @@ pub enum DcMessage {
 /// Includes `"error"` so that inbound remote errors are not reported as
 /// `UnknownType` — they are intercepted and validated in
 /// `route_inner_message()` before reaching `parse_dc_message()`.
-const KNOWN_TYPES: &[&str] = &["ping", "pong", "app_message", "error"];
+const KNOWN_TYPES: &[&str] = &[
+    "ping",
+    "pong",
+    "app_message",
+    "error",
+    // B2: file transfer message types
+    "file-offer",
+    "file-accept",
+    "file-chunk",
+    "file-finish",
+    "pause",
+    "resume",
+    "cancel",
+];
 
 /// Error detail for inner message parse operations.
 ///
@@ -170,11 +251,12 @@ mod tests {
 
     #[test]
     fn parse_unknown_type_returns_unknown_type_error() {
-        let json = r#"{"type":"file-chunk","data":{}}"#;
+        // B2: "file-chunk" is now a known type. Use a genuinely unknown type.
+        let json = r#"{"type":"file-magic","data":{}}"#;
         let result = parse_dc_message(json.as_bytes());
         assert!(result.is_err());
         match result.unwrap_err() {
-            DcParseError::UnknownType(t) => assert_eq!(t, "file-chunk"),
+            DcParseError::UnknownType(t) => assert_eq!(t, "file-magic"),
             other => panic!("expected UnknownType, got: {other:?}"),
         }
     }
@@ -205,5 +287,189 @@ mod tests {
                 reply_to_ms: 42
             }
         );
+    }
+
+    // ── B2: file transfer message serde tests ───────────────────
+
+    #[test]
+    fn file_offer_serde_roundtrip() {
+        let msg = DcMessage::FileOffer {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+            filename: "example.pdf".to_string(),
+            size: 688128,
+            total_chunks: 42,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "file-offer");
+        assert_eq!(json["transferId"], "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
+        assert_eq!(json["filename"], "example.pdf");
+        assert_eq!(json["size"], 688128);
+        assert_eq!(json["totalChunks"], 42);
+        assert_eq!(json["chunkSize"], 16384);
+        assert!(json.get("fileHash").is_none(), "fileHash absent when None");
+    }
+
+    #[test]
+    fn file_offer_with_hash_serde_roundtrip() {
+        let msg = DcMessage::FileOffer {
+            transfer_id: "abcdef0123456789abcdef0123456789".to_string(),
+            filename: "data.bin".to_string(),
+            size: 1024,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: Some("e3b0c44298fc1c149afbf4c8996fb924".to_string()),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["fileHash"], "e3b0c44298fc1c149afbf4c8996fb924");
+    }
+
+    #[test]
+    fn file_accept_serde_roundtrip() {
+        let msg = DcMessage::FileAccept {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "file-accept");
+        assert_eq!(json["transferId"], "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
+    }
+
+    #[test]
+    fn file_chunk_serde_roundtrip() {
+        let msg = DcMessage::FileChunk {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+            chunk_index: 0,
+            total_chunks: 42,
+            payload: "dGVzdCBjaHVuayBkYXRh".to_string(),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "file-chunk");
+        assert_eq!(json["chunkIndex"], 0);
+        assert_eq!(json["totalChunks"], 42);
+        assert_eq!(json["payload"], "dGVzdCBjaHVuayBkYXRh");
+    }
+
+    #[test]
+    fn file_finish_serde_roundtrip() {
+        let msg = DcMessage::FileFinish {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+            file_hash: None,
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "file-finish");
+        assert!(json.get("fileHash").is_none());
+    }
+
+    #[test]
+    fn pause_serde_roundtrip() {
+        let msg = DcMessage::Pause {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "pause");
+        assert_eq!(json["transferId"], "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4");
+    }
+
+    #[test]
+    fn resume_serde_roundtrip() {
+        let msg = DcMessage::Resume {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "resume");
+    }
+
+    #[test]
+    fn cancel_serde_roundtrip() {
+        let msg = DcMessage::Cancel {
+            transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+            cancelled_by: "initiator".to_string(),
+        };
+        let bytes = encode_dc_message(&msg).unwrap();
+        let parsed = parse_dc_message(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "cancel");
+        assert_eq!(json["cancelledBy"], "initiator");
+    }
+
+    #[test]
+    fn file_offer_from_raw_json() {
+        let json = r#"{"type":"file-offer","transferId":"abc123","filename":"test.txt","size":100,"totalChunks":1,"chunkSize":16384}"#;
+        let msg = parse_dc_message(json.as_bytes()).unwrap();
+        match msg {
+            DcMessage::FileOffer {
+                transfer_id,
+                filename,
+                size,
+                total_chunks,
+                chunk_size,
+                file_hash,
+            } => {
+                assert_eq!(transfer_id, "abc123");
+                assert_eq!(filename, "test.txt");
+                assert_eq!(size, 100);
+                assert_eq!(total_chunks, 1);
+                assert_eq!(chunk_size, 16384);
+                assert!(file_hash.is_none());
+            }
+            other => panic!("expected FileOffer, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_types_includes_file_transfer() {
+        for t in &[
+            "file-offer",
+            "file-accept",
+            "file-chunk",
+            "file-finish",
+            "pause",
+            "resume",
+            "cancel",
+        ] {
+            assert!(KNOWN_TYPES.contains(t), "KNOWN_TYPES missing '{t}'");
+        }
+    }
+
+    #[test]
+    fn unknown_type_still_rejected_after_b2() {
+        let json = r#"{"type":"file-magic","data":{}}"#;
+        let result = parse_dc_message(json.as_bytes());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DcParseError::UnknownType(t) => assert_eq!(t, "file-magic"),
+            other => panic!("expected UnknownType, got: {other:?}"),
+        }
     }
 }

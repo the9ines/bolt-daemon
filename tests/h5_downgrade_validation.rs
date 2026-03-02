@@ -367,10 +367,11 @@ fn appendix_a_invalid_message_for_bad_inner_json() {
 
 #[test]
 fn appendix_a_unknown_message_type_for_unrecognized_type() {
-    let json = br#"{"type":"file-chunk","data":"abc"}"#;
+    // B2: "file-chunk" is now a known type. Use a genuinely unknown type.
+    let json = br#"{"type":"file-magic","data":"abc"}"#;
     let err = parse_dc_message(json).unwrap_err();
     match err {
-        DcParseError::UnknownType(t) => assert_eq!(t, "file-chunk"),
+        DcParseError::UnknownType(t) => assert_eq!(t, "file-magic"),
         other => panic!("expected UnknownType, got: {other:?}"),
     }
 }
@@ -378,7 +379,8 @@ fn appendix_a_unknown_message_type_for_unrecognized_type() {
 #[test]
 fn appendix_a_unknown_message_type_propagates_through_route() {
     let (sess_a, _) = make_envelope_session_pair();
-    let unknown_inner = br#"{"type":"file-chunk","data":"abc"}"#;
+    // B2: "file-chunk" is now a known type. Use a genuinely unknown type.
+    let unknown_inner = br#"{"type":"file-magic","data":"abc"}"#;
     let err = bolt_daemon::envelope::route_inner_message(unknown_inner, &sess_a).unwrap_err();
     assert_eq!(err.code(), "UNKNOWN_MESSAGE_TYPE");
 }

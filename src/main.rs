@@ -17,7 +17,9 @@
 
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
-pub(crate) use bolt_daemon::{dc_messages, envelope, identity_store, session, web_hello, HELLO_PAYLOAD};
+pub(crate) use bolt_daemon::{
+    dc_messages, envelope, identity_store, session, web_hello, HELLO_PAYLOAD,
+};
 
 mod ice_filter;
 pub(crate) mod ipc;
@@ -123,6 +125,13 @@ pub(crate) struct Args {
 
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
+    parse_args_from(&argv)
+}
+
+/// Core argument parser, extracted for testability.
+/// Accepts a slice of strings matching the shape of `std::env::args()`:
+/// `argv[0]` is the program name, `argv[1..]` are the flags.
+fn parse_args_from(argv: &[String]) -> Args {
     let mut role = None;
     let mut offer = None;
     let mut answer = None;
@@ -434,8 +443,12 @@ fn parse_args() -> Args {
     }
 
     // ── Fail-closed validation for web_hello_v1 ──────────────
-    let interop_hello_val = interop_hello.unwrap_or(web_hello::InteropHelloMode::DaemonHelloV1);
-    let interop_signal_val = interop_signal.unwrap_or(web_signal::InteropSignal::DaemonV1);
+    // B1: Default to web-compatible interop modes for convergence.
+    // Legacy daemon modes available via explicit --interop-{signal,hello,dc} flags.
+    // This is an intentional breaking change: bare invocation now requires
+    // --signal rendezvous (+ --room, --session, --to/--expect-peer).
+    let interop_hello_val = interop_hello.unwrap_or(web_hello::InteropHelloMode::WebHelloV1);
+    let interop_signal_val = interop_signal.unwrap_or(web_signal::InteropSignal::WebV1);
     if interop_hello_val == web_hello::InteropHelloMode::WebHelloV1 {
         if signal_mode != SignalMode::Rendezvous {
             eprintln!("FATAL: --interop-hello web_hello_v1 requires --signal rendezvous");
@@ -448,7 +461,7 @@ fn parse_args() -> Args {
     }
 
     // ── Fail-closed validation for web_dc_v1 ────────────────
-    let interop_dc_val = interop_dc.unwrap_or(InteropDcMode::DaemonDcV1);
+    let interop_dc_val = interop_dc.unwrap_or(InteropDcMode::WebDcV1);
     if interop_dc_val == InteropDcMode::WebDcV1
         && interop_hello_val != web_hello::InteropHelloMode::WebHelloV1
     {
@@ -1222,9 +1235,12 @@ fn main() {
                 (Role::Offerer, SignalMode::Rendezvous) => {
                     rendezvous::run_offerer_rendezvous(&args, &identity)
                 }
-                (Role::Answerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_answerer_rendezvous(&args, ipc_server.as_ref(), &trust_path, &identity)
-                }
+                (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(
+                    &args,
+                    ipc_server.as_ref(),
+                    &trust_path,
+                    &identity,
+                ),
             };
             match result {
                 Ok(()) => {
@@ -1374,5 +1390,101 @@ mod tests {
         let err: Box<dyn std::error::Error> = "timed out waiting for peer".into();
         let smoke_err = smoke::classify_error(err.as_ref());
         assert_eq!(smoke_err.exit_code(), smoke::EXIT_TIMEOUT);
+    }
+
+    // ── B1: interop default flip tests ──────────────────────────
+
+    /// Helper to build argv from a list of flag strings.
+    fn make_argv(flags: &[&str]) -> Vec<String> {
+        let mut argv = vec!["bolt-daemon".to_string()];
+        for f in flags {
+            argv.push(f.to_string());
+        }
+        argv
+    }
+
+    #[test]
+    fn b1_default_interop_is_web() {
+        // Full rendezvous invocation with no explicit interop flags.
+        // Defaults should be WebV1 / WebHelloV1 / WebDcV1.
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "rendezvous",
+            "--room",
+            "test-room",
+            "--session",
+            "test-session",
+            "--to",
+            "peer-abc",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.interop_signal, web_signal::InteropSignal::WebV1);
+        assert_eq!(args.interop_hello, web_hello::InteropHelloMode::WebHelloV1);
+        assert_eq!(args.interop_dc, InteropDcMode::WebDcV1);
+    }
+
+    #[test]
+    fn b1_explicit_daemon_overrides_web_defaults() {
+        // Explicit daemon flags override the new web defaults.
+        // signal=file + daemon interop → no validation conflict.
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.interop_signal, web_signal::InteropSignal::DaemonV1);
+        assert_eq!(
+            args.interop_hello,
+            web_hello::InteropHelloMode::DaemonHelloV1
+        );
+        assert_eq!(args.interop_dc, InteropDcMode::DaemonDcV1);
+    }
+
+    #[test]
+    fn b1_answerer_rendezvous_default_interop() {
+        let argv = make_argv(&[
+            "--role",
+            "answerer",
+            "--signal",
+            "rendezvous",
+            "--room",
+            "test-room",
+            "--session",
+            "test-session",
+            "--expect-peer",
+            "peer-xyz",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.interop_signal, web_signal::InteropSignal::WebV1);
+        assert_eq!(args.interop_hello, web_hello::InteropHelloMode::WebHelloV1);
+        assert_eq!(args.interop_dc, InteropDcMode::WebDcV1);
+    }
+
+    #[test]
+    fn b1_signal_mode_default_unchanged() {
+        // Signal mode default is still File (only interop defaults flipped).
+        // This invocation uses explicit daemon overrides to avoid validation failure.
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.signal_mode, SignalMode::File);
     }
 }

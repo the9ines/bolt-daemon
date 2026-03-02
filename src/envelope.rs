@@ -374,6 +374,51 @@ pub fn route_inner_message(
             eprintln!("[INTEROP-4] sent echo");
             Ok(Some(envelope_bytes))
         }
+        // B2: File transfer messages — recognized but no state machine.
+        // Log and return Ok(None) (no reply). A future phase will add
+        // the transfer state machine to actually process these.
+        DcMessage::FileOffer {
+            ref transfer_id,
+            ref filename,
+            ..
+        } => {
+            eprintln!("[B2] file-offer received: transfer_id={transfer_id} filename={filename} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::FileAccept { ref transfer_id } => {
+            eprintln!("[B2] file-accept received: transfer_id={transfer_id} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::FileChunk {
+            ref transfer_id,
+            chunk_index,
+            total_chunks,
+            ..
+        } => {
+            eprintln!("[B2] file-chunk received: transfer_id={transfer_id} chunk={chunk_index}/{total_chunks} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::FileFinish {
+            ref transfer_id, ..
+        } => {
+            eprintln!("[B2] file-finish received: transfer_id={transfer_id} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::Pause { ref transfer_id } => {
+            eprintln!("[B2] pause received: transfer_id={transfer_id} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::Resume { ref transfer_id } => {
+            eprintln!("[B2] resume received: transfer_id={transfer_id} (no transfer SM)");
+            Ok(None)
+        }
+        DcMessage::Cancel {
+            ref transfer_id,
+            ref cancelled_by,
+        } => {
+            eprintln!("[B2] cancel received: transfer_id={transfer_id} cancelled_by={cancelled_by} (no transfer SM)");
+            Ok(None)
+        }
     }
 }
 

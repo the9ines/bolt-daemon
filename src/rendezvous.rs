@@ -607,10 +607,31 @@ pub(crate) fn run_post_hello_loop(
                         transfer_id,
                         size,
                         total_chunks,
+                        file_hash,
                         ..
                     }) => {
+                        // B4: Capability-gated hash threading.
+                        let file_hash_negotiated = session.has_capability("bolt.file-hash");
+                        let effective_hash = match (file_hash_negotiated, &file_hash) {
+                            (true, None) => {
+                                // Negotiated but sender omitted hash → fail-closed
+                                let detail = "file_hash required when bolt.file-hash negotiated";
+                                let err_payload = crate::envelope::build_error_payload(
+                                    "INTEGRITY_FAILED",
+                                    detail,
+                                    Some(session),
+                                );
+                                let _ = send_fn(&err_payload);
+                                return Err(format!("[B4] {detail}").into());
+                            }
+                            (true, Some(h)) => Some(h.as_str()),
+                            (false, _) => None, // ignore any hash on wire
+                        };
+
                         // Validate + Idle → OfferReceived
-                        if let Err(te) = transfer.on_file_offer(&transfer_id, size, total_chunks) {
+                        if let Err(te) =
+                            transfer.on_file_offer(&transfer_id, size, total_chunks, effective_hash)
+                        {
                             let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
                             eprintln!("[B3] transfer error: {e}");
                             let err_payload = crate::envelope::build_error_payload(
@@ -688,19 +709,35 @@ pub(crate) fn run_post_hello_loop(
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileFinish { transfer_id, .. }) => {
-                        if let Err(te) = transfer.on_file_finish(&transfer_id) {
-                            let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
-                            eprintln!("[B3] finish error: {e}");
-                            let err_payload = crate::envelope::build_error_payload(
-                                e.code(),
-                                &e.to_string(),
-                                Some(session),
-                            );
-                            let _ = send_fn(&err_payload);
-                            return Err(format!("[B6] {e}").into());
+                        match transfer.on_file_finish(&transfer_id) {
+                            Ok(()) => {
+                                eprintln!("[B3] transfer completed");
+                                continue;
+                            }
+                            Err(crate::transfer::TransferError::IntegrityFailed(ref detail)) => {
+                                // B4: Hash mismatch → INTEGRITY_FAILED + disconnect
+                                eprintln!("[B4] integrity failed: {detail}");
+                                let err_payload = crate::envelope::build_error_payload(
+                                    "INTEGRITY_FAILED",
+                                    detail,
+                                    Some(session),
+                                );
+                                let _ = send_fn(&err_payload);
+                                return Err(format!("[B4] integrity failed: {detail}").into());
+                            }
+                            Err(te) => {
+                                let e =
+                                    crate::envelope::EnvelopeError::InvalidState(te.to_string());
+                                eprintln!("[B3] finish error: {e}");
+                                let err_payload = crate::envelope::build_error_payload(
+                                    e.code(),
+                                    &e.to_string(),
+                                    Some(session),
+                                );
+                                let _ = send_fn(&err_payload);
+                                return Err(format!("[B6] {e}").into());
+                            }
                         }
-                        eprintln!("[B3] transfer completed");
-                        continue;
                     }
                     _ => {
                         // Everything else: fall through to route_inner_message.
@@ -2036,6 +2073,17 @@ mod tests {
         (sess_a, sess_b)
     }
 
+    /// B4: Session pair with custom capabilities.
+    fn make_session_pair_with_caps(caps: Vec<String>) -> (SessionContext, SessionContext) {
+        let kp_a = generate_identity_keypair();
+        let kp_b = generate_identity_keypair();
+        let pk_a = kp_a.public_key;
+        let pk_b = kp_b.public_key;
+        let sess_a = SessionContext::new(kp_a, pk_b, caps.clone()).unwrap();
+        let sess_b = SessionContext::new(kp_b, pk_a, caps).unwrap();
+        (sess_a, sess_b)
+    }
+
     #[test]
     fn b6_loop_exits_on_deadline() {
         let (_, sess_b) = make_b6_session_pair();
@@ -2359,5 +2407,335 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
         assert!(result.is_ok(), "rx disconnect should be a clean exit");
+    }
+
+    // ── B4: file-hash loop integration tests ──────────────────
+
+    #[test]
+    fn b4_hash_negotiated_correct_succeeds() {
+        let caps = vec![
+            "bolt.profile-envelope-v1".to_string(),
+            "bolt.file-hash".to_string(),
+        ];
+        let (sess_a, sess_b) = make_session_pair_with_caps(caps);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let data = b"hello world";
+        let hash = bolt_core::hash::sha256_hex(data);
+
+        // FileOffer with correct hash
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-b4".to_string(),
+            filename: "test.bin".to_string(),
+            size: data.len() as u64,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: Some(hash),
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let offer_env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(offer_env).unwrap();
+
+        // FileChunk
+        let payload_b64 = bolt_core::encoding::to_base64(data);
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: "xfer-b4".to_string(),
+            chunk_index: 0,
+            total_chunks: 1,
+            payload: payload_b64,
+        };
+        let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
+        tx.send(chunk_env).unwrap();
+
+        // FileFinish
+        let finish = crate::dc_messages::DcMessage::FileFinish {
+            transfer_id: "xfer-b4".to_string(),
+            file_hash: None, // finish hash is ignored per spec
+        };
+        let finish_json = crate::dc_messages::encode_dc_message(&finish).unwrap();
+        let finish_env = crate::envelope::encode_envelope(&finish_json, &sess_a).unwrap();
+        tx.send(finish_env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "correct hash should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+
+        // Verify Accept was sent
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent Accept");
+        let inner = crate::envelope::decode_envelope(&captured[0], &sess_a).unwrap();
+        let msg = crate::dc_messages::parse_dc_message(&inner).unwrap();
+        assert!(
+            matches!(msg, crate::dc_messages::DcMessage::FileAccept { .. }),
+            "first reply should be FileAccept"
+        );
+    }
+
+    #[test]
+    fn b4_hash_negotiated_mismatch_disconnects() {
+        let caps = vec![
+            "bolt.profile-envelope-v1".to_string(),
+            "bolt.file-hash".to_string(),
+        ];
+        let (sess_a, sess_b) = make_session_pair_with_caps(caps);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let data = b"hello world";
+        let wrong_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        // FileOffer with wrong hash
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-bad".to_string(),
+            filename: "bad.bin".to_string(),
+            size: data.len() as u64,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: Some(wrong_hash),
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let offer_env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(offer_env).unwrap();
+
+        // FileChunk
+        let payload_b64 = bolt_core::encoding::to_base64(data);
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: "xfer-bad".to_string(),
+            chunk_index: 0,
+            total_chunks: 1,
+            payload: payload_b64,
+        };
+        let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
+        tx.send(chunk_env).unwrap();
+
+        // FileFinish
+        let finish = crate::dc_messages::DcMessage::FileFinish {
+            transfer_id: "xfer-bad".to_string(),
+            file_hash: None,
+        };
+        let finish_json = crate::dc_messages::encode_dc_message(&finish).unwrap();
+        let finish_env = crate::envelope::encode_envelope(&finish_json, &sess_a).unwrap();
+        tx.send(finish_env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_err(), "hash mismatch should disconnect");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("file hash mismatch"),
+            "error should contain 'file hash mismatch', got: {err_str}"
+        );
+
+        // Verify INTEGRITY_FAILED error was sent (after Accept)
+        let captured = sent.borrow();
+        assert!(
+            captured.len() >= 2,
+            "should have sent Accept + INTEGRITY_FAILED error"
+        );
+        // Last sent message should be the error
+        let err_inner =
+            crate::envelope::decode_envelope(captured.last().unwrap(), &sess_a).unwrap();
+        let err_parsed: serde_json::Value = serde_json::from_slice(&err_inner).unwrap();
+        assert_eq!(err_parsed["type"], "error");
+        assert_eq!(err_parsed["code"], "INTEGRITY_FAILED");
+    }
+
+    #[test]
+    fn b4_hash_negotiated_missing_disconnects() {
+        let caps = vec![
+            "bolt.profile-envelope-v1".to_string(),
+            "bolt.file-hash".to_string(),
+        ];
+        let (sess_a, sess_b) = make_session_pair_with_caps(caps);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // FileOffer with NO hash (but bolt.file-hash is negotiated → error)
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-nohash".to_string(),
+            filename: "nohash.bin".to_string(),
+            size: 100,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let offer_env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(offer_env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_err(),
+            "missing hash when negotiated should disconnect"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("file_hash required"),
+            "error should contain 'file_hash required', got: {err_str}"
+        );
+
+        // Verify INTEGRITY_FAILED error was sent
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent error payload");
+        let err_inner = crate::envelope::decode_envelope(&captured[0], &sess_a).unwrap();
+        let err_parsed: serde_json::Value = serde_json::from_slice(&err_inner).unwrap();
+        assert_eq!(err_parsed["type"], "error");
+        assert_eq!(err_parsed["code"], "INTEGRITY_FAILED");
+    }
+
+    #[test]
+    fn b4_hash_not_negotiated_ignored() {
+        // Session with ONLY envelope cap (no file-hash)
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let data = b"test data";
+        let wrong_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        // FileOffer with a hash on wire, but bolt.file-hash NOT negotiated
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-ign".to_string(),
+            filename: "ignored.bin".to_string(),
+            size: data.len() as u64,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: Some(wrong_hash), // should be ignored
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let offer_env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(offer_env).unwrap();
+
+        // FileChunk
+        let payload_b64 = bolt_core::encoding::to_base64(data);
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: "xfer-ign".to_string(),
+            chunk_index: 0,
+            total_chunks: 1,
+            payload: payload_b64,
+        };
+        let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
+        tx.send(chunk_env).unwrap();
+
+        // FileFinish
+        let finish = crate::dc_messages::DcMessage::FileFinish {
+            transfer_id: "xfer-ign".to_string(),
+            file_hash: None,
+        };
+        let finish_json = crate::dc_messages::encode_dc_message(&finish).unwrap();
+        let finish_env = crate::envelope::encode_envelope(&finish_json, &sess_a).unwrap();
+        tx.send(finish_env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "hash on wire should be ignored when not negotiated, got: {:?}",
+            result.unwrap_err()
+        );
+
+        // Verify Accept was sent
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent Accept");
+        assert_eq!(captured.len(), 1, "only Accept should be sent");
+    }
+
+    #[test]
+    fn b4_hash_not_negotiated_no_hash_succeeds() {
+        // Session with ONLY envelope cap (no file-hash), offer has no hash
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let data = b"payload";
+
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-plain".to_string(),
+            filename: "plain.bin".to_string(),
+            size: data.len() as u64,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let offer_env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(offer_env).unwrap();
+
+        let payload_b64 = bolt_core::encoding::to_base64(data);
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: "xfer-plain".to_string(),
+            chunk_index: 0,
+            total_chunks: 1,
+            payload: payload_b64,
+        };
+        let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
+        tx.send(chunk_env).unwrap();
+
+        let finish = crate::dc_messages::DcMessage::FileFinish {
+            transfer_id: "xfer-plain".to_string(),
+            file_hash: None,
+        };
+        let finish_json = crate::dc_messages::encode_dc_message(&finish).unwrap();
+        let finish_env = crate::envelope::encode_envelope(&finish_json, &sess_a).unwrap();
+        tx.send(finish_env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "no hash, no negotiation should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent Accept");
+        assert_eq!(captured.len(), 1, "only Accept should be sent");
     }
 }

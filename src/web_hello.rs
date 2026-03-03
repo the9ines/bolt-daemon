@@ -35,12 +35,9 @@ pub enum InteropHelloMode {
 
 /// Daemon-advertised capabilities in web HELLO.
 ///
-/// SA15: `bolt.file-hash` intentionally omitted. The daemon's DataChannel transfer
-/// path does not compute or verify SHA-256 file hashes during web-interop transfers.
-/// Advertising a capability without a working implementation would violate the
-/// "no false advertisement" invariant. File-hash support will be added when the
-/// daemon's transfer path implements it end-to-end.
-pub const DAEMON_CAPABILITIES: &[&str] = &["bolt.profile-envelope-v1"];
+/// SA15 superseded: `bolt.file-hash` now implemented (B4). Receiver-side
+/// SHA-256 verification after reassembly. Mismatch → INTEGRITY_FAILED + disconnect.
+pub const DAEMON_CAPABILITIES: &[&str] = &["bolt.profile-envelope-v1", "bolt.file-hash"];
 
 /// Return daemon capabilities as owned Strings.
 pub fn daemon_capabilities() -> Vec<String> {
@@ -570,15 +567,13 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("length"));
     }
 
-    // ── SA15: bolt.file-hash intentionally omitted ──────────
+    // ── B4: bolt.file-hash now advertised (SA15 superseded) ──
 
     #[test]
-    fn sa15_daemon_capabilities_no_file_hash() {
-        // bolt.file-hash is deliberately not advertised because the daemon's
-        // DataChannel transfer path does not implement file hash verification.
-        assert!(!DAEMON_CAPABILITIES.contains(&"bolt.file-hash"));
-        // bolt.profile-envelope-v1 IS advertised (implemented).
+    fn b4_daemon_capabilities_includes_file_hash() {
+        assert!(DAEMON_CAPABILITIES.contains(&"bolt.file-hash"));
         assert!(DAEMON_CAPABILITIES.contains(&"bolt.profile-envelope-v1"));
+        assert!(daemon_capabilities().contains(&"bolt.file-hash".to_string()));
     }
 
     // ── SA17: max capabilities length enforcement ───────────

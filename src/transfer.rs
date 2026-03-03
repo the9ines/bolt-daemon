@@ -1,8 +1,10 @@
-//! Transfer state machine for post-HELLO file transfer control (B3-P2).
+//! Transfer state machine for post-HELLO file transfer control (B3-P2, B4).
 //!
 //! Implements a deterministic transfer session tracker integrated into
 //! `run_post_hello_loop`. Phase B3-P2 scope: FileOffer auto-accept,
 //! chunk receive with in-memory reassembly, transfer completion.
+//! Phase B4 scope: receiver-side SHA-256 hash verification gated by
+//! bolt.file-hash capability negotiation.
 //! No disk I/O, no send-side streaming, no concurrent transfers.
 
 // ── Constants ────────────────────────────────────────────────
@@ -29,12 +31,15 @@ pub enum TransferState {
 #[derive(Debug)]
 pub enum TransferError {
     InvalidTransition(String),
+    /// B4: SHA-256 hash mismatch after reassembly (receiver-side).
+    IntegrityFailed(String),
 }
 
 impl std::fmt::Display for TransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransferError::InvalidTransition(detail) => write!(f, "{detail}"),
+            TransferError::IntegrityFailed(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -54,6 +59,7 @@ pub struct TransferSession {
     expected_len: u64,
     total_chunks: u32,
     next_chunk_index: u32,
+    expected_hash: Option<String>, // B4: from FileOffer, hex SHA-256
 }
 
 impl Default for TransferSession {
@@ -70,6 +76,7 @@ impl TransferSession {
             expected_len: 0,
             total_chunks: 0,
             next_chunk_index: 0,
+            expected_hash: None,
         }
     }
 
@@ -82,11 +89,16 @@ impl TransferSession {
     ///
     /// Validates offer fields and stores metadata on the struct.
     /// Errors if not Idle (locked detail strings per B3 spec).
+    ///
+    /// `expected_hash`: B4 — if `Some`, SHA-256 hex hash to verify at finish.
+    /// The loop passes `Some` only when `bolt.file-hash` is negotiated AND the
+    /// offer includes a hash. `None` means no verification.
     pub fn on_file_offer(
         &mut self,
         transfer_id: &str,
         size: u64,
         total_chunks: u32,
+        expected_hash: Option<&str>,
     ) -> Result<(), TransferError> {
         // Validate offer fields before state check (per spec: "any" state)
         if size == 0 {
@@ -109,6 +121,7 @@ impl TransferSession {
             TransferState::Idle => {
                 self.expected_len = size;
                 self.total_chunks = total_chunks;
+                self.expected_hash = expected_hash.map(|s| s.to_string());
                 self.state = TransferState::OfferReceived {
                     transfer_id: transfer_id.to_string(),
                 };
@@ -213,6 +226,8 @@ impl TransferSession {
     /// Transition: Receiving → Completed.
     ///
     /// Validates transfer_id matches active transfer.
+    /// B4: If `expected_hash` is `Some`, computes SHA-256 of the reassembled
+    /// buffer and verifies (case-insensitive). Mismatch → `IntegrityFailed`.
     pub fn on_file_finish(&mut self, transfer_id: &str) -> Result<(), TransferError> {
         let active_tid = match &self.state {
             TransferState::Receiving { transfer_id: tid } => tid.clone(),
@@ -227,6 +242,16 @@ impl TransferSession {
             return Err(TransferError::InvalidTransition(
                 "transfer_id mismatch".to_string(),
             ));
+        }
+
+        // B4: Verify SHA-256 hash if expected_hash was set by on_file_offer.
+        if let Some(ref expected) = self.expected_hash {
+            let computed = bolt_core::hash::sha256_hex(&self.buffer);
+            if !computed.eq_ignore_ascii_case(expected) {
+                return Err(TransferError::IntegrityFailed(
+                    "file hash mismatch".to_string(),
+                ));
+            }
         }
 
         self.state = TransferState::Completed {
@@ -258,7 +283,7 @@ mod tests {
         assert_eq!(*ts.state(), TransferState::Idle);
 
         // Idle → OfferReceived
-        ts.on_file_offer("t1", 100, 1).unwrap();
+        ts.on_file_offer("t1", 100, 1, None).unwrap();
         assert_eq!(
             *ts.state(),
             TransferState::OfferReceived {
@@ -275,9 +300,9 @@ mod tests {
     #[test]
     fn b3_double_offer_rejected() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 100, 1).unwrap();
+        ts.on_file_offer("t1", 100, 1, None).unwrap();
 
-        let err = ts.on_file_offer("t2", 200, 2).unwrap_err();
+        let err = ts.on_file_offer("t2", 200, 2, None).unwrap_err();
         assert!(
             err.to_string().contains("offer already active"),
             "expected 'offer already active', got: {err}"
@@ -299,7 +324,7 @@ mod tests {
     #[test]
     fn b3_offer_accept_lifecycle() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 100, 1).unwrap();
+        ts.on_file_offer("t1", 100, 1, None).unwrap();
         assert_eq!(
             *ts.state(),
             TransferState::OfferReceived {
@@ -320,7 +345,7 @@ mod tests {
     #[test]
     fn b3_full_receive_lifecycle() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 5, 1).unwrap();
+        ts.on_file_offer("t1", 5, 1, None).unwrap();
         ts.accept_current_offer().unwrap();
 
         let data = b"hello";
@@ -339,7 +364,7 @@ mod tests {
     #[test]
     fn b3_multi_chunk_reassembly() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 15, 3).unwrap();
+        ts.on_file_offer("t1", 15, 3, None).unwrap();
         ts.accept_current_offer().unwrap();
 
         ts.on_file_chunk("t1", 0, b"aaaaa").unwrap();
@@ -369,7 +394,7 @@ mod tests {
     #[test]
     fn b3_chunk_wrong_transfer_id_fails() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 100, 1).unwrap();
+        ts.on_file_offer("t1", 100, 1, None).unwrap();
         ts.accept_current_offer().unwrap();
 
         let err = ts.on_file_chunk("t2", 0, b"data").unwrap_err();
@@ -382,7 +407,7 @@ mod tests {
     #[test]
     fn b3_chunk_wrong_index_fails() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 100, 3).unwrap();
+        ts.on_file_offer("t1", 100, 3, None).unwrap();
         ts.accept_current_offer().unwrap();
 
         let err = ts.on_file_chunk("t1", 1, b"data").unwrap_err();
@@ -396,7 +421,7 @@ mod tests {
     fn b3_offer_size_exceeded_fails() {
         let mut ts = TransferSession::new();
         let err = ts
-            .on_file_offer("t1", MAX_TRANSFER_BYTES + 1, 1)
+            .on_file_offer("t1", MAX_TRANSFER_BYTES + 1, 1, None)
             .unwrap_err();
         assert!(
             err.to_string().contains("transfer size exceeded"),
@@ -407,7 +432,7 @@ mod tests {
     #[test]
     fn b3_finish_wrong_id_fails() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 100, 1).unwrap();
+        ts.on_file_offer("t1", 100, 1, None).unwrap();
         ts.accept_current_offer().unwrap();
 
         let err = ts.on_file_finish("wrong_id").unwrap_err();
@@ -420,7 +445,7 @@ mod tests {
     #[test]
     fn b3_second_offer_after_complete_fails() {
         let mut ts = TransferSession::new();
-        ts.on_file_offer("t1", 5, 1).unwrap();
+        ts.on_file_offer("t1", 5, 1, None).unwrap();
         ts.accept_current_offer().unwrap();
         ts.on_file_chunk("t1", 0, b"hello").unwrap();
         ts.on_file_finish("t1").unwrap();
@@ -431,10 +456,89 @@ mod tests {
             }
         );
 
-        let err = ts.on_file_offer("t2", 200, 2).unwrap_err();
+        let err = ts.on_file_offer("t2", 200, 2, None).unwrap_err();
         assert!(
             err.to_string().contains("transfer session ended"),
             "expected 'transfer session ended', got: {err}"
+        );
+    }
+
+    // ── B4: file hash verification tests ──
+
+    #[test]
+    fn b4_hash_verify_correct() {
+        let data = b"hello";
+        let hash = bolt_core::hash::sha256_hex(data);
+
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, Some(&hash))
+            .unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+        ts.on_file_finish("t1").unwrap();
+
+        assert_eq!(
+            *ts.state(),
+            TransferState::Completed {
+                transfer_id: "t1".to_string()
+            }
+        );
+        assert_eq!(ts.completed_bytes(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn b4_hash_verify_mismatch() {
+        let data = b"hello";
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, Some(wrong_hash))
+            .unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+
+        let err = ts.on_file_finish("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("file hash mismatch"),
+            "expected 'file hash mismatch', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b4_no_hash_skips_verify() {
+        let data = b"hello";
+
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, None).unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+        ts.on_file_finish("t1").unwrap();
+
+        assert_eq!(
+            *ts.state(),
+            TransferState::Completed {
+                transfer_id: "t1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn b4_hash_case_insensitive() {
+        let data = b"hello";
+        let hash_upper = bolt_core::hash::sha256_hex(data).to_uppercase();
+
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, Some(&hash_upper))
+            .unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+        ts.on_file_finish("t1").unwrap();
+
+        assert_eq!(
+            *ts.state(),
+            TransferState::Completed {
+                transfer_id: "t1".to_string()
+            }
         );
     }
 }

@@ -540,6 +540,90 @@ pub(crate) struct SmokeDcContext<'a> {
     pub expect_peer: Option<&'a str>,
 }
 
+// ── Post-HELLO event loop (B6-P1) ───────────────────────────
+
+/// Deterministic, symmetric post-HELLO message loop.
+///
+/// Shared by offerer and answerer (WebDcV1). The loop:
+///   recv → decode → route → optional respond
+///
+/// Exits cleanly on deadline expiry or rx disconnect.
+/// Returns Err on protocol error or send failure (caller disconnects).
+///
+/// Caller MUST send initial Ping before entering this loop.
+/// Periodic Ping every 2s is handled inside.
+pub(crate) fn run_post_hello_loop(
+    dc_msg_rx: &mpsc::Receiver<Vec<u8>>,
+    mut send_fn: impl FnMut(&[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    deadline: Instant,
+    session: &crate::session::SessionContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const PING_INTERVAL: Duration = Duration::from_secs(2);
+    let mut last_ping = Instant::now();
+
+    loop {
+        if Instant::now() >= deadline {
+            eprintln!("[B6] post-HELLO loop deadline — clean exit");
+            return Ok(());
+        }
+
+        let poll_timeout = std::cmp::min(
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO),
+            Duration::from_millis(200),
+        );
+
+        let raw = match dc_msg_rx.recv_timeout(poll_timeout) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_ping.elapsed() >= PING_INTERVAL {
+                    let ping = crate::dc_messages::DcMessage::Ping {
+                        ts_ms: crate::dc_messages::now_ms(),
+                    };
+                    let json = crate::dc_messages::encode_dc_message(&ping)
+                        .map_err(|e| format!("[B6] encode ping: {e}"))?;
+                    let env = crate::envelope::encode_envelope(&json, session)?;
+                    send_fn(&env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    eprintln!("[B6] sent periodic ping");
+                    last_ping = Instant::now();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("[B6] rx disconnected — clean exit");
+                return Ok(());
+            }
+        };
+
+        match crate::envelope::decode_envelope(&raw, session) {
+            Ok(inner) => match crate::envelope::route_inner_message(&inner, session) {
+                Ok(Some(reply)) => {
+                    send_fn(&reply).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[B6] route error: {e}");
+                    let err_payload = crate::envelope::build_error_payload(
+                        e.code(),
+                        &e.to_string(),
+                        Some(session),
+                    );
+                    let _ = send_fn(&err_payload);
+                    return Err(format!("[B6] {e}").into());
+                }
+            },
+            Err(e) => {
+                eprintln!("[B6] envelope error: {e}");
+                let err_payload =
+                    crate::envelope::build_error_payload(e.code(), &e.to_string(), Some(session));
+                let _ = send_fn(&err_payload);
+                return Err(format!("[B6] {e}").into());
+            }
+        }
+    }
+}
+
 // ── Entry points ────────────────────────────────────────────
 
 /// Offerer flow via rendezvous signaling.
@@ -829,94 +913,25 @@ pub fn run_offerer_rendezvous(
             if !session.envelope_v1_negotiated() {
                 return Err("[INTEROP-3_NO_ENVELOPE_CAP] bolt.profile-envelope-v1 not negotiated — aborting".into());
             }
-            eprintln!("[INTEROP-3] entering post-HELLO DC envelope loop (offerer)");
+            eprintln!("[B6] entering post-HELLO DC envelope loop (offerer)");
 
-            // Send initial ping + app_message for E2E validation
+            // Send initial ping (caller responsibility, before loop)
             let ping = crate::dc_messages::DcMessage::Ping {
                 ts_ms: crate::dc_messages::now_ms(),
             };
             let ping_json = crate::dc_messages::encode_dc_message(&ping)
-                .map_err(|e| format!("[INTEROP-4] encode ping: {e}"))?;
+                .map_err(|e| format!("[B6] encode ping: {e}"))?;
             let ping_env = crate::envelope::encode_envelope(&ping_json, &session)?;
             dc.send(&ping_env)?;
-            eprintln!("[INTEROP-4] sent initial ping");
+            eprintln!("[B6] sent initial ping (offerer)");
 
-            let app = crate::dc_messages::DcMessage::AppMessage {
-                text: "hello from offerer".to_string(),
-            };
-            let app_json = crate::dc_messages::encode_dc_message(&app)
-                .map_err(|e| format!("[INTEROP-4] encode app_message: {e}"))?;
-            let app_env = crate::envelope::encode_envelope(&app_json, &session)?;
-            dc.send(&app_env)?;
-            eprintln!("[INTEROP-4] sent app_message");
-
-            // Periodic ping interval
-            const PING_INTERVAL: Duration = Duration::from_secs(2);
-            let mut last_ping = Instant::now();
-
-            loop {
-                // Use short poll interval so we can send periodic pings
-                let poll_timeout = std::cmp::min(
-                    deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or(Duration::ZERO),
-                    Duration::from_millis(200),
-                );
-                if deadline <= Instant::now() {
-                    eprintln!("[INTEROP-4] DC loop timeout — clean exit");
-                    break;
-                }
-
-                let raw = match dc_msg_rx.recv_timeout(poll_timeout) {
-                    Ok(r) => r,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // Send periodic ping if interval elapsed
-                        if last_ping.elapsed() >= PING_INTERVAL {
-                            let ping = crate::dc_messages::DcMessage::Ping {
-                                ts_ms: crate::dc_messages::now_ms(),
-                            };
-                            if let Ok(json) = crate::dc_messages::encode_dc_message(&ping) {
-                                if let Ok(env) = crate::envelope::encode_envelope(&json, &session) {
-                                    let _ = dc.send(&env);
-                                    eprintln!("[INTEROP-4] sent periodic ping");
-                                }
-                            }
-                            last_ping = Instant::now();
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(format!("[INTEROP-4] DC recv error: {e}").into()),
+            // Enter shared post-HELLO loop
+            let mut send_fn =
+                |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    dc.send(bytes)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-
-                match crate::envelope::decode_envelope(&raw, &session) {
-                    Ok(inner) => match crate::envelope::route_inner_message(&inner, &session) {
-                        Ok(Some(reply)) => {
-                            let _ = dc.send(&reply);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            eprintln!("[INTEROP-4] route error: {e}");
-                            let err_payload = crate::envelope::build_error_payload(
-                                e.code(),
-                                &e.to_string(),
-                                Some(&session),
-                            );
-                            let _ = dc.send(&err_payload);
-                            return Err(format!("[INTEROP-4] {e}").into());
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        let err_payload = crate::envelope::build_error_payload(
-                            e.code(),
-                            &e.to_string(),
-                            Some(&session),
-                        );
-                        let _ = dc.send(&err_payload);
-                        return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());
-                    }
-                }
-            }
+            run_post_hello_loop(&dc_msg_rx, &mut send_fn, deadline, &session)?;
         }
     } else {
         // Legacy daemon HELLO
@@ -1269,50 +1284,25 @@ pub fn run_answerer_rendezvous(
             if !session.envelope_v1_negotiated() {
                 return Err("[INTEROP-3_NO_ENVELOPE_CAP] bolt.profile-envelope-v1 not negotiated — aborting".into());
             }
-            eprintln!("[INTEROP-3] entering post-HELLO DC envelope loop (answerer)");
+            eprintln!("[B6] entering post-HELLO DC envelope loop (answerer)");
 
-            loop {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or("phase timeout expired in DC envelope loop")?;
-                let raw = match ch.dc_msg_rx.recv_timeout(remaining) {
-                    Ok(r) => r,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        eprintln!("[INTEROP-4] DC loop timeout — clean exit");
-                        break;
-                    }
-                    Err(e) => return Err(format!("[INTEROP-4] DC recv error: {e}").into()),
+            // Send initial ping (caller responsibility, before loop)
+            let ping = crate::dc_messages::DcMessage::Ping {
+                ts_ms: crate::dc_messages::now_ms(),
+            };
+            let ping_json = crate::dc_messages::encode_dc_message(&ping)
+                .map_err(|e| format!("[B6] encode ping: {e}"))?;
+            let ping_env = crate::envelope::encode_envelope(&ping_json, &session)?;
+            dc.send(&ping_env)?;
+            eprintln!("[B6] sent initial ping (answerer)");
+
+            // Enter shared post-HELLO loop
+            let mut send_fn =
+                |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    dc.send(bytes)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-
-                match crate::envelope::decode_envelope(&raw, &session) {
-                    Ok(inner) => match crate::envelope::route_inner_message(&inner, &session) {
-                        Ok(Some(reply)) => {
-                            let _ = dc.send(&reply);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            eprintln!("[INTEROP-4] route error: {e}");
-                            let err_payload = crate::envelope::build_error_payload(
-                                e.code(),
-                                &e.to_string(),
-                                Some(&session),
-                            );
-                            let _ = dc.send(&err_payload);
-                            return Err(format!("[INTEROP-4] {e}").into());
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("[INTEROP-3_ENVELOPE_ERR] {e}");
-                        let err_payload = crate::envelope::build_error_payload(
-                            e.code(),
-                            &e.to_string(),
-                            Some(&session),
-                        );
-                        let _ = dc.send(&err_payload);
-                        return Err(format!("[INTEROP-3_ENVELOPE_ERR] {e}").into());
-                    }
-                }
-            }
+            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, deadline, &session)?;
         } else {
             thread::sleep(Duration::from_millis(500));
         }
@@ -1913,5 +1903,160 @@ mod tests {
         assert!(!is_retryable_peer_not_found("internal server error", "bob"));
         assert!(!is_retryable_peer_not_found("peer not found", "bob")); // missing quotes
         assert!(!is_retryable_peer_not_found("", "bob"));
+    }
+
+    // ── B6-P1: post-HELLO loop tests ────────────────────────────
+
+    use crate::session::SessionContext;
+    use bolt_core::identity::generate_identity_keypair;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn make_b6_session_pair() -> (SessionContext, SessionContext) {
+        let kp_a = generate_identity_keypair();
+        let kp_b = generate_identity_keypair();
+        let pk_a = kp_a.public_key;
+        let pk_b = kp_b.public_key;
+        let caps = vec!["bolt.profile-envelope-v1".to_string()];
+        let sess_a = SessionContext::new(kp_a, pk_b, caps.clone()).unwrap();
+        let sess_b = SessionContext::new(kp_b, pk_a, caps).unwrap();
+        (sess_a, sess_b)
+    }
+
+    #[test]
+    fn b6_loop_exits_on_deadline() {
+        let (_, sess_b) = make_b6_session_pair();
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_ok(), "loop should exit cleanly on deadline");
+    }
+
+    #[test]
+    fn b6_ping_produces_pong() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Encode a ping from A
+        let ping = crate::dc_messages::DcMessage::Ping { ts_ms: 42 };
+        let ping_json = crate::dc_messages::encode_dc_message(&ping).unwrap();
+        let ping_env = crate::envelope::encode_envelope(&ping_json, &sess_a).unwrap();
+        tx.send(ping_env).unwrap();
+        drop(tx); // close channel so loop exits after processing
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_ok());
+
+        // Verify pong was sent
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent at least one reply");
+        // Decode the first sent message as pong
+        let inner = crate::envelope::decode_envelope(&captured[0], &sess_a).unwrap();
+        let msg = crate::dc_messages::parse_dc_message(&inner).unwrap();
+        match msg {
+            crate::dc_messages::DcMessage::Pong { reply_to_ms, .. } => {
+                assert_eq!(reply_to_ms, 42);
+            }
+            other => panic!("expected Pong, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b6_unknown_message_disconnects() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Send an unknown type wrapped in envelope
+        let unknown_json = br#"{"type":"file-magic","data":"test"}"#;
+        let env = crate::envelope::encode_envelope(unknown_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_err(),
+            "unknown message type should cause disconnect"
+        );
+    }
+
+    #[test]
+    fn b6_malformed_frame_disconnects() {
+        let (_, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Send garbage bytes (not valid envelope)
+        tx.send(b"not-valid-json".to_vec()).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_err(), "malformed frame should cause disconnect");
+    }
+
+    #[test]
+    fn b6_transfer_message_invalid_state_disconnect() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Send a file-offer (transfer message — INVALID_STATE per B6-P1 policy)
+        let offer = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "test-xfer-id".to_string(),
+            filename: "test.txt".to_string(),
+            size: 100,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
+        let env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_err(), "transfer message should cause disconnect");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("transfer SM not active"),
+            "error should contain locked detail string, got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn b6_rx_disconnect_clean_exit() {
+        let (_, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        drop(tx); // immediately disconnect
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_ok(), "rx disconnect should be a clean exit");
     }
 }

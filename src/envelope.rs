@@ -374,15 +374,15 @@ pub fn route_inner_message(
             eprintln!("[INTEROP-4] sent echo");
             Ok(Some(envelope_bytes))
         }
-        // B3-P1: FileOffer is handled at loop level (TransferSession) after envelope decrypt.
+        // B3-P2: FileOffer, FileChunk, FileFinish are handled at loop level
+        // (TransferSession) after envelope decrypt.
         // Ok(None) here prevents disconnect; loop-level handler MUST intercept.
-        // If any caller reaches this without loop-level handling, FileOffer would be dropped.
-        DcMessage::FileOffer { .. } => Ok(None),
-        // B6-P1: Remaining transfer messages are INVALID_STATE — no transfer SM active.
+        DcMessage::FileOffer { .. }
+        | DcMessage::FileChunk { .. }
+        | DcMessage::FileFinish { .. } => Ok(None),
+        // Remaining transfer messages are INVALID_STATE — not implemented.
         // Fail-closed: caller disconnects on any Err from route_inner_message.
         DcMessage::FileAccept { .. }
-        | DcMessage::FileChunk { .. }
-        | DcMessage::FileFinish { .. }
         | DcMessage::Pause { .. }
         | DcMessage::Resume { .. }
         | DcMessage::Cancel { .. } => Err(EnvelopeError::InvalidState(
@@ -831,10 +831,22 @@ mod tests {
     }
 
     #[test]
-    fn b3_file_chunk_still_invalid_state() {
+    fn b3_file_chunk_routes_to_ok_none() {
         let (sess_a, _) = make_session_pair();
         let chunk_json = r#"{"type":"file-chunk","transferId":"t1","chunkIndex":0,"totalChunks":1,"payload":"dGVzdA=="}"#;
         let result = route_inner_message(chunk_json.as_bytes(), &sess_a);
+        assert!(result.is_ok(), "FileChunk should return Ok");
+        assert!(
+            result.unwrap().is_none(),
+            "FileChunk should return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn b3_file_accept_still_invalid_state() {
+        let (sess_a, _) = make_session_pair();
+        let accept_json = r#"{"type":"file-accept","transferId":"t1"}"#;
+        let result = route_inner_message(accept_json.as_bytes(), &sess_a);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), "INVALID_STATE");

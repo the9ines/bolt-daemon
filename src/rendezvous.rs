@@ -777,6 +777,38 @@ pub fn run_offerer_rendezvous(
         let remote_hello =
             crate::web_hello::parse_hello_message(&response, &remote_pk, local_session)?;
 
+        // ── B5 Stage B (offerer): decode identity + enforce TOFU pin ──
+        let remote_identity_bytes =
+            bolt_core::encoding::from_base64(&remote_hello.identity_public_key).map_err(|e| {
+                format!("[B5_IDENTITY_DECODE_FAIL] offerer: base64 decode failed: {e}")
+            })?;
+        if remote_identity_bytes.len() != 32 {
+            return Err(format!(
+                "[B5_IDENTITY_DECODE_FAIL] offerer: identity key length {} != 32",
+                remote_identity_bytes.len()
+            )
+            .into());
+        }
+        let mut identity_bytes_arr = [0u8; 32];
+        identity_bytes_arr.copy_from_slice(&remote_identity_bytes);
+        let identity_key_hex = crate::ipc::trust::identity_key_to_hex(&identity_bytes_arr);
+        eprintln!(
+            "[B5_STAGE_B] offerer: remote identity_key_hex={}",
+            identity_key_hex
+        );
+
+        // Offerer has no Stage A — pass None. Use default trust path.
+        let offerer_trust_path = crate::ipc::trust::default_trust_path();
+        let stage_b =
+            crate::ipc::trust::enforce_stage_b(&offerer_trust_path, &identity_key_hex, None);
+        if stage_b == crate::ipc::trust::StageBResult::Deny {
+            return Err(format!(
+                "[B5_STAGE_B] offerer: identity '{}' denied by TOFU pin — aborting",
+                identity_key_hex
+            )
+            .into());
+        }
+
         // Negotiate capabilities
         let local_caps = crate::web_hello::daemon_capabilities();
         let negotiated =
@@ -1008,21 +1040,46 @@ pub fn run_answerer_rendezvous(
         }
     }
 
-    // ── Pairing approval gate ──────────────────────────────────
+    // ── Stage A: Pairing approval gate (decision capture, no persistence) ──
     let remote_peer = hello.from_peer.as_deref().unwrap_or(expect_peer);
-    if !crate::ipc::trust::check_pairing_approval(
+    let stage_a_decision = crate::ipc::trust::check_pairing_approval(
         ipc_server,
         trust_path,
         remote_peer,
         args.pairing_policy,
-    ) {
-        return Err(format!(
-            "pairing denied for peer '{}' — aborting handshake",
-            remote_peer
-        )
-        .into());
+    );
+
+    // Handle Stage A outcomes
+    use crate::ipc::types::Decision;
+    match stage_a_decision {
+        None => {
+            return Err(format!(
+                "pairing denied for peer '{}' — no decision (fail-closed)",
+                remote_peer
+            )
+            .into());
+        }
+        Some(Decision::DenyOnce) => {
+            return Err(format!(
+                "pairing denied (DenyOnce) for peer '{}' — aborting at Stage A",
+                remote_peer
+            )
+            .into());
+        }
+        Some(Decision::DenyAlways) => {
+            // Continue to DC open/HELLO parse (Stage B will persist then abort)
+            eprintln!(
+                "[B5_STAGE_A] DenyAlways for peer '{}' — continuing to Stage B for identity persistence",
+                remote_peer
+            );
+        }
+        Some(d @ Decision::AllowOnce) | Some(d @ Decision::AllowAlways) => {
+            eprintln!(
+                "[B5_STAGE_A] {:?} for peer '{}' — proceeding",
+                d, remote_peer
+            );
+        }
     }
-    eprintln!("[rendezvous] pairing approved for peer '{}'", remote_peer);
 
     // Send ack to expected peer
     let ack_payload = SignalPayload {
@@ -1170,6 +1227,36 @@ pub fn run_answerer_rendezvous(
             "[INTEROP-2] HELLO exchange complete — remote_identity={}, negotiated_caps={:?}",
             remote_hello.identity_public_key, negotiated
         );
+
+        // ── B5 Stage B (answerer): decode identity + enforce TOFU pin ──
+        let ans_remote_identity_bytes =
+            bolt_core::encoding::from_base64(&remote_hello.identity_public_key).map_err(|e| {
+                format!("[B5_IDENTITY_DECODE_FAIL] answerer: base64 decode failed: {e}")
+            })?;
+        if ans_remote_identity_bytes.len() != 32 {
+            return Err(format!(
+                "[B5_IDENTITY_DECODE_FAIL] answerer: identity key length {} != 32",
+                ans_remote_identity_bytes.len()
+            )
+            .into());
+        }
+        let mut ans_identity_arr = [0u8; 32];
+        ans_identity_arr.copy_from_slice(&ans_remote_identity_bytes);
+        let ans_identity_hex = crate::ipc::trust::identity_key_to_hex(&ans_identity_arr);
+        eprintln!(
+            "[B5_STAGE_B] answerer: remote identity_key_hex={}",
+            ans_identity_hex
+        );
+
+        let ans_stage_b =
+            crate::ipc::trust::enforce_stage_b(trust_path, &ans_identity_hex, stage_a_decision);
+        if ans_stage_b == crate::ipc::trust::StageBResult::Deny {
+            return Err(format!(
+                "[B5_STAGE_B] answerer: identity '{}' denied — aborting post-HELLO",
+                ans_identity_hex
+            )
+            .into());
+        }
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
         // N4: Move ownership via .take() instead of cloning secret key material.

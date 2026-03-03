@@ -1,9 +1,14 @@
 //! Trust store and pairing approval logic.
 //!
-//! Persistence of `allow_always` / `deny_always` decisions is DISABLED until
-//! stable identity keys are available. The trust store infrastructure exists
-//! and is tested, but `check_pairing_approval` treats _always as _once and
-//! does not write to disk.
+//! Two-stage TOFU pinning model (B5):
+//!
+//! - **Stage A** (answerer only): Signaling-level user decision gate. Captures
+//!   the full `Decision` variant but does NOT persist (identity not yet known).
+//! - **Stage B** (offerer + answerer): Identity-based enforcement and persistence
+//!   occurs immediately after DC HELLO is parsed, keyed by `identity_key_hex`.
+//!
+//! Only `AllowAlways` and `DenyAlways` are persisted. `AllowOnce` / `DenyOnce`
+//! are session-scoped and never written to the trust store.
 
 use std::collections::HashMap;
 use std::io;
@@ -21,6 +26,9 @@ use super::types::{Decision, IpcMessage, PairingRequestPayload};
 /// Decision timeout when waiting for UI response.
 const DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Required file mode for the trust store file.
+const TRUST_FILE_MODE: u32 = 0o600;
+
 // ── Pairing Policy ──────────────────────────────────────────
 
 /// Controls pairing behavior when no UI client is connected.
@@ -34,6 +42,39 @@ pub enum PairingPolicy {
     Allow,
 }
 
+// ── Constant-Time Compare ───────────────────────────────────
+
+/// Constant-time byte comparison. Returns `true` if `a == b`.
+///
+/// No early exit — iterates all bytes regardless of mismatch position.
+/// No unsafe code. No external dependencies.
+///
+/// Used by tests; available for production key comparison paths.
+#[allow(dead_code)]
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+// ── Identity Key Hex ────────────────────────────────────────
+
+/// Compute canonical `identity_key_hex` from raw 32-byte identity public key.
+///
+/// Returns lowercase hex string (64 characters).
+pub fn identity_key_to_hex(raw: &[u8; 32]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in raw {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 // ── Trust Store ─────────────────────────────────────────────
 
 /// Default path for the trust store.
@@ -42,10 +83,11 @@ pub fn default_trust_path() -> PathBuf {
     PathBuf::from(home).join(".config/bolt-daemon/trust.json")
 }
 
-/// Persistent trust decisions keyed by peer identity.
+/// Persistent trust decisions keyed by `identity_key_hex`.
 ///
-/// Currently keyed by signaling `peer_id` which is session-ephemeral.
-/// Will be re-keyed to stable identity public keys when available.
+/// Keys are lowercase hex-encoded 32-byte identity public keys (64 chars).
+/// Legacy `peer_id` entries (non-hex) remain in the file but are ignored
+/// by lookup — no migration or cleanup in B5.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TrustStore {
     pub version: u32,
@@ -85,13 +127,13 @@ impl TrustStore {
         }
     }
 
-    /// Save to file atomically (write .tmp → fsync → rename).
+    /// Save to file atomically (write .tmp → fsync → rename → chmod 0600).
     /// Creates parent directories if needed.
     ///
-    /// Currently used by tests only; will be called from `check_pairing_approval`
-    /// once stable identity keys enable meaningful persistence.
-    #[allow(dead_code)]
+    /// Fail-closed: if permission setting fails, the error is propagated.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -103,6 +145,9 @@ impl TrustStore {
         // Write to temp file
         std::fs::write(&tmp_path, &contents)?;
 
+        // Set 0600 on temp file before rename
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(TRUST_FILE_MODE))?;
+
         // fsync best-effort
         if let Ok(f) = std::fs::File::open(&tmp_path) {
             let _ = f.sync_all();
@@ -110,6 +155,19 @@ impl TrustStore {
 
         // Atomic rename
         std::fs::rename(&tmp_path, path)?;
+
+        // Verify final mode
+        let meta = std::fs::metadata(path)?;
+        let actual = meta.permissions().mode() & 0o777;
+        if actual != TRUST_FILE_MODE {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "trust file mode {:04o} != expected {:04o}",
+                    actual, TRUST_FILE_MODE
+                ),
+            ));
+        }
 
         Ok(())
     }
@@ -122,79 +180,168 @@ impl TrustStore {
     /// Store a decision for a peer. Only persists `AllowAlways` / `DenyAlways`.
     /// `AllowOnce` / `DenyOnce` are ignored (not stored).
     ///
-    /// Currently used by tests only; will be called from `check_pairing_approval`
-    /// once stable identity keys enable meaningful persistence.
-    #[allow(dead_code)]
-    pub fn set(&mut self, peer_id: &str, decision: Decision) {
+    /// Does not overwrite existing entries — returns `false` if the key already
+    /// exists, `true` if inserted.
+    pub fn set(&mut self, peer_id: &str, decision: Decision) -> bool {
         match decision {
             Decision::AllowAlways | Decision::DenyAlways => {
+                if self.peers.contains_key(peer_id) {
+                    return false;
+                }
                 self.peers.insert(peer_id.to_string(), decision);
+                true
             }
             Decision::AllowOnce | Decision::DenyOnce => {
                 // _once decisions are not persisted
+                false
             }
         }
     }
 }
 
-// ── Pairing Approval ────────────────────────────────────────
+// ── Stage B: Identity-Based Enforcement ─────────────────────
+
+/// Result of Stage B identity enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageBResult {
+    /// Proceed with session.
+    Allow,
+    /// Abort session immediately.
+    Deny,
+}
+
+/// Perform Stage B identity-based TOFU enforcement.
+///
+/// Called immediately after DC HELLO parse for BOTH offerer and answerer.
+///
+/// - If a persistent pin exists for `identity_key_hex`, enforce it.
+/// - If no pin exists:
+///   - Answerer uses `stage_a_decision` to determine persistence.
+///   - Offerer passes `None` (no Stage A) — proceeds without persistence.
+///
+/// Fail-closed on any internal error (load/save failure).
+pub fn enforce_stage_b(
+    trust_path: &Path,
+    identity_key_hex: &str,
+    stage_a_decision: Option<Decision>,
+) -> StageBResult {
+    // Load trust store
+    let mut store = TrustStore::load(trust_path);
+
+    // Check for existing pin
+    if let Some(pinned) = store.get(identity_key_hex) {
+        match pinned {
+            Decision::AllowAlways => {
+                eprintln!(
+                    "[B5_STAGE_B] existing pin AllowAlways for identity '{identity_key_hex}'"
+                );
+                return StageBResult::Allow;
+            }
+            Decision::DenyAlways => {
+                eprintln!("[B5_STAGE_B] existing pin DenyAlways for identity '{identity_key_hex}'");
+                return StageBResult::Deny;
+            }
+            _ => {
+                // _once variants should not be in store, but treat as no-pin
+            }
+        }
+    }
+
+    // No existing pin — apply Stage A decision if present (answerer path)
+    match stage_a_decision {
+        Some(Decision::AllowAlways) => {
+            if store.set(identity_key_hex, Decision::AllowAlways) {
+                if let Err(e) = store.save(trust_path) {
+                    eprintln!(
+                        "[B5_STAGE_B] FAIL-CLOSED: cannot save AllowAlways for '{identity_key_hex}': {e}"
+                    );
+                    return StageBResult::Deny;
+                }
+                eprintln!("[B5_STAGE_B] persisted AllowAlways for identity '{identity_key_hex}'");
+            }
+            StageBResult::Allow
+        }
+        Some(Decision::DenyAlways) => {
+            if store.set(identity_key_hex, Decision::DenyAlways) {
+                if let Err(e) = store.save(trust_path) {
+                    eprintln!(
+                        "[B5_STAGE_B] FAIL-CLOSED: cannot save DenyAlways for '{identity_key_hex}': {e}"
+                    );
+                    // Already denying, so this is consistent
+                }
+                eprintln!("[B5_STAGE_B] persisted DenyAlways for identity '{identity_key_hex}'");
+            }
+            StageBResult::Deny
+        }
+        Some(Decision::AllowOnce) => {
+            eprintln!("[B5_STAGE_B] AllowOnce for identity '{identity_key_hex}' — no persistence");
+            StageBResult::Allow
+        }
+        Some(Decision::DenyOnce) => {
+            // DenyOnce should never reach Stage B (aborted at Stage A).
+            // Defensive: deny anyway.
+            eprintln!("[B5_STAGE_B] DenyOnce reached Stage B for '{identity_key_hex}' — denying");
+            StageBResult::Deny
+        }
+        None => {
+            // Offerer path: no Stage A decision. Proceed without persistence.
+            eprintln!(
+                "[B5_STAGE_B] offerer — no Stage A decision for '{identity_key_hex}', proceeding"
+            );
+            StageBResult::Allow
+        }
+    }
+}
+
+// ── Pairing Approval (Stage A) ─────────────────────────────
 
 /// Check whether a pairing request from `from_peer` should be approved.
 ///
-/// Decision flow:
-/// 1. Check trust store for stored decision (AllowAlways / DenyAlways)
-/// 2. Apply pairing policy (deny/allow bypass UI)
-/// 3. If policy is `Ask`: emit pairing.request over IPC, block for decision
-/// 4. If UI returns _always variant: log that persistence is disabled
+/// This is Stage A (answerer only). Returns `Option<Decision>`:
+/// - `None` = no decision obtained (timeout / IPC failure / policy abort). Treat as hard deny.
+/// - `Some(AllowOnce)` = proceed, no persistence
+/// - `Some(AllowAlways)` = proceed, thread to Stage B for persistence
+/// - `Some(DenyOnce)` = abort immediately at Stage A (no Stage B)
+/// - `Some(DenyAlways)` = proceed to Stage B ONLY to learn identity, persist denial, then abort
 ///
-/// Returns `true` if pairing is allowed, `false` if denied.
+/// Stage A does NOT persist anything. Stage A does NOT consult the trust store
+/// for identity-keyed entries (identity not yet known at signaling time).
 pub fn check_pairing_approval(
     ipc_server: Option<&IpcServer>,
     trust_path: &Path,
     from_peer: &str,
     policy: PairingPolicy,
-) -> bool {
-    // 1. Check trust store
-    let store = TrustStore::load(trust_path);
-    if let Some(decision) = store.get(from_peer) {
-        match decision {
-            Decision::AllowAlways => {
-                eprintln!("[PAIRING_TRUST_HIT] allow_always for peer '{from_peer}'");
-                return true;
-            }
-            Decision::DenyAlways => {
-                eprintln!("[PAIRING_TRUST_HIT] deny_always for peer '{from_peer}'");
-                return false;
-            }
-            _ => {} // _once variants shouldn't be in store, but handle gracefully
-        }
-    }
+) -> Option<Decision> {
+    // Note: We no longer check trust store here at Stage A.
+    // The trust store is keyed by identity_key_hex which is unknown at this point.
+    // Stage B performs identity-based trust checks after DC HELLO parse.
+    let _ = trust_path; // Acknowledge parameter (used by Stage B, not Stage A)
 
-    // 2. Apply pairing policy for non-UI paths
+    // Apply pairing policy for non-UI paths
     match policy {
         PairingPolicy::Deny => {
             eprintln!("[PAIRING_DENIED] policy=deny — no UI consultation");
-            return false;
+            return None;
         }
         PairingPolicy::Allow => {
             eprintln!("[PAIRING_ALLOWED] policy=allow — auto-approved (headless)");
-            return true;
+            return Some(Decision::AllowOnce);
         }
         PairingPolicy::Ask => {
             // Fall through to IPC
         }
     }
 
-    // 3. Policy is Ask — need IPC
+    // Policy is Ask — need IPC
     let server = match ipc_server {
         Some(s) if s.is_ui_connected() => s,
         Some(_) => {
             eprintln!("[PAIRING_DENIED] no UI connected — fail-closed deny");
-            return false;
+            return None;
         }
         None => {
             eprintln!("[PAIRING_DENIED] IPC server unavailable — fail-closed deny");
-            return false;
+            return None;
         }
     };
 
@@ -214,35 +361,23 @@ pub fn check_pairing_approval(
         Ok(v) => v,
         Err(e) => {
             eprintln!("[PAIRING_DENIED] serialize pairing.request failed: {e} — fail-closed deny");
-            return false;
+            return None;
         }
     };
     server.emit_event(IpcMessage::new_event("pairing.request", payload_value));
 
-    // 4. Block for decision
+    // Block for decision
     match server.await_decision(&request_id, DECISION_TIMEOUT) {
         Some(dp) => {
-            let allowed = matches!(dp.decision, Decision::AllowOnce | Decision::AllowAlways);
-
-            // Log _always decisions but do NOT persist (keys are ephemeral)
-            if matches!(dp.decision, Decision::AllowAlways | Decision::DenyAlways) {
-                eprintln!(
-                    "[PAIRING_DECISION] {:?} for peer '{from_peer}' — persistence disabled \
-                     (peer_id is session-ephemeral, stable identity keys required)",
-                    dp.decision
-                );
-            } else {
-                eprintln!(
-                    "[PAIRING_DECISION] {:?} for peer '{from_peer}'",
-                    dp.decision
-                );
-            }
-
-            allowed
+            eprintln!(
+                "[PAIRING_DECISION] {:?} for peer '{from_peer}'",
+                dp.decision
+            );
+            Some(dp.decision)
         }
         None => {
             eprintln!("[PAIRING_DENIED] timeout — fail-closed deny for peer '{from_peer}'");
-            false
+            None
         }
     }
 }
@@ -252,6 +387,7 @@ pub fn check_pairing_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -268,6 +404,17 @@ mod tests {
             .join(format!("bolt-trust-test-{pid}-{ts}-{n}"))
             .join("trust.json")
     }
+
+    /// Build a deterministic 32-byte identity key for testing.
+    fn test_identity_bytes(seed: u8) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        key
+    }
+
+    // ── Existing trust store tests ──────────────────────────
 
     #[test]
     fn trust_store_new_is_empty() {
@@ -391,53 +538,28 @@ mod tests {
     }
 
     #[test]
-    fn check_approval_no_ipc_no_trust_returns_false() {
+    fn check_approval_no_ipc_no_trust_returns_none() {
         let path = temp_trust_path();
         let result = check_pairing_approval(None, &path, "unknown-peer", PairingPolicy::Ask);
-        assert!(!result, "should deny when no IPC server and no trust entry");
+        assert!(result.is_none(), "should return None when no IPC server");
     }
 
     #[test]
-    fn check_approval_policy_deny_returns_false() {
+    fn check_approval_policy_deny_returns_none() {
         let path = temp_trust_path();
         let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Deny);
-        assert!(!result, "policy=deny should always deny");
+        assert!(result.is_none(), "policy=deny should return None");
     }
 
     #[test]
-    fn check_approval_policy_allow_returns_true() {
+    fn check_approval_policy_allow_returns_allow_once() {
         let path = temp_trust_path();
         let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Allow);
-        assert!(result, "policy=allow should always allow");
-    }
-
-    #[test]
-    fn check_approval_stored_allow_always_returns_true() {
-        let path = temp_trust_path();
-        let mut store = TrustStore::new();
-        store.set("trusted-peer", Decision::AllowAlways);
-        store.save(&path).unwrap();
-
-        // Even with no IPC, trust store hit should return true
-        let result = check_pairing_approval(None, &path, "trusted-peer", PairingPolicy::Ask);
-        assert!(result, "stored allow_always should return true");
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn check_approval_stored_deny_always_returns_false() {
-        let path = temp_trust_path();
-        let mut store = TrustStore::new();
-        store.set("blocked-peer", Decision::DenyAlways);
-        store.save(&path).unwrap();
-
-        let result = check_pairing_approval(None, &path, "blocked-peer", PairingPolicy::Ask);
-        assert!(!result, "stored deny_always should return false");
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(
+            result,
+            Some(Decision::AllowOnce),
+            "policy=allow should return AllowOnce"
+        );
     }
 
     #[test]
@@ -448,5 +570,213 @@ mod tests {
             path_str.contains(".config/bolt-daemon/trust.json"),
             "unexpected path: {path_str}"
         );
+    }
+
+    // ── B5: identity_key_hex ────────────────────────────────
+
+    #[test]
+    fn identity_key_to_hex_format() {
+        let key = test_identity_bytes(0xAA);
+        let hex = identity_key_to_hex(&key);
+        assert_eq!(hex.len(), 64);
+        // All lowercase hex
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // First byte 0xAA
+        assert!(hex.starts_with("aa"));
+    }
+
+    // ── B5: constant-time compare ───────────────────────────
+
+    #[test]
+    fn constant_time_eq_equal() {
+        let a = test_identity_bytes(0x01);
+        let b = test_identity_bytes(0x01);
+        assert!(constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn constant_time_eq_unequal() {
+        let a = test_identity_bytes(0x01);
+        let b = test_identity_bytes(0x02);
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+    }
+
+    #[test]
+    fn constant_time_eq_empty() {
+        assert!(constant_time_eq(&[], &[]));
+    }
+
+    // ── B5: set does not overwrite ──────────────────────────
+
+    #[test]
+    fn set_does_not_overwrite_existing() {
+        let mut store = TrustStore::new();
+        assert!(store.set("key-a", Decision::AllowAlways));
+        // Second set should return false and not overwrite
+        assert!(!store.set("key-a", Decision::DenyAlways));
+        assert_eq!(store.get("key-a"), Some(Decision::AllowAlways));
+    }
+
+    // ── B5: Stage B enforcement ─────────────────────────────
+
+    #[test]
+    fn stage_b_allow_always_persists() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x10);
+        let hex = identity_key_to_hex(&key);
+
+        let result = enforce_stage_b(&path, &hex, Some(Decision::AllowAlways));
+        assert_eq!(result, StageBResult::Allow);
+
+        // Verify persisted
+        let store = TrustStore::load(&path);
+        assert_eq!(store.get(&hex), Some(Decision::AllowAlways));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stage_b_deny_always_persists_then_denies() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x20);
+        let hex = identity_key_to_hex(&key);
+
+        let result = enforce_stage_b(&path, &hex, Some(Decision::DenyAlways));
+        assert_eq!(result, StageBResult::Deny);
+
+        // Verify persisted
+        let store = TrustStore::load(&path);
+        assert_eq!(store.get(&hex), Some(Decision::DenyAlways));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stage_b_deny_once_aborts_no_persistence() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x30);
+        let hex = identity_key_to_hex(&key);
+
+        let result = enforce_stage_b(&path, &hex, Some(Decision::DenyOnce));
+        assert_eq!(result, StageBResult::Deny);
+
+        // Verify NOT persisted
+        let store = TrustStore::load(&path);
+        assert_eq!(store.get(&hex), None);
+    }
+
+    #[test]
+    fn stage_b_allow_once_no_persistence() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x40);
+        let hex = identity_key_to_hex(&key);
+
+        let result = enforce_stage_b(&path, &hex, Some(Decision::AllowOnce));
+        assert_eq!(result, StageBResult::Allow);
+
+        // Verify NOT persisted
+        let store = TrustStore::load(&path);
+        assert_eq!(store.get(&hex), None);
+    }
+
+    #[test]
+    fn stage_b_offerer_no_decision_allows() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x50);
+        let hex = identity_key_to_hex(&key);
+
+        let result = enforce_stage_b(&path, &hex, None);
+        assert_eq!(result, StageBResult::Allow);
+
+        // Verify NOT persisted
+        let store = TrustStore::load(&path);
+        assert_eq!(store.get(&hex), None);
+    }
+
+    #[test]
+    fn stage_b_existing_deny_always_pin_enforced() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x60);
+        let hex = identity_key_to_hex(&key);
+
+        // Pre-populate pin
+        let mut store = TrustStore::new();
+        store.set(&hex, Decision::DenyAlways);
+        store.save(&path).unwrap();
+
+        // Offerer path: no Stage A decision, but existing pin denies
+        let result = enforce_stage_b(&path, &hex, None);
+        assert_eq!(result, StageBResult::Deny);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stage_b_existing_allow_always_pin_enforced() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x70);
+        let hex = identity_key_to_hex(&key);
+
+        // Pre-populate pin
+        let mut store = TrustStore::new();
+        store.set(&hex, Decision::AllowAlways);
+        store.save(&path).unwrap();
+
+        // Even with a DenyAlways Stage A, existing pin takes precedence
+        let result = enforce_stage_b(&path, &hex, Some(Decision::DenyAlways));
+        assert_eq!(result, StageBResult::Allow);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ── B5: 0600 permissions ────────────────────────────────
+
+    #[test]
+    fn save_enforces_0600_permissions() {
+        let path = temp_trust_path();
+        let mut store = TrustStore::new();
+        store.set("perm-test", Decision::AllowAlways);
+        store.save(&path).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, TRUST_FILE_MODE,
+            "trust file mode {:04o} != expected {:04o}",
+            mode, TRUST_FILE_MODE
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ── B5: Stage B does not overwrite existing pin ─────────
+
+    #[test]
+    fn stage_b_does_not_overwrite_existing_pin() {
+        let path = temp_trust_path();
+        let key = test_identity_bytes(0x80);
+        let hex = identity_key_to_hex(&key);
+
+        // Pre-populate AllowAlways
+        let mut store = TrustStore::new();
+        store.set(&hex, Decision::AllowAlways);
+        store.save(&path).unwrap();
+
+        // Stage B with DenyAlways should NOT overwrite — existing pin wins
+        let result = enforce_stage_b(&path, &hex, Some(Decision::DenyAlways));
+        assert_eq!(result, StageBResult::Allow);
+
+        // Verify pin unchanged
+        let loaded = TrustStore::load(&path);
+        assert_eq!(loaded.get(&hex), Some(Decision::AllowAlways));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

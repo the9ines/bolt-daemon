@@ -560,6 +560,7 @@ pub(crate) fn run_post_hello_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const PING_INTERVAL: Duration = Duration::from_secs(2);
     let mut last_ping = Instant::now();
+    let mut transfer = crate::transfer::TransferSession::new();
 
     loop {
         if Instant::now() >= deadline {
@@ -597,22 +598,72 @@ pub(crate) fn run_post_hello_loop(
         };
 
         match crate::envelope::decode_envelope(&raw, session) {
-            Ok(inner) => match crate::envelope::route_inner_message(&inner, session) {
-                Ok(Some(reply)) => {
-                    send_fn(&reply).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Ok(inner) => {
+                // B3-P1: Probe for FileOffer before route_inner_message.
+                // Only FileOffer is intercepted; all other results fall through.
+                if let Ok(crate::dc_messages::DcMessage::FileOffer { transfer_id, .. }) =
+                    crate::dc_messages::parse_dc_message(&inner)
+                {
+                    // Transition: Idle → OfferReceived
+                    if let Err(te) = transfer.on_file_offer(&transfer_id) {
+                        let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
+                        eprintln!("[B3] transfer error: {e}");
+                        let err_payload = crate::envelope::build_error_payload(
+                            e.code(),
+                            &e.to_string(),
+                            Some(session),
+                        );
+                        let _ = send_fn(&err_payload);
+                        return Err(format!("[B6] {e}").into());
+                    }
+
+                    // Transition: OfferReceived → Rejected, get transfer_id back
+                    let tid = match transfer.reject_current_offer() {
+                        Ok(t) => t,
+                        Err(te) => {
+                            let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
+                            eprintln!("[B3] reject error: {e}");
+                            let err_payload = crate::envelope::build_error_payload(
+                                e.code(),
+                                &e.to_string(),
+                                Some(session),
+                            );
+                            let _ = send_fn(&err_payload);
+                            return Err(format!("[B6] {e}").into());
+                        }
+                    };
+
+                    // Send Cancel with cancelled_by = "receiver"
+                    let cancel = crate::dc_messages::DcMessage::Cancel {
+                        transfer_id: tid,
+                        cancelled_by: "receiver".to_string(),
+                    };
+                    let cancel_json = crate::dc_messages::encode_dc_message(&cancel)
+                        .map_err(|e| format!("[B3] encode cancel: {e}"))?;
+                    let cancel_env = crate::envelope::encode_envelope(&cancel_json, session)?;
+                    send_fn(&cancel_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    eprintln!("[B3] FileOffer rejected via Cancel");
+                    continue;
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("[B6] route error: {e}");
-                    let err_payload = crate::envelope::build_error_payload(
-                        e.code(),
-                        &e.to_string(),
-                        Some(session),
-                    );
-                    let _ = send_fn(&err_payload);
-                    return Err(format!("[B6] {e}").into());
+
+                // Non-FileOffer: fall through to existing route_inner_message
+                match crate::envelope::route_inner_message(&inner, session) {
+                    Ok(Some(reply)) => {
+                        send_fn(&reply).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[B6] route error: {e}");
+                        let err_payload = crate::envelope::build_error_payload(
+                            e.code(),
+                            &e.to_string(),
+                            Some(session),
+                        );
+                        let _ = send_fn(&err_payload);
+                        return Err(format!("[B6] {e}").into());
+                    }
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("[B6] envelope error: {e}");
                 let err_payload =
@@ -2010,12 +2061,14 @@ mod tests {
         assert!(result.is_err(), "malformed frame should cause disconnect");
     }
 
+    // ── B3-P1: FileOffer → Cancel tests ──────────────────────
+
     #[test]
-    fn b6_transfer_message_invalid_state_disconnect() {
+    fn b3_file_offer_produces_cancel() {
         let (sess_a, sess_b) = make_b6_session_pair();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
-        // Send a file-offer (transfer message — INVALID_STATE per B6-P1 policy)
+        // Send a file-offer envelope
         let offer = crate::dc_messages::DcMessage::FileOffer {
             transfer_id: "test-xfer-id".to_string(),
             filename: "test.txt".to_string(),
@@ -2027,6 +2080,66 @@ mod tests {
         let offer_json = crate::dc_messages::encode_dc_message(&offer).unwrap();
         let env = crate::envelope::encode_envelope(&offer_json, &sess_a).unwrap();
         tx.send(env).unwrap();
+        drop(tx); // close channel so loop exits after processing
+
+        let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sent_c = Rc::clone(&sent);
+        let send_fn = move |bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            sent_c.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(result.is_ok(), "FileOffer should not cause disconnect");
+
+        // Verify Cancel was sent
+        let captured = sent.borrow();
+        assert!(!captured.is_empty(), "should have sent Cancel reply");
+        let inner = crate::envelope::decode_envelope(&captured[0], &sess_a).unwrap();
+        let msg = crate::dc_messages::parse_dc_message(&inner).unwrap();
+        match msg {
+            crate::dc_messages::DcMessage::Cancel {
+                transfer_id,
+                cancelled_by,
+            } => {
+                assert_eq!(transfer_id, "test-xfer-id");
+                assert_eq!(cancelled_by, "receiver");
+            }
+            other => panic!("expected Cancel, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b3_second_file_offer_disconnects() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // First FileOffer
+        let offer1 = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-1".to_string(),
+            filename: "a.txt".to_string(),
+            size: 50,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let offer1_json = crate::dc_messages::encode_dc_message(&offer1).unwrap();
+        let env1 = crate::envelope::encode_envelope(&offer1_json, &sess_a).unwrap();
+        tx.send(env1).unwrap();
+
+        // Second FileOffer (should trigger disconnect — state is Rejected)
+        let offer2 = crate::dc_messages::DcMessage::FileOffer {
+            transfer_id: "xfer-2".to_string(),
+            filename: "b.txt".to_string(),
+            size: 75,
+            total_chunks: 1,
+            chunk_size: 16384,
+            file_hash: None,
+        };
+        let offer2_json = crate::dc_messages::encode_dc_message(&offer2).unwrap();
+        let env2 = crate::envelope::encode_envelope(&offer2_json, &sess_a).unwrap();
+        tx.send(env2).unwrap();
         drop(tx);
 
         let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2038,11 +2151,24 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
-        assert!(result.is_err(), "transfer message should cause disconnect");
+        assert!(result.is_err(), "second FileOffer should cause disconnect");
         let err_str = result.unwrap_err().to_string();
         assert!(
-            err_str.contains("transfer SM not active"),
-            "error should contain locked detail string, got: {err_str}"
+            err_str.contains("transfer session ended"),
+            "error should contain 'transfer session ended', got: {err_str}"
+        );
+
+        // First offer should have produced a Cancel
+        let captured = sent.borrow();
+        assert!(
+            !captured.is_empty(),
+            "first FileOffer should have sent Cancel"
+        );
+        let inner = crate::envelope::decode_envelope(&captured[0], &sess_a).unwrap();
+        let msg = crate::dc_messages::parse_dc_message(&inner).unwrap();
+        assert!(
+            matches!(msg, crate::dc_messages::DcMessage::Cancel { .. }),
+            "first reply should be Cancel"
         );
     }
 

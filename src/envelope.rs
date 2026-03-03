@@ -374,10 +374,13 @@ pub fn route_inner_message(
             eprintln!("[INTEROP-4] sent echo");
             Ok(Some(envelope_bytes))
         }
-        // B6-P1: Transfer messages are INVALID_STATE — no transfer SM active.
+        // B3-P1: FileOffer is handled at loop level (TransferSession) after envelope decrypt.
+        // Ok(None) here prevents disconnect; loop-level handler MUST intercept.
+        // If any caller reaches this without loop-level handling, FileOffer would be dropped.
+        DcMessage::FileOffer { .. } => Ok(None),
+        // B6-P1: Remaining transfer messages are INVALID_STATE — no transfer SM active.
         // Fail-closed: caller disconnects on any Err from route_inner_message.
-        DcMessage::FileOffer { .. }
-        | DcMessage::FileAccept { .. }
+        DcMessage::FileAccept { .. }
         | DcMessage::FileChunk { .. }
         | DcMessage::FileFinish { .. }
         | DcMessage::Pause { .. }
@@ -811,5 +814,33 @@ mod tests {
             let result = route_inner_message(json.as_bytes(), &sess_a);
             assert!(result.is_ok(), "ENFORCEMENT code {code} should be accepted");
         }
+    }
+
+    // ── B3-P1: FileOffer carve-out + remaining transfer INVALID_STATE ──
+
+    #[test]
+    fn b3_file_offer_routes_to_ok_none() {
+        let (sess_a, _) = make_session_pair();
+        let offer_json = r#"{"type":"file-offer","transferId":"t1","filename":"f.txt","size":100,"totalChunks":1,"chunkSize":16384}"#;
+        let result = route_inner_message(offer_json.as_bytes(), &sess_a);
+        assert!(result.is_ok(), "FileOffer should return Ok");
+        assert!(
+            result.unwrap().is_none(),
+            "FileOffer should return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn b3_file_chunk_still_invalid_state() {
+        let (sess_a, _) = make_session_pair();
+        let chunk_json = r#"{"type":"file-chunk","transferId":"t1","chunkIndex":0,"totalChunks":1,"payload":"dGVzdA=="}"#;
+        let result = route_inner_message(chunk_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "INVALID_STATE");
+        assert!(
+            err.to_string().contains("transfer SM not active"),
+            "detail string must be locked, got: {err}"
+        );
     }
 }

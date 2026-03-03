@@ -13,6 +13,8 @@ pub mod identity_store;
 #[doc(hidden)]
 pub mod session;
 #[doc(hidden)]
+pub mod transfer;
+#[doc(hidden)]
 pub mod web_hello;
 
 /// Deterministic payload exchanged during the legacy hello protocol.
@@ -43,6 +45,9 @@ pub mod test_support {
 
     // Inner messages
     pub use crate::dc_messages::{encode_dc_message, parse_dc_message, DcMessage, DcParseError};
+
+    // Transfer SM
+    pub use crate::transfer::{TransferError, TransferSession, TransferState};
 
     // Identity store
     pub use crate::identity_store::{

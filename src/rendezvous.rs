@@ -549,7 +549,10 @@ pub(crate) struct SmokeDcContext<'a> {
 ///
 /// INVARIANT: `--signal rendezvous` is required. No fallback to file mode.
 /// If the server is down or peer is unreachable, exit 1.
-pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::IdentityKeyPair) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_offerer_rendezvous(
+    args: &Args,
+    identity: &bolt_core::identity::IdentityKeyPair,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed: these are validated in parse_args() but double-check here
     let room = args
         .room
@@ -761,7 +764,8 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
         eprintln!("[INTEROP-2] remote session pk: {}", remote_pk_b64_str);
 
         // Send encrypted HELLO (identity.pk in inner field, session_kp for sealing)
-        let hello_msg = crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
+        let hello_msg =
+            crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
         dc.send(hello_msg.as_bytes())?;
         eprintln!("[INTEROP-2] sent encrypted HELLO");
 
@@ -770,7 +774,8 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
             .checked_duration_since(Instant::now())
             .ok_or("phase timeout expired waiting for web HELLO")?;
         let response = dc_msg_rx.recv_timeout(remaining)?;
-        let remote_hello = crate::web_hello::parse_hello_message(&response, &remote_pk, local_session)?;
+        let remote_hello =
+            crate::web_hello::parse_hello_message(&response, &remote_pk, local_session)?;
 
         // Negotiate capabilities
         let local_caps = crate::web_hello::daemon_capabilities();
@@ -783,10 +788,10 @@ pub fn run_offerer_rendezvous(args: &Args, identity: &bolt_core::identity::Ident
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
         // N4: Move ownership via .take() instead of cloning secret key material.
-        let owned_kp = session_kp.take()
+        let owned_kp = session_kp
+            .take()
             .ok_or("[INTEROP-3_SESSION_MOVE] session keypair already consumed (offerer)")?;
-        let session =
-            crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
+        let session = crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {
@@ -1129,29 +1134,31 @@ pub fn run_answerer_rendezvous(
         let mut hello_state = crate::web_hello::HelloState::new();
 
         // N6: Typed error on HELLO parse/decrypt failure (sent before disconnect)
-        let remote_hello = match crate::web_hello::parse_hello_typed(&msg, &remote_pk, local_session) {
-            Ok(inner) => inner,
-            Err(e) => {
-                eprintln!(
-                    "[INTEROP-2_HELLO_FAIL] typed error → peer: {} {e}",
-                    e.code()
-                );
+        let remote_hello =
+            match crate::web_hello::parse_hello_typed(&msg, &remote_pk, local_session) {
+                Ok(inner) => inner,
+                Err(e) => {
+                    eprintln!(
+                        "[INTEROP-2_HELLO_FAIL] typed error → peer: {} {e}",
+                        e.code()
+                    );
 
-                let err_payload =
-                    crate::envelope::build_error_payload(e.code(), &e.to_string(), None);
+                    let err_payload =
+                        crate::envelope::build_error_payload(e.code(), &e.to_string(), None);
 
-                let _ = dc.send(&err_payload);
+                    let _ = dc.send(&err_payload);
 
-                return Err(format!("[INTEROP-2_HELLO_FAIL] {e}").into());
-            }
-        };
+                    return Err(format!("[INTEROP-2_HELLO_FAIL] {e}").into());
+                }
+            };
 
         hello_state
             .mark_completed()
             .map_err(Box::<dyn std::error::Error>::from)?;
 
         // Send encrypted HELLO reply (identity.pk in inner field, session_kp for sealing)
-        let hello_msg = crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
+        let hello_msg =
+            crate::web_hello::build_hello_message(&identity.public_key, local_session, &remote_pk)?;
         dc.send(hello_msg.as_bytes())?;
         eprintln!("[INTEROP-2] sent encrypted HELLO reply");
 
@@ -1166,10 +1173,10 @@ pub fn run_answerer_rendezvous(
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
         // N4: Move ownership via .take() instead of cloning secret key material.
-        let owned_kp = session_kp.take()
+        let owned_kp = session_kp
+            .take()
             .ok_or("[INTEROP-3_SESSION_MOVE] session keypair already consumed (answerer)")?;
-        let session =
-            crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
+        let session = crate::session::SessionContext::new(owned_kp, remote_pk, negotiated.clone())?;
 
         if args.interop_dc == crate::InteropDcMode::WebDcV1 {
             if !session.envelope_v1_negotiated() {

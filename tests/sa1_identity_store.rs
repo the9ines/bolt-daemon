@@ -10,8 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use bolt_daemon::test_support::{
-    ensure_parent_dir_secure, load_or_create_identity, validate_file_mode_0600,
-    IdentityStoreError,
+    ensure_parent_dir_secure, load_or_create_identity, validate_file_mode_0600, IdentityStoreError,
 };
 
 // ── Helpers ─────────────────────────────────────────────────

@@ -113,9 +113,9 @@ pub fn resolve_identity_path() -> Result<PathBuf, IdentityStoreError> {
         }
     }
     match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => {
-            Ok(PathBuf::from(home).join(DEFAULT_DIR_NAME).join(DEFAULT_FILE_NAME))
-        }
+        Ok(home) if !home.is_empty() => Ok(PathBuf::from(home)
+            .join(DEFAULT_DIR_NAME)
+            .join(DEFAULT_FILE_NAME)),
         _ => Err(IdentityStoreError::NoHomePath),
     }
 }
@@ -126,10 +126,12 @@ pub fn resolve_identity_path() -> Result<PathBuf, IdentityStoreError> {
 pub fn ensure_parent_dir_secure(path: &Path) -> Result<(), IdentityStoreError> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
-        _ => return Err(IdentityStoreError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "identity key path has no parent directory",
-        ))),
+        _ => {
+            return Err(IdentityStoreError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "identity key path has no parent directory",
+            )))
+        }
     };
 
     if parent.exists() {
@@ -209,7 +211,10 @@ fn load_identity(path: &Path) -> Result<IdentityKeyPair, IdentityStoreError> {
 
     eprintln!("[IDENTITY] loaded persistent identity from {:?}", path);
 
-    Ok(IdentityKeyPair { public_key, secret_key })
+    Ok(IdentityKeyPair {
+        public_key,
+        secret_key,
+    })
 }
 
 /// Generate a new identity keypair and write it atomically.
@@ -229,11 +234,7 @@ fn create_identity(path: &Path) -> Result<IdentityKeyPair, IdentityStoreError> {
         ))
     })?;
 
-    let tmp_name = format!(
-        "{}.tmp.{}",
-        DEFAULT_FILE_NAME,
-        std::process::id()
-    );
+    let tmp_name = format!("{}.tmp.{}", DEFAULT_FILE_NAME, std::process::id());
     let tmp_path = parent.join(&tmp_name);
 
     fs::write(&tmp_path, buf)?;

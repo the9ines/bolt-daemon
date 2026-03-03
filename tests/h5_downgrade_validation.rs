@@ -423,7 +423,8 @@ fn appendix_a_hello_decrypt_fail_for_wrong_key() {
     let session_a = bolt_core::crypto::generate_ephemeral_keypair();
     let session_b = bolt_core::crypto::generate_ephemeral_keypair();
     let session_c = bolt_core::crypto::generate_ephemeral_keypair();
-    let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+    let msg =
+        build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
     let err = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_c).unwrap_err();
     assert_eq!(err.code(), "HELLO_DECRYPT_FAIL");
 }

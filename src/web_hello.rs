@@ -275,9 +275,7 @@ pub fn parse_hello_typed(
     // N8: reject individual capability strings exceeding 64 bytes
     for cap in &inner.capabilities {
         if cap.len() > 64 {
-            return Err(HelloError::SchemaError(
-                "capability too long".into(),
-            ));
+            return Err(HelloError::SchemaError("capability too long".into()));
         }
     }
 
@@ -400,7 +398,12 @@ mod tests {
         let session_kp = bolt_core::crypto::generate_ephemeral_keypair();
         let remote_session = bolt_core::crypto::generate_ephemeral_keypair();
 
-        let msg = build_hello_message(&identity.public_key, &session_kp, &remote_session.public_key).unwrap();
+        let msg = build_hello_message(
+            &identity.public_key,
+            &session_kp,
+            &remote_session.public_key,
+        )
+        .unwrap();
         let outer: WebHelloOuter = serde_json::from_str(&msg).unwrap();
         assert_eq!(outer.msg_type, "hello");
         assert!(!outer.payload.is_empty());
@@ -413,7 +416,8 @@ mod tests {
         let session_b = bolt_core::crypto::generate_ephemeral_keypair();
 
         // A builds HELLO for B (identity_a.pk in inner, sealed with session_a.sk)
-        let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+        let msg =
+            build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
 
         // B parses HELLO from A (opens with session_b.sk, sender is session_a.pk)
         let inner = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_b).unwrap();
@@ -433,14 +437,24 @@ mod tests {
         let session_b = bolt_core::crypto::generate_ephemeral_keypair();
 
         // A → B
-        let msg_a = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
-        let inner_a = parse_hello_message(msg_a.as_bytes(), &session_a.public_key, &session_b).unwrap();
-        assert_eq!(inner_a.identity_public_key, to_base64(&identity_a.public_key));
+        let msg_a =
+            build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+        let inner_a =
+            parse_hello_message(msg_a.as_bytes(), &session_a.public_key, &session_b).unwrap();
+        assert_eq!(
+            inner_a.identity_public_key,
+            to_base64(&identity_a.public_key)
+        );
 
         // B → A
-        let msg_b = build_hello_message(&identity_b.public_key, &session_b, &session_a.public_key).unwrap();
-        let inner_b = parse_hello_message(msg_b.as_bytes(), &session_b.public_key, &session_a).unwrap();
-        assert_eq!(inner_b.identity_public_key, to_base64(&identity_b.public_key));
+        let msg_b =
+            build_hello_message(&identity_b.public_key, &session_b, &session_a.public_key).unwrap();
+        let inner_b =
+            parse_hello_message(msg_b.as_bytes(), &session_b.public_key, &session_a).unwrap();
+        assert_eq!(
+            inner_b.identity_public_key,
+            to_base64(&identity_b.public_key)
+        );
     }
 
     // ── Failure tests ───────────────────────────────────────
@@ -481,7 +495,8 @@ mod tests {
         let session_c = bolt_core::crypto::generate_ephemeral_keypair();
 
         // A encrypts for B (session keys)
-        let msg = build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
+        let msg =
+            build_hello_message(&identity_a.public_key, &session_a, &session_b.public_key).unwrap();
 
         // C tries to decrypt (wrong session key)
         let result = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_c);
@@ -583,7 +598,8 @@ mod tests {
             capabilities: caps,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
-        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let sealed =
+            seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
         let outer = WebHelloOuter {
             msg_type: "hello".to_string(),
             payload: sealed,
@@ -610,7 +626,8 @@ mod tests {
             capabilities: caps,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
-        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let sealed =
+            seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
         let outer = WebHelloOuter {
             msg_type: "hello".to_string(),
             payload: sealed,
@@ -642,7 +659,8 @@ mod tests {
             capabilities: vec![],
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
-        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let sealed =
+            seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
         let outer = WebHelloOuter {
             msg_type: "hello".to_string(),
             payload: sealed,
@@ -671,7 +689,8 @@ mod tests {
             capabilities: vec![long_cap],
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
-        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let sealed =
+            seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
         let outer = WebHelloOuter {
             msg_type: "hello".to_string(),
             payload: sealed,
@@ -704,7 +723,8 @@ mod tests {
             capabilities: vec![cap_64.clone()],
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
-        let sealed = seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
+        let sealed =
+            seal_box_payload(&plaintext, &session_b.public_key, &session_a.secret_key).unwrap();
         let outer = WebHelloOuter {
             msg_type: "hello".to_string(),
             payload: sealed,

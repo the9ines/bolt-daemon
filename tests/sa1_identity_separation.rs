@@ -25,20 +25,11 @@ fn hello_inner_identity_pk_is_persistent_key() {
     let session = generate_ephemeral_keypair();
     let remote_session = generate_ephemeral_keypair();
 
-    let msg = build_hello_message(
-        &identity.public_key,
-        &session,
-        &remote_session.public_key,
-    )
-    .unwrap();
+    let msg =
+        build_hello_message(&identity.public_key, &session, &remote_session.public_key).unwrap();
 
     // Decrypt to inspect inner
-    let inner = parse_hello_message(
-        msg.as_bytes(),
-        &session.public_key,
-        &remote_session,
-    )
-    .unwrap();
+    let inner = parse_hello_message(msg.as_bytes(), &session.public_key, &remote_session).unwrap();
 
     // HELLO inner identityPublicKey MUST be the persistent identity key
     assert_eq!(
@@ -86,20 +77,10 @@ fn hello_sealed_with_session_sk_opens_with_session_sk() {
     let session_b = generate_ephemeral_keypair();
 
     // A builds HELLO using session_a for sealing
-    let msg = build_hello_message(
-        &identity.public_key,
-        &session_a,
-        &session_b.public_key,
-    )
-    .unwrap();
+    let msg = build_hello_message(&identity.public_key, &session_a, &session_b.public_key).unwrap();
 
     // B opens using session_b — succeeds because sealing used session_a.sk
-    let inner = parse_hello_message(
-        msg.as_bytes(),
-        &session_a.public_key,
-        &session_b,
-    )
-    .unwrap();
+    let inner = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_b).unwrap();
     assert_eq!(inner.identity_public_key, to_base64(&identity.public_key));
 }
 
@@ -110,23 +91,14 @@ fn hello_sealed_with_session_sk_cannot_be_opened_with_identity_sk() {
     let session_b = generate_ephemeral_keypair();
 
     // A builds HELLO using session_a.sk for sealing
-    let msg = build_hello_message(
-        &identity.public_key,
-        &session_a,
-        &session_b.public_key,
-    )
-    .unwrap();
+    let msg = build_hello_message(&identity.public_key, &session_a, &session_b.public_key).unwrap();
 
     // Attempt to open with identity.sk instead of session_b.sk — must fail
     let identity_as_receiver = KeyPair {
         public_key: identity.public_key,
         secret_key: identity.secret_key,
     };
-    let result = parse_hello_message(
-        msg.as_bytes(),
-        &session_a.public_key,
-        &identity_as_receiver,
-    );
+    let result = parse_hello_message(msg.as_bytes(), &session_a.public_key, &identity_as_receiver);
     assert!(
         result.is_err(),
         "opening HELLO with identity secret key must fail — sealing used session key"
@@ -217,12 +189,8 @@ fn envelope_fails_with_identity_key_instead_of_session() {
     .unwrap();
 
     // Receiver constructs context with identity key (wrong) instead of session_b
-    let ctx_wrong = SessionContext::new(
-        identity,
-        pk_a,
-        vec!["bolt.profile-envelope-v1".to_string()],
-    )
-    .unwrap();
+    let ctx_wrong =
+        SessionContext::new(identity, pk_a, vec!["bolt.profile-envelope-v1".to_string()]).unwrap();
 
     let payload = b"{\"type\":\"ping\",\"ts_ms\":99999}";
     let encoded = encode_envelope(payload, &ctx_a).unwrap();
@@ -251,12 +219,7 @@ fn offerer_path_key_separation() {
     let pk_b = session_b.public_key;
 
     // Offerer builds HELLO: identity.pk in inner, session_a for sealing
-    let msg = build_hello_message(
-        &identity_a.public_key,
-        &session_a,
-        &pk_b,
-    )
-    .unwrap();
+    let msg = build_hello_message(&identity_a.public_key, &session_a, &pk_b).unwrap();
 
     // Remote opens
     let inner = parse_hello_message(msg.as_bytes(), &pk_a, &session_b).unwrap();
@@ -284,12 +247,7 @@ fn answerer_path_key_separation() {
 
     // Answerer receives HELLO from offerer, then sends reply
     // Answerer builds HELLO reply: identity.pk in inner, session_b for sealing
-    let msg = build_hello_message(
-        &identity_b.public_key,
-        &session_b,
-        &pk_a,
-    )
-    .unwrap();
+    let msg = build_hello_message(&identity_b.public_key, &session_b, &pk_a).unwrap();
 
     // Remote opens
     let inner = parse_hello_message(msg.as_bytes(), &pk_b, &session_a).unwrap();

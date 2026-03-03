@@ -2,6 +2,54 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## B3-P3 — Sender-Side Transfer MVP (4fd55e3)
+
+Sender-side transfer state machine with cursor-driven chunk streaming.
+Daemon can now build and send FileOffer (with SHA-256 hash when
+bolt.file-hash negotiated), wait for FileAccept, stream FileChunk
+messages deterministically, and send FileFinish. Handles Cancel from
+receiver. Separate SendSession struct independent from receive-side
+TransferSession.
+
+### Added
+- `SendSession` struct in `src/transfer.rs` — outbound transfer state
+  machine (Idle → OfferSent → Sending → Completed/Cancelled)
+- `SendState`, `SendOffer`, `SendChunk` types for send-side metadata
+- `begin_send()` — computes metadata, generates transfer_id, optional
+  SHA-256 hash via `bolt_core::hash::sha256_hex`
+- `on_accept()` — transitions OfferSent → Sending on matching transfer_id
+- `on_cancel()` — transitions OfferSent/Sending → Cancelled
+- `next_chunk()` — cursor-driven, returns one chunk at a time
+  (DEFAULT_CHUNK_SIZE = 16,384 bytes), returns None when exhausted
+- `finish()` — validates all chunks yielded, transitions Sending → Completed
+- Loop-level FileAccept/Cancel interception in `run_post_hello_loop`:
+  drives send-side SM when active, absorbed gracefully when idle
+- FileAccept and Cancel carved out from `route_inner_message` to `Ok(None)`
+  (previously INVALID_STATE disconnect)
+- Pause and Resume remain INVALID_STATE in `route_inner_message`
+- test_support re-exports: SendSession, SendState, SendOffer, SendChunk
+- 10 unit tests (send lifecycle, hash/no-hash, cancel, wrong ID, chunk
+  correctness), 3 loop integration tests (FileAccept/Cancel absorption,
+  Pause disconnect), 3 envelope routing tests (net +3 from 1 replaced)
+
+### Invariants
+- No new DcMessage variants
+- No new EnvelopeError variants
+- No new canonical error codes
+- dc_messages.rs unchanged (READ-ONLY)
+- run_post_hello_loop signature unchanged
+- No disk IO, no async, no new dependencies
+- Existing receive-side TransferSession unchanged
+
+### Tests
+- Default: 318 (was 302, +16)
+- test-support: 398 + 1 ignored (was 382 + 1 ignored, +16)
+- Delta: +10 unit (transfer.rs), +3 loop (rendezvous.rs), +3 net envelope (envelope.rs)
+
+**Tag:** `daemon-v0.2.29-b3-transfer-sm-p3-sender`
+
+---
+
 ## P1 — Inbound Error Validation Hardening (8c45819)
 
 Strict structural + registry validation for inbound `{type:"error"}`

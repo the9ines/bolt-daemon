@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.12-p1-inbound-error-validation` |
-| Commit (main) | `8c45819` |
+| Tag (main) | `daemon-v0.2.29-b3-transfer-sm-p3-sender` |
+| Commit (main) | `4fd55e3` |
 | Branch | `main` |
-| Phase | P1 inbound error validation hardening |
+| Phase | B3-P3 sender-side transfer MVP |
 
 ## Test Status
 
-- 276 tests with test-support (60 lib + 146 main + 15 relay + 5 vectors + 50 H5 integration)
+- 398 tests with test-support + 1 ignored E2E (318 default)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -26,6 +26,7 @@
 | H5 | DONE-MERGED | Downgrade resistance + error code alignment (R7), `daemon-v0.2.7-h5-downgrade-validation` |
 | H6 | DONE-MERGED | CI enforcement, `daemon-v0.2.9-h6-ci-enforcement` (`398a63d`) |
 | P1 | DONE | Inbound error validation hardening, `daemon-v0.2.12-p1-inbound-error-validation` (`8c45819`) |
+| B3-P3 | DONE | Sender-side transfer MVP, `daemon-v0.2.29-b3-transfer-sm-p3-sender` (`4fd55e3`) |
 
 ## Daemon Modes
 
@@ -72,6 +73,8 @@
 - Answerer responds: ping → pong reply, app_message → echo
 - All sends go through encode_envelope (NaCl box encrypted)
 - route_inner_message() in envelope.rs handles dispatch
+- B3-P3: FileAccept and Cancel carved out to Ok(None) for loop-level send-side interception
+- Pause and Resume remain INVALID_STATE in route_inner_message
 - Inbound error validation (P1): `validate_inbound_error()` validates `{type:"error"}` messages
   against `CANONICAL_ERROR_CODES` registry. Unknown/malformed codes → PROTOCOL_VIOLATION + disconnect.
 - E2E script: `scripts/e2e_interop_4_local.sh`

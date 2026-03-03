@@ -36,6 +36,12 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+tungstenite = "0.24"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+datachannel = { version = "0.16", features = ["vendored"] }
+webrtc-sdp = "0.3"
+bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 
 [profile.dev]
 opt-level = 0

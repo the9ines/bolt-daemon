@@ -711,7 +711,13 @@ pub(crate) fn run_post_hello_loop(
                     Ok(crate::dc_messages::DcMessage::FileFinish { transfer_id, .. }) => {
                         match transfer.on_file_finish(&transfer_id) {
                             Ok(()) => {
-                                eprintln!("[B3] transfer completed");
+                                if transfer.hash_verified() {
+                                    eprintln!(
+                                        "[B4_VERIFY_OK] transfer completed with hash verification"
+                                    );
+                                } else {
+                                    eprintln!("[B3] transfer completed");
+                                }
                                 continue;
                             }
                             Err(crate::transfer::TransferError::IntegrityFailed(ref detail)) => {

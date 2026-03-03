@@ -260,6 +260,11 @@ impl TransferSession {
         Ok(())
     }
 
+    /// Returns true if this transfer completed with hash verification (B4 evidence).
+    pub fn hash_verified(&self) -> bool {
+        matches!(&self.state, TransferState::Completed { .. }) && self.expected_hash.is_some()
+    }
+
     /// Returns buffer contents if Completed, None otherwise.
     pub fn completed_bytes(&self) -> Option<&[u8]> {
         match &self.state {
@@ -540,5 +545,31 @@ mod tests {
                 transfer_id: "t1".to_string()
             }
         );
+    }
+
+    // ── B4: hash_verified() evidence tests ──
+
+    #[test]
+    fn b4_hash_verified_true_after_hash_match() {
+        let data = b"deterministic payload";
+        let hash = bolt_core::hash::sha256_hex(data);
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, Some(&hash))
+            .unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+        ts.on_file_finish("t1").unwrap();
+        assert!(ts.hash_verified());
+    }
+
+    #[test]
+    fn b4_hash_verified_false_when_no_hash() {
+        let data = b"no hash payload";
+        let mut ts = TransferSession::new();
+        ts.on_file_offer("t1", data.len() as u64, 1, None).unwrap();
+        ts.accept_current_offer().unwrap();
+        ts.on_file_chunk("t1", 0, data).unwrap();
+        ts.on_file_finish("t1").unwrap();
+        assert!(!ts.hash_verified());
     }
 }

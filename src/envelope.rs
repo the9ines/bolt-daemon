@@ -380,12 +380,10 @@ pub fn route_inner_message(
         DcMessage::FileOffer { .. }
         | DcMessage::FileChunk { .. }
         | DcMessage::FileFinish { .. } => Ok(None),
-        // Remaining transfer messages are INVALID_STATE — not implemented.
-        // Fail-closed: caller disconnects on any Err from route_inner_message.
-        DcMessage::FileAccept { .. }
-        | DcMessage::Pause { .. }
-        | DcMessage::Resume { .. }
-        | DcMessage::Cancel { .. } => Err(EnvelopeError::InvalidState(
+        // B3-P3: FileAccept and Cancel handled at loop level (send-side SM).
+        DcMessage::FileAccept { .. } | DcMessage::Cancel { .. } => Ok(None),
+        // Pause and Resume remain unimplemented.
+        DcMessage::Pause { .. } | DcMessage::Resume { .. } => Err(EnvelopeError::InvalidState(
             "transfer SM not active".to_string(),
         )),
     }
@@ -843,10 +841,47 @@ mod tests {
     }
 
     #[test]
-    fn b3_file_accept_still_invalid_state() {
+    fn b3p3_file_accept_routes_to_ok_none() {
+        // B3-P3: FileAccept carved out to Ok(None) — handled at loop level.
         let (sess_a, _) = make_session_pair();
         let accept_json = r#"{"type":"file-accept","transferId":"t1"}"#;
         let result = route_inner_message(accept_json.as_bytes(), &sess_a);
+        assert!(result.is_ok(), "FileAccept should return Ok");
+        assert!(
+            result.unwrap().is_none(),
+            "FileAccept should return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn b3p3_cancel_routes_to_ok_none() {
+        // B3-P3: Cancel carved out to Ok(None) — handled at loop level.
+        let (sess_a, _) = make_session_pair();
+        let cancel_json = r#"{"type":"cancel","transferId":"t1","cancelledBy":"receiver"}"#;
+        let result = route_inner_message(cancel_json.as_bytes(), &sess_a);
+        assert!(result.is_ok(), "Cancel should return Ok");
+        assert!(result.unwrap().is_none(), "Cancel should return Ok(None)");
+    }
+
+    #[test]
+    fn b3p3_pause_still_invalid_state() {
+        let (sess_a, _) = make_session_pair();
+        let pause_json = r#"{"type":"pause","transferId":"t1"}"#;
+        let result = route_inner_message(pause_json.as_bytes(), &sess_a);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "INVALID_STATE");
+        assert!(
+            err.to_string().contains("transfer SM not active"),
+            "detail string must be locked, got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_resume_still_invalid_state() {
+        let (sess_a, _) = make_session_pair();
+        let resume_json = r#"{"type":"resume","transferId":"t1"}"#;
+        let result = route_inner_message(resume_json.as_bytes(), &sess_a);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), "INVALID_STATE");

@@ -274,6 +274,227 @@ impl TransferSession {
     }
 }
 
+// ── Send-side state (B3-P3) ──────────────────────────────────
+
+/// Send-side transfer state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendState {
+    Idle,
+    OfferSent { transfer_id: String },
+    Sending { transfer_id: String },
+    Completed { transfer_id: String },
+    Cancelled { transfer_id: String },
+}
+
+/// Metadata returned by `begin_send()`.
+#[derive(Debug)]
+pub struct SendOffer {
+    pub transfer_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub total_chunks: u32,
+    pub chunk_size: u32,
+    pub file_hash: Option<String>,
+}
+
+/// Single chunk returned by `next_chunk()`.
+#[derive(Debug)]
+pub struct SendChunk {
+    pub transfer_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub data: Vec<u8>,
+}
+
+/// Outbound transfer session tracker (sender side).
+///
+/// Enforces: Idle → OfferSent → Sending → Completed.
+/// Also supports: OfferSent/Sending → Cancelled (receiver Cancel).
+/// One outbound transfer per connection maximum.
+pub struct SendSession {
+    state: SendState,
+    payload: Vec<u8>,
+    chunk_size: usize,
+    cursor: usize,
+    total_chunks: u32,
+    next_chunk_index: u32,
+    send_count: u64,
+    file_hash: Option<String>,
+}
+
+impl Default for SendSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SendSession {
+    pub fn new() -> Self {
+        Self {
+            state: SendState::Idle,
+            payload: Vec::new(),
+            chunk_size: bolt_core::constants::DEFAULT_CHUNK_SIZE,
+            cursor: 0,
+            total_chunks: 0,
+            next_chunk_index: 0,
+            send_count: 0,
+            file_hash: None,
+        }
+    }
+
+    /// Current state (for test observability).
+    pub fn state(&self) -> &SendState {
+        &self.state
+    }
+
+    /// Begin an outbound transfer. Must be Idle.
+    ///
+    /// Computes metadata, generates transfer_id, transitions Idle → OfferSent.
+    /// Returns structured metadata for the loop to build DcMessage::FileOffer.
+    pub fn begin_send(
+        &mut self,
+        payload: Vec<u8>,
+        filename: &str,
+        file_hash_negotiated: bool,
+    ) -> Result<SendOffer, TransferError> {
+        if !matches!(self.state, SendState::Idle) {
+            return Err(TransferError::InvalidTransition(
+                "outbound transfer already active".to_string(),
+            ));
+        }
+
+        if payload.is_empty() {
+            return Err(TransferError::InvalidTransition(
+                "empty payload".to_string(),
+            ));
+        }
+
+        let size = payload.len() as u64;
+        let total_chunks = payload.len().div_ceil(self.chunk_size) as u32;
+        let hash = if file_hash_negotiated {
+            Some(bolt_core::hash::sha256_hex(&payload))
+        } else {
+            None
+        };
+
+        self.send_count += 1;
+        let transfer_id = format!("daemon-send-{:016x}", self.send_count);
+
+        self.payload = payload;
+        self.cursor = 0;
+        self.total_chunks = total_chunks;
+        self.next_chunk_index = 0;
+        self.file_hash = hash.clone();
+        self.state = SendState::OfferSent {
+            transfer_id: transfer_id.clone(),
+        };
+
+        Ok(SendOffer {
+            transfer_id,
+            filename: filename.to_string(),
+            size,
+            total_chunks,
+            chunk_size: self.chunk_size as u32,
+            file_hash: hash,
+        })
+    }
+
+    /// Receiver accepted our offer. Transitions OfferSent → Sending.
+    pub fn on_accept(&mut self, transfer_id: &str) -> Result<(), TransferError> {
+        match &self.state {
+            SendState::OfferSent { transfer_id: tid } => {
+                if transfer_id != tid {
+                    return Err(TransferError::InvalidTransition(
+                        "transfer_id mismatch".to_string(),
+                    ));
+                }
+                let tid = tid.clone();
+                self.cursor = 0;
+                self.next_chunk_index = 0;
+                self.state = SendState::Sending { transfer_id: tid };
+                Ok(())
+            }
+            _ => Err(TransferError::InvalidTransition(
+                "not awaiting accept".to_string(),
+            )),
+        }
+    }
+
+    /// Receiver cancelled. Transitions OfferSent/Sending → Cancelled.
+    pub fn on_cancel(&mut self, transfer_id: &str) -> Result<(), TransferError> {
+        match &self.state {
+            SendState::OfferSent { transfer_id: tid } | SendState::Sending { transfer_id: tid } => {
+                if transfer_id != tid {
+                    return Err(TransferError::InvalidTransition(
+                        "transfer_id mismatch".to_string(),
+                    ));
+                }
+                self.state = SendState::Cancelled {
+                    transfer_id: transfer_id.to_string(),
+                };
+                Ok(())
+            }
+            _ => Err(TransferError::InvalidTransition(
+                "no active outbound transfer".to_string(),
+            )),
+        }
+    }
+
+    /// Yield next chunk. Must be Sending. Returns None when all chunks yielded.
+    pub fn next_chunk(&mut self) -> Result<Option<SendChunk>, TransferError> {
+        let tid = match &self.state {
+            SendState::Sending { transfer_id } => transfer_id.clone(),
+            _ => {
+                return Err(TransferError::InvalidTransition(
+                    "not in sending state".to_string(),
+                ))
+            }
+        };
+
+        if self.cursor >= self.payload.len() {
+            return Ok(None);
+        }
+
+        let end = std::cmp::min(self.cursor + self.chunk_size, self.payload.len());
+        let data = self.payload[self.cursor..end].to_vec();
+        let chunk_index = self.next_chunk_index;
+
+        self.cursor = end;
+        self.next_chunk_index += 1;
+
+        Ok(Some(SendChunk {
+            transfer_id: tid,
+            chunk_index,
+            total_chunks: self.total_chunks,
+            data,
+        }))
+    }
+
+    /// Finalize transfer. Must be Sending with all chunks yielded.
+    /// Transitions Sending → Completed. Returns transfer_id.
+    pub fn finish(&mut self) -> Result<String, TransferError> {
+        let tid = match &self.state {
+            SendState::Sending { transfer_id } => transfer_id.clone(),
+            _ => {
+                return Err(TransferError::InvalidTransition(
+                    "not in sending state".to_string(),
+                ))
+            }
+        };
+
+        if self.cursor < self.payload.len() {
+            return Err(TransferError::InvalidTransition(
+                "not all chunks yielded".to_string(),
+            ));
+        }
+
+        self.state = SendState::Completed {
+            transfer_id: tid.clone(),
+        };
+        Ok(tid)
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -571,5 +792,159 @@ mod tests {
         ts.on_file_chunk("t1", 0, data).unwrap();
         ts.on_file_finish("t1").unwrap();
         assert!(!ts.hash_verified());
+    }
+
+    // ── B3-P3: send-side state machine tests ──
+
+    #[test]
+    fn b3p3_send_lifecycle_complete() {
+        let mut ss = SendSession::new();
+        assert_eq!(*ss.state(), SendState::Idle);
+
+        let payload = b"hello world, this is a test payload for send lifecycle".to_vec();
+        let offer = ss.begin_send(payload.clone(), "test.txt", true).unwrap();
+        assert!(matches!(ss.state(), SendState::OfferSent { .. }));
+        assert!(offer.file_hash.is_some());
+        assert_eq!(offer.size, payload.len() as u64);
+
+        ss.on_accept(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Sending { .. }));
+
+        let mut reassembled = Vec::new();
+        while let Some(chunk) = ss.next_chunk().unwrap() {
+            reassembled.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(reassembled, payload);
+
+        let tid = ss.finish().unwrap();
+        assert_eq!(tid, offer.transfer_id);
+        assert!(matches!(ss.state(), SendState::Completed { .. }));
+    }
+
+    #[test]
+    fn b3p3_send_lifecycle_no_hash() {
+        let mut ss = SendSession::new();
+        let payload = b"no hash test".to_vec();
+        let offer = ss
+            .begin_send(payload.clone(), "no_hash.txt", false)
+            .unwrap();
+        assert!(offer.file_hash.is_none());
+
+        ss.on_accept(&offer.transfer_id).unwrap();
+        let mut reassembled = Vec::new();
+        while let Some(chunk) = ss.next_chunk().unwrap() {
+            reassembled.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(reassembled, payload);
+        ss.finish().unwrap();
+        assert!(matches!(ss.state(), SendState::Completed { .. }));
+    }
+
+    #[test]
+    fn b3p3_send_cancel_before_accept() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(b"data".to_vec(), "f.txt", false).unwrap();
+        ss.on_cancel(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Cancelled { .. }));
+    }
+
+    #[test]
+    fn b3p3_send_cancel_during_send() {
+        let mut ss = SendSession::new();
+        let payload = vec![0u8; 32768]; // > 1 chunk
+        let offer = ss.begin_send(payload, "big.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        // Consume one chunk (partial)
+        let chunk = ss.next_chunk().unwrap();
+        assert!(chunk.is_some());
+        ss.on_cancel(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Cancelled { .. }));
+    }
+
+    #[test]
+    fn b3p3_accept_wrong_transfer_id() {
+        let mut ss = SendSession::new();
+        ss.begin_send(b"data".to_vec(), "f.txt", false).unwrap();
+        let err = ss.on_accept("wrong-id").unwrap_err();
+        assert!(
+            err.to_string().contains("transfer_id mismatch"),
+            "expected 'transfer_id mismatch', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_cancel_wrong_transfer_id() {
+        let mut ss = SendSession::new();
+        ss.begin_send(b"data".to_vec(), "f.txt", false).unwrap();
+        let err = ss.on_cancel("wrong-id").unwrap_err();
+        assert!(
+            err.to_string().contains("transfer_id mismatch"),
+            "expected 'transfer_id mismatch', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_send_while_not_idle() {
+        let mut ss = SendSession::new();
+        ss.begin_send(b"data".to_vec(), "f.txt", false).unwrap();
+        let err = ss.begin_send(b"more".to_vec(), "g.txt", false).unwrap_err();
+        assert!(
+            err.to_string().contains("outbound transfer already active"),
+            "expected 'outbound transfer already active', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_next_chunk_before_accept() {
+        let mut ss = SendSession::new();
+        ss.begin_send(b"data".to_vec(), "f.txt", false).unwrap();
+        let err = ss.next_chunk().unwrap_err();
+        assert!(
+            err.to_string().contains("not in sending state"),
+            "expected 'not in sending state', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_finish_before_all_chunks() {
+        let mut ss = SendSession::new();
+        let payload = vec![0u8; 32768]; // 2 chunks
+        let offer = ss.begin_send(payload, "big.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        // Consume only 1 chunk
+        ss.next_chunk().unwrap();
+        let err = ss.finish().unwrap_err();
+        assert!(
+            err.to_string().contains("not all chunks yielded"),
+            "expected 'not all chunks yielded', got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3p3_chunk_size_correctness() {
+        let mut ss = SendSession::new();
+        // Payload = 2.5 chunks (16384 * 2 + 8192 = 40960)
+        let payload = vec![0xAB; 40960];
+        let offer = ss.begin_send(payload.clone(), "multi.bin", false).unwrap();
+        assert_eq!(offer.total_chunks, 3);
+        assert_eq!(
+            offer.chunk_size,
+            bolt_core::constants::DEFAULT_CHUNK_SIZE as u32
+        );
+
+        ss.on_accept(&offer.transfer_id).unwrap();
+
+        let mut reassembled = Vec::new();
+        let mut chunk_count = 0u32;
+        while let Some(chunk) = ss.next_chunk().unwrap() {
+            assert!(chunk.data.len() <= bolt_core::constants::DEFAULT_CHUNK_SIZE);
+            assert_eq!(chunk.chunk_index, chunk_count);
+            assert_eq!(chunk.total_chunks, 3);
+            reassembled.extend_from_slice(&chunk.data);
+            chunk_count += 1;
+        }
+        assert_eq!(chunk_count, 3);
+        assert_eq!(reassembled, payload);
+        ss.finish().unwrap();
     }
 }

@@ -47,7 +47,9 @@ pub mod test_support {
     pub use crate::dc_messages::{encode_dc_message, parse_dc_message, DcMessage, DcParseError};
 
     // Transfer SM
-    pub use crate::transfer::{TransferError, TransferSession, TransferState};
+    pub use crate::transfer::{
+        SendChunk, SendOffer, SendSession, SendState, TransferError, TransferSession, TransferState,
+    };
 
     // Identity store
     pub use crate::identity_store::{

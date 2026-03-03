@@ -561,6 +561,7 @@ pub(crate) fn run_post_hello_loop(
     const PING_INTERVAL: Duration = Duration::from_secs(2);
     let mut last_ping = Instant::now();
     let mut transfer = crate::transfer::TransferSession::new();
+    let mut send_session = crate::transfer::SendSession::new();
 
     loop {
         if Instant::now() >= deadline {
@@ -745,11 +746,73 @@ pub(crate) fn run_post_hello_loop(
                             }
                         }
                     }
+                    // B3-P3: FileAccept — drive send-side SM if active, else absorb.
+                    Ok(crate::dc_messages::DcMessage::FileAccept { transfer_id }) => {
+                        match send_session.on_accept(&transfer_id) {
+                            Ok(()) => {
+                                // Stream all chunks, then finish
+                                while let Some(chunk) = send_session.next_chunk().map_err(
+                                    |te| -> Box<dyn std::error::Error> {
+                                        format!("[B3-P3] chunk error: {te}").into()
+                                    },
+                                )? {
+                                    let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
+                                    let msg = crate::dc_messages::DcMessage::FileChunk {
+                                        transfer_id: chunk.transfer_id,
+                                        chunk_index: chunk.chunk_index,
+                                        total_chunks: chunk.total_chunks,
+                                        payload: payload_b64,
+                                    };
+                                    let json = crate::dc_messages::encode_dc_message(&msg)
+                                        .map_err(|e| format!("[B3-P3] encode chunk: {e}"))?;
+                                    let env = crate::envelope::encode_envelope(&json, session)?;
+                                    send_fn(&env)
+                                        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                                }
+
+                                // All chunks sent — send FileFinish
+                                let tid = send_session.finish().map_err(
+                                    |te| -> Box<dyn std::error::Error> {
+                                        format!("[B3-P3] finish error: {te}").into()
+                                    },
+                                )?;
+                                let finish_msg = crate::dc_messages::DcMessage::FileFinish {
+                                    transfer_id: tid,
+                                    file_hash: None,
+                                };
+                                let finish_json =
+                                    crate::dc_messages::encode_dc_message(&finish_msg)
+                                        .map_err(|e| format!("[B3-P3] encode finish: {e}"))?;
+                                let finish_env =
+                                    crate::envelope::encode_envelope(&finish_json, session)?;
+                                send_fn(&finish_env)
+                                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                                eprintln!("[B3-P3] outbound transfer completed");
+                            }
+                            Err(te) => {
+                                // No active outbound transfer — log and continue (not disconnect).
+                                eprintln!("[B3-P3] FileAccept ignored: {te}");
+                            }
+                        }
+                        continue;
+                    }
+                    // B3-P3: Cancel — drive send-side SM if active, else absorb.
+                    Ok(crate::dc_messages::DcMessage::Cancel { transfer_id, .. }) => {
+                        match send_session.on_cancel(&transfer_id) {
+                            Ok(()) => {
+                                eprintln!("[B3-P3] outbound transfer cancelled by receiver");
+                            }
+                            Err(te) => {
+                                // No active outbound transfer — log and continue.
+                                eprintln!("[B3-P3] Cancel ignored: {te}");
+                            }
+                        }
+                        continue;
+                    }
                     _ => {
                         // Everything else: fall through to route_inner_message.
                         // Preserves existing behavior for ping, pong, app_message, error,
-                        // and remaining transfer messages (FileAccept, Pause, Resume,
-                        // Cancel → InvalidState).
+                        // and remaining transfer messages (Pause, Resume → InvalidState).
                         match crate::envelope::route_inner_message(&inner, session) {
                             Ok(Some(reply)) => {
                                 send_fn(&reply).map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -2743,5 +2806,85 @@ mod tests {
         let captured = sent.borrow();
         assert!(!captured.is_empty(), "should have sent Accept");
         assert_eq!(captured.len(), 1, "only Accept should be sent");
+    }
+
+    // ── B3-P3: send-side loop integration tests ─────────────────
+
+    #[test]
+    fn b3p3_file_accept_no_active_send_continues() {
+        // FileAccept with no outbound transfer should be absorbed, not disconnect.
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let accept = crate::dc_messages::DcMessage::FileAccept {
+            transfer_id: "nonexistent-tid".to_string(),
+        };
+        let accept_json = crate::dc_messages::encode_dc_message(&accept).unwrap();
+        let env = crate::envelope::encode_envelope(&accept_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "FileAccept with no active send should not disconnect, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn b3p3_cancel_no_active_send_continues() {
+        // Cancel with no outbound transfer should be absorbed, not disconnect.
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let cancel = crate::dc_messages::DcMessage::Cancel {
+            transfer_id: "nonexistent-tid".to_string(),
+            cancelled_by: "receiver".to_string(),
+        };
+        let cancel_json = crate::dc_messages::encode_dc_message(&cancel).unwrap();
+        let env = crate::envelope::encode_envelope(&cancel_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "Cancel with no active send should not disconnect, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn b3p3_pause_still_disconnects() {
+        // Pause remains unimplemented — should cause INVALID_STATE disconnect.
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let pause = crate::dc_messages::DcMessage::Pause {
+            transfer_id: "some-tid".to_string(),
+        };
+        let pause_json = crate::dc_messages::encode_dc_message(&pause).unwrap();
+        let env = crate::envelope::encode_envelope(&pause_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_err(),
+            "Pause should still cause disconnect (not carved out)"
+        );
     }
 }

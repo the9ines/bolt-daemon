@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.29-b3-transfer-sm-p3-sender` |
-| Commit (main) | `4fd55e3` |
+| Tag (main) | `daemon-v0.2.30-d-e2e-b-cross-impl` |
+| Commit (main) | `a8cf108` |
 | Branch | `main` |
-| Phase | B3-P3 sender-side transfer MVP |
+| Phase | D-E2E-B cross-implementation bidirectional E2E transfer |
 
 ## Test Status
 
-- 398 tests with test-support + 1 ignored E2E (318 default)
+- 398 tests with test-support + 3 ignored E2E (318 default)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -27,6 +27,7 @@
 | H6 | DONE-MERGED | CI enforcement, `daemon-v0.2.9-h6-ci-enforcement` (`398a63d`) |
 | P1 | DONE | Inbound error validation hardening, `daemon-v0.2.12-p1-inbound-error-validation` (`8c45819`) |
 | B3-P3 | DONE | Sender-side transfer MVP, `daemon-v0.2.29-b3-transfer-sm-p3-sender` (`4fd55e3`) |
+| D-E2E-B | DONE | Cross-impl bidirectional TS↔Rust E2E transfer, `daemon-v0.2.30-d-e2e-b-cross-impl` (`a8cf108`) |
 
 ## Daemon Modes
 
@@ -183,6 +184,7 @@ src/rendezvous.rs      — WebSocket signaling via bolt-rendezvous
 src/relay_main.rs      — bolt-relay binary
 scripts/               — E2E regression harness
 interop/browser/       — Browser interop test page
+tests/ts-harness/      — Node.js E2E harness (node-datachannel, tweetnacl, ws)
 docs/                  — Test procedures, changelog, state
 ```
 

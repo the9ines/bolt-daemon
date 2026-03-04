@@ -2,6 +2,48 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## D-E2E-B — Cross-Implementation Bidirectional E2E Transfer (a8cf108)
+
+Cross-implementation bidirectional file transfer between Node.js offerer
+(tests/ts-harness) and Rust daemon answerer via real bolt-rendezvous.
+Proves full interop: signaling, HELLO handshake, capability negotiation,
+and bidirectional transfer with SHA-256 hash verification in both
+directions. Pattern A (4096 B) flows JS→daemon, Pattern B (6144 B)
+flows daemon→JS.
+
+### Added
+- Node.js test harness (`tests/ts-harness/harness.mjs`) — full ESM
+  implementation of Bolt protocol: WebSocket rendezvous signaling,
+  WebRTC DataChannel via `node-datachannel`, NaCl box envelope v1 via
+  `tweetnacl`, encrypted HELLO exchange, bidirectional file transfer
+  with SHA-256 verification. CLI with deterministic payload input and
+  expected hash/size validation.
+- `tests/ts-harness/package.json` + `package-lock.json` — pinned deps:
+  `node-datachannel@0.32.1`, `tweetnacl@1.0.3`, `ws@8.19.0`
+- Test-only send trigger in `src/rendezvous.rs` (30 lines, all
+  `#[cfg(feature = "test-support")]`) — reads `BOLT_TEST_SEND_PAYLOAD_PATH`
+  env var after receiving a file and sends it back via SendSession
+- `tests/d_e2e_bidirectional.rs` — two `#[ignore]` integration tests:
+  happy-path bidirectional transfer + negative integrity mismatch
+- Deterministic payloads: Pattern A = `((i+1)*31) & 0xFF` (4096 B),
+  Pattern B = `((i+1)*37) & 0xFF` (6144 B)
+
+### Invariants
+- No new DcMessage variants
+- No new EnvelopeError variants
+- No new canonical error codes
+- No protocol wire format changes
+- No cryptographic changes
+- Existing receive/send state machines (B3-P2, B3-P3) unchanged
+
+### Tests
+- Default: 318 (unchanged — new tests are #[ignore])
+- test-support: 398 + 3 ignored (was 398 + 1 ignored, +2 ignored E2E)
+
+**Tag:** `daemon-v0.2.30-d-e2e-b-cross-impl`
+
+---
+
 ## B3-P3 — Sender-Side Transfer MVP (4fd55e3)
 
 Sender-side transfer state machine with cursor-driven chunk streaming.

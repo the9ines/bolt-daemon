@@ -540,6 +540,27 @@ pub(crate) struct SmokeDcContext<'a> {
     pub expect_peer: Option<&'a str>,
 }
 
+// D-E2E-B test-only trigger — remove when IPC lands
+#[cfg(feature = "test-support")]
+fn test_send_offer(
+    path: &str,
+    ss: &mut crate::transfer::SendSession,
+    ctx: &crate::session::SessionContext,
+) -> Option<Vec<u8>> {
+    let d = std::fs::read(path).ok().filter(|v| !v.is_empty())?;
+    let fh = ctx.has_capability("bolt.file-hash");
+    let o = ss.begin_send(d, "test-send.bin", fh).ok()?;
+    let j = crate::dc_messages::encode_dc_message(&crate::dc_messages::DcMessage::FileOffer {
+        transfer_id: o.transfer_id,
+        filename: o.filename,
+        size: o.size,
+        total_chunks: o.total_chunks,
+        chunk_size: o.chunk_size,
+        file_hash: o.file_hash,
+    })
+    .ok()?;
+    crate::envelope::encode_envelope(&j, ctx).ok()
+}
 // ── Post-HELLO event loop (B6-P1) ───────────────────────────
 
 /// Deterministic, symmetric post-HELLO message loop.
@@ -562,6 +583,8 @@ pub(crate) fn run_post_hello_loop(
     let mut last_ping = Instant::now();
     let mut transfer = crate::transfer::TransferSession::new();
     let mut send_session = crate::transfer::SendSession::new();
+    #[cfg(feature = "test-support")]
+    let test_send_path = std::env::var("BOLT_TEST_SEND_PAYLOAD_PATH").ok();
 
     loop {
         if Instant::now() >= deadline {
@@ -718,6 +741,13 @@ pub(crate) fn run_post_hello_loop(
                                     );
                                 } else {
                                     eprintln!("[B3] transfer completed");
+                                }
+                                #[cfg(feature = "test-support")]
+                                if let Some(ref p) = test_send_path {
+                                    if let Some(e) = test_send_offer(p, &mut send_session, session)
+                                    {
+                                        let _ = send_fn(&e);
+                                    }
                                 }
                                 continue;
                             }

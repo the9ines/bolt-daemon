@@ -1,0 +1,12 @@
+{
+  "name": "bolt-daemon-e2e-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "D-E2E-B cross-implementation bidirectional transfer harness (test fixture, not product code)",
+  "dependencies": {
+    "node-datachannel": "0.32.1",
+    "tweetnacl": "1.0.3",
+    "ws": "8.19.0"
+  }
+}

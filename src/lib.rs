@@ -21,6 +21,24 @@ pub mod web_hello;
 /// Used by `web_hello::parse_hello_message` for no-downgrade detection.
 pub const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";
 
+// ── IPC Transport (for integration tests) ───────────────────
+
+/// Re-export: default IPC endpoint path for the current platform.
+pub const IPC_DEFAULT_PATH: &str = ipc::transport::DEFAULT_IPC_PATH;
+
+/// Re-export: check if a path is a Windows named pipe path.
+pub fn ipc_transport_is_windows_pipe(path: &str) -> bool {
+    ipc::transport::is_windows_pipe_path(path)
+}
+
+/// Re-export: start the IPC server (for integration tests).
+pub fn ipc_server_start(path: &str) -> std::io::Result<ipc::server::IpcServer> {
+    ipc::server::IpcServer::start(path)
+}
+
+#[doc(hidden)]
+pub mod ipc;
+
 /// Test-only re-exports for integration tests.
 ///
 /// Gated behind `--features test-support` so release builds carry no

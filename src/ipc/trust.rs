@@ -102,6 +102,12 @@ pub struct TrustStore {
     pub peers: HashMap<String, Decision>,
 }
 
+impl Default for TrustStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrustStore {
     /// Create a new empty trust store.
     pub fn new() -> Self {

@@ -18,11 +18,10 @@
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
 pub(crate) use bolt_daemon::{
-    dc_messages, envelope, identity_store, session, transfer, web_hello, HELLO_PAYLOAD,
+    dc_messages, envelope, identity_store, ipc, session, transfer, web_hello, HELLO_PAYLOAD,
 };
 
 mod ice_filter;
-pub(crate) mod ipc;
 mod rendezvous;
 mod smoke;
 pub(crate) mod web_signal;

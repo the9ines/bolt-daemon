@@ -2,6 +2,87 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## N6-B2 — Windows Named Pipe Transport (B-DEP-N2-3)
+
+Resolves B-DEP-N2-3: transport abstraction supporting both Unix domain
+sockets (existing) and Windows named pipes (new). Preserves locked N2
+handshake semantics, single-client kick-on-reconnect, and fail-closed
+behavior across both transports.
+
+### Added
+- `src/ipc/transport.rs` (NEW) — transport abstraction layer:
+  - `IpcListener` enum (Unix / NamedPipe variants, `#[cfg]`-gated)
+  - `IpcStream` enum with `Read`/`Write` for owned and `&` references
+  - `is_windows_pipe_path()` — detects `\\.\pipe\` path format
+  - `DEFAULT_IPC_PATH` — platform-dependent default IPC endpoint
+  - `cleanup_ipc_endpoint()` — shutdown cleanup (removes socket on Unix)
+  - `#[cfg(windows)] mod windows_pipe` — full Win32 named pipe impl:
+    `NamedPipeListener::bind()` with SDDL current-user-only DACL,
+    `NamedPipeStream` with `ReadFile`/`WriteFile`, `PeekNamedPipe`-based
+    read timeout, handle duplication for `try_clone()`
+- `windows-sys` dependency (cfg(windows) only) with Win32 features:
+  `Win32_Foundation`, `Win32_Security`, `Win32_Security_Authorization`,
+  `Win32_Storage_FileSystem`, `Win32_System_Pipes`, `Win32_System_Threading`
+- 10 unit tests in `transport.rs` (path detection + Unix transport)
+- 8 Unix transport unit tests (bind, accept, read/write, clone, timeout,
+  cleanup, permissions, prepare_next)
+- `tests/n6b2_windows_pipe.rs` — 11 integration tests:
+  6 transport detection (all platforms), 2 default path, 3 Unix regression
+  (N2 handshake ordering, kick-on-reconnect, incompatible version fail-closed)
+- 3 Windows-only integration tests (cfg(windows) gated: bind, wouldblock,
+  connection lifecycle)
+- Public re-exports in `lib.rs`: `IPC_DEFAULT_PATH`,
+  `ipc_transport_is_windows_pipe()`, `ipc_server_start()`
+
+### Changed
+- `src/ipc/server.rs` — refactored to use transport abstraction:
+  replaced `UnixListener`/`UnixStream` with `IpcListener`/`IpcStream`,
+  `listener_loop()` calls `listener.prepare_next()` after each client,
+  `Drop` impl calls `transport::cleanup_ipc_endpoint()`
+- `src/ipc/mod.rs` — added `pub mod transport`
+- `src/lib.rs` — added `pub mod ipc` and thin public wrappers for
+  integration test access
+- `src/main.rs` — `ipc` module now comes from `lib.rs` via re-export
+- `src/ipc/trust.rs` — added `Default` impl for `TrustStore` (clippy fix)
+
+### Transport Architecture
+- Enum dispatch (not trait objects) — zero dynamic dispatch overhead
+- `IpcListener::bind()` detects path format, creates appropriate listener
+- `IpcListener::prepare_next()` — `DisconnectNamedPipe` on Windows, no-op
+  on Unix
+- `IpcStream` implements `Read`/`Write` for both owned and `&` references
+- Windows read timeout: `PeekNamedPipe` polling with 10ms sleep + deadline
+- Windows security: SDDL `D:P(A;;GA;;;<SID>)` restricts pipe to current
+  user only (0600-equivalent)
+
+### Windows Security Model
+- Named pipe created with explicit DACL via `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+- SID lookup: `OpenProcessToken` + `GetTokenInformation(TokenUser)` +
+  `ConvertSidToStringSidW`
+- SDDL format: `D:P(A;;GA;;;<current-user-SID>)` — Protected DACL,
+  Generic All for current user only
+- No inheritance, no other users, no SYSTEM access
+
+### B1 Integration
+- `is_windows_pipe_path()` integrates with `--socket-path` flag from N6-B1
+- Pipe paths (`\\.\pipe\...`) route to `NamedPipeListener`
+- Unix paths route to `UnixListener` (existing behavior preserved)
+
+### Invariants
+- No changes to N2 handshake semantics (version.handshake → version.status
+  → daemon.status)
+- No changes to single-client kick-on-reconnect policy
+- No changes to message parsing, routing, envelope schema, or trust logic
+- No new DcMessage variants, EnvelopeError variants, or canonical error codes
+
+### Tests
+- Default: 389 (was 360, +29 new)
+- test-support: 458 + 3 ignored (was 440 + 3 ignored, +18 new)
+
+**Tag:** `daemon-v0.2.33-n6b2-windows-pipe`
+
+---
+
 ## N6-B1 — `--socket-path` and `--data-dir` CLI Flags (B-DEP-N1-1)
 
 Resolves B-DEP-N1-1: daemon path configurability for platform-appropriate

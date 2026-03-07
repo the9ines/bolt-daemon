@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.32-n6b1-path-flags` |
-| Commit (main) | `810043f` |
+| Tag (main) | `daemon-v0.2.33-n6b2-windows-pipe` |
+| Commit (main) | `5ae8419` |
 | Branch | `main` |
-| Phase | N6-B1: B-DEP-N1-1 — `--socket-path` and `--data-dir` CLI flags |
+| Phase | N6-B2: B-DEP-N2-3 — Windows named pipe transport |
 
 ## Test Status
 
-- 440 tests with test-support + 3 ignored E2E (345 default + 13 N6-B1 integration)
+- 458 tests with test-support + 3 ignored E2E (389 default + 11 N6-B2 integration)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - `scripts/check_no_panic.sh` PASS
@@ -31,6 +31,7 @@
 | D-E2E-B | DONE | Cross-impl bidirectional TS↔Rust E2E transfer, `daemon-v0.2.30-d-e2e-b-cross-impl` (`a8cf108`) |
 | B-DEP-N2 | DONE | IPC version handshake + daemon.status in default mode, `daemon-v0.2.31-bdep-n2-ipc-unblock` |
 | N6-B1 | DONE | `--socket-path` and `--data-dir` CLI flags (B-DEP-N1-1), `daemon-v0.2.32-n6b1-path-flags` |
+| N6-B2 | DONE | Windows named pipe transport (B-DEP-N2-3), `daemon-v0.2.33-n6b2-windows-pipe` |
 
 ## Daemon Modes
 
@@ -141,8 +142,9 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 
 ## IPC Channel (EVENT-0)
 
-- Transport: Unix domain socket (chmod 600)
-- Default path: `/tmp/bolt-daemon.sock` (override via `--socket-path <path>`)
+- Transport: Unix domain socket (chmod 600) or Windows named pipe (DACL current-user-only)
+- Default path: `/tmp/bolt-daemon.sock` (Unix) or `\\.\pipe\bolt-daemon` (Windows)
+  (override via `--socket-path <path>`)
 - Protocol: NDJSON (line-delimited JSON, 1 MiB cap per line)
 - Client policy: single-client, new connection kicks old
 - Fail-closed: no UI connected = pending/deny
@@ -169,6 +171,7 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | bolt-rendezvous-protocol | 0.1.0 | Canonical signaling types (git dep, tag-pinned) |
 | serde/serde_json | 1.x | Serialization |
 | rand | 0.8 | Peer ID generation |
+| windows-sys | 0.59 (cfg(windows)) | Win32 named pipe, security descriptor APIs |
 
 ## Architecture
 
@@ -180,8 +183,9 @@ src/envelope.rs        — Profile Envelope v1 codec: encode/decode, route, DcEr
 src/web_hello.rs       — Web HELLO handshake: NaCl-box encrypted JSON, capability negotiation
 src/web_signal.rs      — Web inner signaling payloads: {type,data,from,to} schema
 src/ipc/mod.rs         — IPC module root
+src/ipc/transport.rs   — Transport abstraction: IpcListener/IpcStream (Unix + Windows named pipe)
 src/ipc/types.rs       — IpcMessage, IpcKind, event/decision payload structs
-src/ipc/server.rs      — IpcServer, bounded reader, client handler
+src/ipc/server.rs      — IpcServer, bounded reader, client handler (transport-agnostic)
 src/ipc/id.rs          — Monotonic request ID generator
 src/ipc/trust.rs       — TrustStore persistence + check_pairing_approval()
 src/ipc_client_main.rs — bolt-ipc-client dev binary

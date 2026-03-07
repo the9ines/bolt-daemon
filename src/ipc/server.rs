@@ -1,22 +1,23 @@
-//! IPC server: Unix domain socket, NDJSON protocol, single-client.
+//! IPC server: Unix domain socket or Windows named pipe, NDJSON protocol,
+//! single-client.
 //!
 //! New client kicks old client (no dead-UI blocking).
 //! Fail-closed: no UI connected = `await_decision` returns `None`.
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::transport::{self, IpcListener, IpcStream};
 use super::types::{DaemonStatusPayload, DecisionPayload, IpcMessage, VersionStatusPayload};
 
 // ── Constants ───────────────────────────────────────────────
 
-/// Default socket path.
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/bolt-daemon.sock";
+/// Default IPC endpoint path (platform-dependent).
+pub const DEFAULT_SOCKET_PATH: &str = transport::DEFAULT_IPC_PATH;
 
 /// Maximum line size (1 MiB). Lines exceeding this cause disconnect.
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -125,33 +126,17 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    /// Start the IPC server on the given socket path.
+    /// Start the IPC server on the given path.
     ///
     /// Spawns a background thread that listens for a single client at a time.
     /// New connections kick the old client.
+    ///
+    /// On Unix: creates a Unix domain socket.
+    /// On Windows with `\\.\pipe\` prefix: creates a named pipe.
     pub fn start(socket_path: &str) -> io::Result<Self> {
-        let path = PathBuf::from(socket_path);
-
-        // Remove stale socket file if it exists.
-        if path.exists() {
-            eprintln!("[IPC] removing stale socket: {}", path.display());
-            std::fs::remove_file(&path)?;
-        }
-
-        let listener = UnixListener::bind(&path)?;
-
-        // chmod 600 — owner-only access.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms)?;
-        }
+        let (listener, path) = IpcListener::bind(socket_path)?;
 
         eprintln!("[IPC] listening on {} (single-client)", path.display());
-
-        // Set non-blocking so we can check for shutdown.
-        listener.set_nonblocking(true)?;
 
         let (event_tx, event_rx) = mpsc::channel::<IpcMessage>();
         let (decision_tx, decision_rx) = mpsc::channel::<IpcMessage>();
@@ -225,14 +210,14 @@ impl IpcServer {
 
     /// Listener loop: accepts one client at a time, kicks old on new connect.
     fn listener_loop(
-        listener: UnixListener,
+        listener: IpcListener,
         event_rx: Receiver<IpcMessage>,
         decision_tx: Sender<IpcMessage>,
         ui_connected: Arc<Mutex<bool>>,
     ) {
         loop {
             match listener.accept() {
-                Ok((stream, _addr)) => {
+                Ok(stream) => {
                     eprintln!("[IPC] client connected");
 
                     // Drain any stale events from previous client session
@@ -251,6 +236,9 @@ impl IpcServer {
                         }
                     }
                     eprintln!("[IPC_CLIENT_DISCONNECTED]");
+
+                    // Prepare listener for next client (Windows: disconnect pipe).
+                    listener.prepare_next();
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Non-blocking: no client waiting, sleep and retry
@@ -266,7 +254,7 @@ impl IpcServer {
 
     /// Send a version.status response on the given writer.
     fn write_version_status(
-        writer: &mut io::BufWriter<&UnixStream>,
+        writer: &mut io::BufWriter<&IpcStream>,
         compatible: bool,
     ) -> io::Result<()> {
         let payload = VersionStatusPayload {
@@ -288,7 +276,7 @@ impl IpcServer {
     /// 2. If compatible: emit daemon.status, set ui_connected, enter event loop
     /// 3. If incompatible/malformed/missing: fail-closed disconnect
     fn handle_client(
-        stream: UnixStream,
+        stream: IpcStream,
         event_rx: &Receiver<IpcMessage>,
         decision_tx: &Sender<IpcMessage>,
         ui_connected: &Arc<Mutex<bool>>,
@@ -505,10 +493,7 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
-            eprintln!("[IPC] cleaned up socket: {}", self.socket_path.display());
-        }
+        transport::cleanup_ipc_endpoint(&self.socket_path);
     }
 }
 
@@ -678,8 +663,10 @@ mod tests {
 
     // ── Handshake Integration Tests ─────────────────────────
 
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
 
+    #[cfg(unix)]
     fn temp_socket_path() -> String {
         let dir = std::env::temp_dir();
         format!(
@@ -692,6 +679,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn send_version_handshake(stream: &mut UnixStream, app_version: &str) {
         let msg = serde_json::json!({
             "id": "cli-0",
@@ -706,6 +694,7 @@ mod tests {
         stream.flush().unwrap();
     }
 
+    #[cfg(unix)]
     fn read_ipc_line(reader: &mut BufReader<UnixStream>) -> Option<serde_json::Value> {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -715,6 +704,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_compatible_emits_version_status_then_daemon_status() {
         let path = temp_socket_path();
@@ -753,6 +743,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_incompatible_sends_status_then_disconnects() {
         let path = temp_socket_path();
@@ -789,6 +780,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_wrong_first_message_fails_closed() {
         let path = temp_socket_path();
@@ -826,6 +818,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_malformed_json_fails_closed() {
         let path = temp_socket_path();
@@ -854,6 +847,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_missing_app_version_fails_closed() {
         let path = temp_socket_path();
@@ -890,6 +884,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_events_blocked_before_completion() {
         let path = temp_socket_path();
@@ -926,6 +921,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handshake_events_flow_after_compatible() {
         let path = temp_socket_path();

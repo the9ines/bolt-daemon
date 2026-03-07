@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | Tag (main) | `daemon-v0.2.31-bdep-n2-ipc-unblock` |
-| Commit (main) | `1065433` |
+| Commit (main) | `1ad2db8` |
 | Branch | `main` |
 | Phase | B-DEP-N2-1 + B-DEP-N2-2: IPC version handshake + daemon.status in default mode |
 

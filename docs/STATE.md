@@ -4,14 +4,14 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.30-d-e2e-b-cross-impl` |
-| Commit (main) | `a8cf108` |
+| Tag (main) | `daemon-v0.2.31-bdep-n2-ipc-unblock` |
+| Commit (main) | `1065433` |
 | Branch | `main` |
-| Phase | D-E2E-B cross-implementation bidirectional E2E transfer |
+| Phase | B-DEP-N2-1 + B-DEP-N2-2: IPC version handshake + daemon.status in default mode |
 
 ## Test Status
 
-- 398 tests with test-support + 3 ignored E2E (318 default)
+- 418 tests with test-support + 3 ignored E2E (338 default)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
@@ -28,6 +28,7 @@
 | P1 | DONE | Inbound error validation hardening, `daemon-v0.2.12-p1-inbound-error-validation` (`8c45819`) |
 | B3-P3 | DONE | Sender-side transfer MVP, `daemon-v0.2.29-b3-transfer-sm-p3-sender` (`4fd55e3`) |
 | D-E2E-B | DONE | Cross-impl bidirectional TS↔Rust E2E transfer, `daemon-v0.2.30-d-e2e-b-cross-impl` (`a8cf108`) |
+| B-DEP-N2 | DONE | IPC version handshake + daemon.status in default mode, `daemon-v0.2.31-bdep-n2-ipc-unblock` |
 
 ## Daemon Modes
 

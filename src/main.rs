@@ -1058,9 +1058,7 @@ fn run_smoke_rendezvous(args: &Args) -> Result<(), smoke::SmokeError> {
 
 fn run_simulate(simulate_event: SimulateEvent) {
     use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
-    use ipc::types::{
-        DaemonStatusPayload, IpcMessage, PairingRequestPayload, TransferIncomingRequestPayload,
-    };
+    use ipc::types::{IpcMessage, PairingRequestPayload, TransferIncomingRequestPayload};
 
     let server = match IpcServer::start(DEFAULT_SOCKET_PATH) {
         Ok(s) => s,
@@ -1080,25 +1078,9 @@ fn run_simulate(simulate_event: SimulateEvent) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("[simulate] IPC client connected");
-
-    // Emit daemon.status
-    let status = DaemonStatusPayload {
-        connected_peers: 0,
-        ui_connected: true,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    let status_value = match serde_json::to_value(&status) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[simulate] FATAL: serialize status: {e}");
-            std::process::exit(1);
-        }
-    };
-    server.emit_event(IpcMessage::new_event("daemon.status", status_value));
-
-    // Small delay to let status arrive before the prompt
-    thread::sleep(Duration::from_millis(100));
+    eprintln!(
+        "[simulate] IPC client connected (version handshake + daemon.status handled by IPC server)"
+    );
 
     // Emit the simulated event
     let request_id = ipc::id::generate_request_id();

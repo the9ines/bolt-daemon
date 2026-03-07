@@ -112,6 +112,72 @@ This separation is by design. The rendezvous server is untrusted and sees
 only opaque signaling metadata. All encryption and payload integrity are
 enforced at the peer level by the Bolt protocol layer.
 
+## IPC Version Handshake Contract (B-DEP-N2-2)
+
+The IPC Unix socket enforces a strict version handshake as the first
+message exchange after client connection. No grace mode exists.
+
+### Sequence
+
+1. Client connects to Unix socket.
+2. Client MUST send `version.handshake` (kind: `decision`) as its first message:
+   ```json
+   {"id":"...","kind":"decision","type":"version.handshake","ts_ms":<u64>,"payload":{"app_version":"<major.minor.patch>"}}
+   ```
+3. Daemon replies with `version.status` (kind: `event`):
+   ```json
+   {"id":"...","kind":"event","type":"version.status","ts_ms":<u64>,"payload":{"daemon_version":"<major.minor.patch>","compatible":<bool>}}
+   ```
+4. If `compatible: true`: daemon emits `daemon.status` event, then enters
+   normal event/decision loop.
+5. If `compatible: false`: daemon closes the connection immediately after
+   sending `version.status`.
+
+### Compatibility Rule
+
+`major.minor` of app version MUST equal `major.minor` of daemon version.
+Patch version MAY differ. Malformed versions are treated as incompatible.
+
+### Fail-Closed Semantics
+
+| Condition | Behavior |
+|-----------|----------|
+| First message is not `version.handshake` | `version.status` with `compatible: false`, then disconnect |
+| First message is malformed JSON | `version.status` with `compatible: false`, then disconnect |
+| `app_version` field missing from payload | `version.status` with `compatible: false`, then disconnect |
+| Version incompatible (major.minor mismatch) | `version.status` with `compatible: false`, then disconnect |
+| Handshake timeout (5 seconds) | Disconnect without response |
+
+### Event Ordering Lock
+
+- Before handshake completion: daemon MUST NOT emit any events except
+  `version.status`.
+- After compatible handshake: `daemon.status` is emitted immediately,
+  followed by normal event flow.
+- `ui_connected` flag is only set to `true` after successful handshake
+  and `daemon.status` emission.
+
+### Log Tokens
+
+| Token | Meaning |
+|-------|---------|
+| `[IPC_VERSION_COMPATIBLE]` | Handshake succeeded, versions match |
+| `[IPC_VERSION_INCOMPATIBLE]` | Handshake failed, version mismatch — closing |
+| `[IPC_HANDSHAKE_FAIL]` | Handshake failed (malformed, missing, wrong type) — fail-closed |
+
+## daemon.status Emission (B-DEP-N2-1)
+
+The `daemon.status` event is emitted in **all daemon modes** (default,
+smoke, simulate) immediately after a successful IPC version handshake.
+
+Payload schema:
+```json
+{"connected_peers": <u32>, "ui_connected": <bool>, "version": "<string>"}
+```
+
+This event signals daemon readiness to the app. The app SHOULD NOT enable
+transfer UI until `daemon.status` is received.
+
 ## Compatibility Contract
 
 - **payload_version**: MUST be `1`. Any other value is fatal (exit 1).

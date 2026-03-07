@@ -63,7 +63,33 @@ fn main() {
     let mut writer = stream;
     let reader = BufReader::new(read_stream);
 
-    eprintln!("[ipc-client] connected, reading events...");
+    eprintln!("[ipc-client] connected, sending version.handshake...");
+
+    // Send version.handshake as first message (B-DEP-N2-2 contract).
+    let handshake = serde_json::json!({
+        "id": "cli-handshake",
+        "kind": "decision",
+        "type": "version.handshake",
+        "ts_ms": now_ms(),
+        "payload": { "app_version": env!("CARGO_PKG_VERSION") }
+    });
+    let mut hs_line = match serde_json::to_string(&handshake) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: serialize version.handshake: {e}");
+            std::process::exit(1);
+        }
+    };
+    hs_line.push('\n');
+    if let Err(e) = writer.write_all(hs_line.as_bytes()) {
+        eprintln!("[ipc-client] FATAL: write version.handshake: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("[ipc-client] FATAL: flush version.handshake: {e}");
+        std::process::exit(1);
+    }
+    eprintln!("[ipc-client] version.handshake sent, reading events...");
 
     for line_result in reader.lines() {
         let line = match line_result {

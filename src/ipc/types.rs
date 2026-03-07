@@ -69,6 +69,23 @@ pub struct DaemonStatusPayload {
     pub version: String,
 }
 
+// ── Version Handshake Payloads ───────────────────────────────
+
+/// Payload for `version.handshake` (app -> daemon, first message after connect).
+/// Constructed by the app side; daemon deserializes from `serde_json::Value`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct VersionHandshakePayload {
+    pub app_version: String,
+}
+
+/// Payload for `version.status` (daemon -> app, response to handshake).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct VersionStatusPayload {
+    pub daemon_version: String,
+    pub compatible: bool,
+}
+
 // ── Decision Payloads (UI -> daemon) ────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -324,5 +341,64 @@ mod tests {
         let extracted = msg.as_decision_payload().unwrap();
         assert_eq!(extracted.decision, Decision::DenyOnce);
         assert_eq!(extracted.request_id, "evt-0");
+    }
+
+    #[test]
+    fn version_handshake_payload_roundtrip() {
+        let p = VersionHandshakePayload {
+            app_version: "0.0.1".to_string(),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let decoded: VersionHandshakePayload = serde_json::from_value(v).unwrap();
+        assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn version_status_payload_roundtrip_compatible() {
+        let p = VersionStatusPayload {
+            daemon_version: "0.0.1".to_string(),
+            compatible: true,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let decoded: VersionStatusPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(decoded, p);
+        assert!(decoded.compatible);
+    }
+
+    #[test]
+    fn version_status_payload_roundtrip_incompatible() {
+        let p = VersionStatusPayload {
+            daemon_version: "0.0.1".to_string(),
+            compatible: false,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let decoded: VersionStatusPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, p);
+        assert!(!decoded.compatible);
+    }
+
+    #[test]
+    fn version_handshake_as_ipc_message() {
+        let payload = VersionHandshakePayload {
+            app_version: "1.2.3".to_string(),
+        };
+        let msg =
+            IpcMessage::new_decision("version.handshake", serde_json::to_value(&payload).unwrap());
+        assert_eq!(msg.kind, IpcKind::Decision);
+        assert_eq!(msg.msg_type, "version.handshake");
+        assert_eq!(msg.payload["app_version"], "1.2.3");
+    }
+
+    #[test]
+    fn version_status_as_ipc_message() {
+        let payload = VersionStatusPayload {
+            daemon_version: "0.0.1".to_string(),
+            compatible: true,
+        };
+        let msg = IpcMessage::new_event("version.status", serde_json::to_value(&payload).unwrap());
+        assert_eq!(msg.kind, IpcKind::Event);
+        assert_eq!(msg.msg_type, "version.status");
+        assert_eq!(msg.payload["daemon_version"], "0.0.1");
+        assert_eq!(msg.payload["compatible"], true);
     }
 }

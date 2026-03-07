@@ -2,6 +2,67 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## B-DEP-N2 — IPC Version Handshake + daemon.status in Default Mode
+
+Implements B-DEP-N2-1 and B-DEP-N2-2 to unblock N-STREAM-1 N6 execution.
+IPC clients must now send `version.handshake` as their first message after
+connecting. Daemon replies with `version.status` (compatibility result),
+then emits `daemon.status` if compatible. Strict enforcement from day one
+— no grace mode. Fail-closed on incompatible, malformed, missing, or late
+handshake.
+
+### Added
+- `VersionHandshakePayload` and `VersionStatusPayload` structs in
+  `src/ipc/types.rs` — typed payloads for version contract messages
+- `check_version_compatible()` in `src/ipc/server.rs` — strict
+  `major.minor` match rule (patch may differ)
+- Version handshake phase in `handle_client()` — synchronous blocking
+  read of first message, validation, version.status response, then
+  daemon.status emission before entering normal event/decision loop
+- `version.handshake` and `version.status` added to `parse_ipc_line()`
+  known message types
+- `HANDSHAKE_TIMEOUT` (5 seconds) and `DAEMON_VERSION` constants
+- IPC Version Handshake Contract section in `docs/DAEMON_CONTRACT.md`
+- daemon.status Emission section in `docs/DAEMON_CONTRACT.md`
+- Version handshake in `bolt-ipc-client` dev harness — sends
+  `version.handshake` as first message after connecting
+- 20 new tests: 5 payload type tests, 8 version compatibility tests,
+  7 handshake integration tests (full Unix socket round-trip)
+
+### Changed
+- `handle_client()` now accepts `ui_connected: &Arc<Mutex<bool>>` and
+  sets it only after successful handshake (was set unconditionally in
+  `listener_loop` before)
+- `listener_loop()` no longer sets `ui_connected = true` before calling
+  `handle_client()` — handshake must complete first
+- `daemon.status` is now emitted by the IPC server after successful
+  handshake, replacing manual emission in `run_simulate()`
+- `run_simulate()` no longer emits `daemon.status` manually (removed
+  `DaemonStatusPayload` construction + `emit_event` call)
+- Event ordering: `version.status` → `daemon.status` → normal events
+  (pre-handshake events drained per existing stale event drain)
+
+### Log Tokens
+- `[IPC_VERSION_COMPATIBLE]` — handshake succeeded
+- `[IPC_VERSION_INCOMPATIBLE]` — version mismatch, closing
+- `[IPC_HANDSHAKE_FAIL]` — malformed/missing/wrong first message
+
+### Invariants
+- No new DcMessage variants
+- No new EnvelopeError variants
+- No new canonical error codes
+- No protocol wire format changes
+- No cryptographic changes
+- Existing WebRTC/HELLO/envelope/transfer flows unchanged
+
+### Tests
+- Default: 338 (was 318, +20 new)
+- test-support: 418 + 3 ignored (was 398 + 3 ignored, +20 new)
+
+**Tag:** `daemon-v0.2.31-bdep-n2-ipc-unblock`
+
+---
+
 ## D-E2E-B — Cross-Implementation Bidirectional E2E Transfer (a8cf108)
 
 Cross-implementation bidirectional file transfer between Node.js offerer

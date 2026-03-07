@@ -121,6 +121,8 @@ pub(crate) struct Args {
     pub(crate) interop_signal: web_signal::InteropSignal,
     pub(crate) interop_hello: web_hello::InteropHelloMode,
     pub(crate) interop_dc: InteropDcMode,
+    pub(crate) socket_path: Option<String>,
+    pub(crate) data_dir: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -153,6 +155,8 @@ fn parse_args_from(argv: &[String]) -> Args {
     let mut interop_signal = None;
     let mut interop_hello = None;
     let mut interop_dc = None;
+    let mut socket_path = None;
+    let mut data_dir = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -395,6 +399,26 @@ fn parse_args_from(argv: &[String]) -> Args {
                     }
                 });
             }
+            "--socket-path" => {
+                i += 1;
+                socket_path = Some(match argv.get(i) {
+                    Some(p) if !p.is_empty() => p.clone(),
+                    _ => {
+                        eprintln!("--socket-path requires a non-empty path");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--data-dir" => {
+                i += 1;
+                data_dir = Some(match argv.get(i) {
+                    Some(p) if !p.is_empty() => p.clone(),
+                    _ => {
+                        eprintln!("--data-dir requires a non-empty path");
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -500,6 +524,8 @@ fn parse_args_from(argv: &[String]) -> Args {
         interop_signal: interop_signal_val,
         interop_hello: interop_hello_val,
         interop_dc: interop_dc_val,
+        socket_path,
+        data_dir,
     }
 }
 
@@ -1153,7 +1179,7 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} interop_dc={:?} timeout={}s",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} interop_dc={:?} timeout={}s socket_path={:?} data_dir={:?}",
         args.role,
         args.signal_mode,
         args.network_scope,
@@ -1162,19 +1188,24 @@ fn main() {
         args.interop_signal,
         args.interop_hello,
         args.interop_dc,
-        args.phase_timeout.as_secs()
+        args.phase_timeout.as_secs(),
+        args.socket_path,
+        args.data_dir,
     );
 
     match args.daemon_mode {
         DaemonMode::Default => {
             use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
-            use ipc::trust::default_trust_path;
+            use ipc::trust::{default_trust_path, trust_path_from_data_dir};
+
+            // Resolve socket path: explicit flag or default.
+            let socket_path_str = args.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);
 
             // Start IPC server for UI communication.
             // Fail-closed: if IPC start fails, pairing will deny all.
-            let ipc_server = match IpcServer::start(DEFAULT_SOCKET_PATH) {
+            let ipc_server = match IpcServer::start(socket_path_str) {
                 Ok(s) => {
-                    eprintln!("[bolt-daemon] IPC server started");
+                    eprintln!("[bolt-daemon] IPC server started on {socket_path_str}");
                     Some(s)
                 }
                 Err(e) => {
@@ -1185,17 +1216,32 @@ fn main() {
                     None
                 }
             };
-            let trust_path = default_trust_path();
+
+            // Resolve data-dir-dependent paths.
+            let data_dir_path = args.data_dir.as_ref().map(std::path::PathBuf::from);
+            let trust_path = match &data_dir_path {
+                Some(dd) => trust_path_from_data_dir(dd),
+                None => default_trust_path(),
+            };
+            let identity_path = match &data_dir_path {
+                Some(dd) => identity_store::resolve_identity_path_from_data_dir(dd),
+                None => match identity_store::resolve_identity_path() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[bolt-daemon] FATAL: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+            };
+
+            eprintln!(
+                "[bolt-daemon] identity_path={} trust_path={}",
+                identity_path.display(),
+                trust_path.display()
+            );
 
             // Load persistent identity once, before role dispatch.
             // Both rendezvous paths share the same long-lived keypair.
-            let identity_path = match identity_store::resolve_identity_path() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("[bolt-daemon] FATAL: {}", e);
-                    std::process::exit(1);
-                }
-            };
             let identity = match identity_store::load_or_create_identity(&identity_path) {
                 Ok(kp) => kp,
                 Err(e) => {
@@ -1215,7 +1261,7 @@ fn main() {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
                 (Role::Offerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_offerer_rendezvous(&args, &identity)
+                    rendezvous::run_offerer_rendezvous(&args, &trust_path, &identity)
                 }
                 (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(
                     &args,
@@ -1468,5 +1514,119 @@ mod tests {
         ]);
         let args = parse_args_from(&argv);
         assert_eq!(args.signal_mode, SignalMode::File);
+    }
+
+    // ── N6-B1: --socket-path and --data-dir CLI parse tests ──
+
+    #[test]
+    fn n6b1_socket_path_parsed() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+            "--socket-path",
+            "/run/user/1000/bolt.sock",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(
+            args.socket_path.as_deref(),
+            Some("/run/user/1000/bolt.sock")
+        );
+    }
+
+    #[test]
+    fn n6b1_data_dir_parsed() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+            "--data-dir",
+            "/opt/localbolt/data",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.data_dir.as_deref(), Some("/opt/localbolt/data"));
+    }
+
+    #[test]
+    fn n6b1_both_flags_parsed() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+            "--socket-path",
+            "/tmp/custom.sock",
+            "--data-dir",
+            "/custom/data",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.socket_path.as_deref(), Some("/tmp/custom.sock"));
+        assert_eq!(args.data_dir.as_deref(), Some("/custom/data"));
+    }
+
+    #[test]
+    fn n6b1_defaults_when_omitted() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+        ]);
+        let args = parse_args_from(&argv);
+        assert!(args.socket_path.is_none());
+        assert!(args.data_dir.is_none());
+    }
+
+    #[test]
+    fn n6b1_socket_path_with_rendezvous_mode() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "rendezvous",
+            "--room",
+            "test-room",
+            "--session",
+            "test-session",
+            "--to",
+            "peer-abc",
+            "--socket-path",
+            "/var/run/bolt.sock",
+            "--data-dir",
+            "/home/user/.local/share/localbolt",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.socket_path.as_deref(), Some("/var/run/bolt.sock"));
+        assert_eq!(
+            args.data_dir.as_deref(),
+            Some("/home/user/.local/share/localbolt")
+        );
+        assert_eq!(args.signal_mode, SignalMode::Rendezvous);
     }
 }

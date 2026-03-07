@@ -2,6 +2,56 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## N6-B1 — `--socket-path` and `--data-dir` CLI Flags (B-DEP-N1-1)
+
+Resolves B-DEP-N1-1: daemon path configurability for platform-appropriate
+filesystem locations. The app (localbolt-app) can now pass platform-correct
+socket and data paths when spawning the daemon as a sidecar.
+
+### Added
+- `--socket-path <path>` CLI flag — overrides default IPC socket location
+  (`/tmp/bolt-daemon.sock`). Used by app to place socket at
+  platform-appropriate runtime path (e.g. `$XDG_RUNTIME_DIR`,
+  `$TMPDIR`, `\\.\pipe\` on Windows).
+- `--data-dir <path>` CLI flag — overrides default data directory. When
+  set, identity key resolves to `<data-dir>/identity.key` and trust
+  store to `<data-dir>/pins/trust.json`. Supersedes `BOLT_IDENTITY_PATH`
+  env var and `default_trust_path()`.
+- `resolve_identity_path_from_data_dir()` in `src/identity_store.rs`
+- `trust_path_from_data_dir()` in `src/ipc/trust.rs`
+- 13 integration tests in `tests/n6b1_path_flags.rs` covering CLI parse,
+  path resolution, custom socket, stale cleanup, identity persistence,
+  trust store structure, containment, and regression
+- 6 unit tests in `src/main.rs` for CLI parse of new flags
+- 4 unit tests in `src/identity_store.rs` and `src/ipc/trust.rs` for
+  path resolution functions
+
+### Changed
+- `run_offerer_rendezvous()` now accepts `trust_path: &Path` parameter
+  instead of calling `default_trust_path()` internally — both offerer
+  and answerer trust paths now flow from `fn main()` resolution
+- Default mode startup logs now include `socket_path` and `data_dir`
+  values, and prints resolved `identity_path` and `trust_path`
+- Startup log includes new fields for observability
+
+### Data Dir Contract
+- Identity key: `<data-dir>/identity.key`
+- TOFU pin store: `<data-dir>/pins/trust.json`
+- No config currently persisted by daemon (N/A)
+- No writes outside `data-dir` for daemon-owned state
+
+### Safe Defaults (flags omitted)
+- Socket: `/tmp/bolt-daemon.sock` (unchanged)
+- Identity: `$BOLT_IDENTITY_PATH` or `$HOME/.bolt/identity.key` (unchanged)
+- Trust: `$HOME/.config/bolt-daemon/trust.json` (unchanged)
+
+### N2 Wire Contract
+- No changes to IPC message types, payloads, or handshake
+- No changes to version compatibility rules
+- `--socket-path` and `--data-dir` are daemon-side only (not in IPC)
+
+---
+
 ## B-DEP-N2 — IPC Version Handshake + daemon.status in Default Mode
 
 Implements B-DEP-N2-1 and B-DEP-N2-2 to unblock N-STREAM-1 N6 execution.

@@ -83,6 +83,14 @@ pub fn default_trust_path() -> PathBuf {
     PathBuf::from(home).join(".config/bolt-daemon/trust.json")
 }
 
+/// Resolve trust store path from an explicit data directory.
+///
+/// Returns `<data_dir>/pins/trust.json`. Takes precedence over
+/// `default_trust_path()` when `--data-dir` is provided.
+pub fn trust_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("pins").join("trust.json")
+}
+
 /// Persistent trust decisions keyed by `identity_key_hex`.
 ///
 /// Keys are lowercase hex-encoded 32-byte identity public keys (64 chars).
@@ -570,6 +578,21 @@ mod tests {
             path_str.contains(".config/bolt-daemon/trust.json"),
             "unexpected path: {path_str}"
         );
+    }
+
+    #[test]
+    fn trust_path_from_data_dir_structure() {
+        let dd = PathBuf::from("/opt/localbolt");
+        let path = trust_path_from_data_dir(&dd);
+        assert_eq!(path, PathBuf::from("/opt/localbolt/pins/trust.json"));
+    }
+
+    #[test]
+    fn trust_path_from_data_dir_roundtrip() {
+        let dd = temp_trust_path().parent().unwrap().to_path_buf();
+        let path = trust_path_from_data_dir(&dd);
+        assert!(path.ends_with("pins/trust.json"));
+        assert!(path.starts_with(&dd));
     }
 
     // ── B5: identity_key_hex ────────────────────────────────

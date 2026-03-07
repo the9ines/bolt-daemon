@@ -4,16 +4,17 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.31-bdep-n2-ipc-unblock` |
-| Commit (main) | `1ad2db8` |
+| Tag (main) | `daemon-v0.2.32-n6b1-path-flags` |
+| Commit (main) | `810043f` |
 | Branch | `main` |
-| Phase | B-DEP-N2-1 + B-DEP-N2-2: IPC version handshake + daemon.status in default mode |
+| Phase | N6-B1: B-DEP-N1-1 — `--socket-path` and `--data-dir` CLI flags |
 
 ## Test Status
 
-- 418 tests with test-support + 3 ignored E2E (338 default)
+- 440 tests with test-support + 3 ignored E2E (345 default + 13 N6-B1 integration)
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
+- `scripts/check_no_panic.sh` PASS
 - E2E harness (`scripts/e2e_rendezvous_local.sh`) PASS
 
 ## H-Phase Status
@@ -29,6 +30,7 @@
 | B3-P3 | DONE | Sender-side transfer MVP, `daemon-v0.2.29-b3-transfer-sm-p3-sender` (`4fd55e3`) |
 | D-E2E-B | DONE | Cross-impl bidirectional TS↔Rust E2E transfer, `daemon-v0.2.30-d-e2e-b-cross-impl` (`a8cf108`) |
 | B-DEP-N2 | DONE | IPC version handshake + daemon.status in default mode, `daemon-v0.2.31-bdep-n2-ipc-unblock` |
+| N6-B1 | DONE | `--socket-path` and `--data-dir` CLI flags (B-DEP-N1-1), `daemon-v0.2.32-n6b1-path-flags` |
 
 ## Daemon Modes
 
@@ -45,6 +47,8 @@
 | `--interop-signal` | `daemon_v1`, `web_v1` | `daemon_v1` | Inner signaling payload format |
 | `--interop-hello` | `daemon_hello_v1`, `web_hello_v1` | `daemon_hello_v1` | HELLO handshake protocol |
 | `--interop-dc` | `daemon_dc_v1`, `web_dc_v1` | `daemon_dc_v1` | Post-HELLO DataChannel mode |
+| `--socket-path` | `<path>` | `/tmp/bolt-daemon.sock` | IPC Unix socket path |
+| `--data-dir` | `<path>` | `~/.bolt` (identity), `~/.config/bolt-daemon` (trust) | Data directory for identity key + TOFU pins |
 
 - `web_dc_v1` requires `--interop-hello web_hello_v1` (and transitively rendezvous + web_v1)
 - `web_hello_v1` requires `--signal rendezvous` + `--interop-signal web_v1` (fail-closed validation)
@@ -129,14 +133,16 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 ## Pairing Approval (EVENT-1)
 
 - Answerer-only: offerer explicitly chose to connect
-- Trust store: `~/.config/bolt-daemon/trust.json` keyed by `from_peer`
+- Trust store default: `~/.config/bolt-daemon/trust.json`
+- Trust store with `--data-dir`: `<data-dir>/pins/trust.json`
 - `--pairing-policy {ask, deny, allow}` CLI flag (default: ask)
 - Fail-closed: no IPC server or no UI connected → deny all
 - Stored decisions: `allow_always` / `deny_always` persist; `_once` variants do not
 
 ## IPC Channel (EVENT-0)
 
-- Transport: Unix domain socket at `/tmp/bolt-daemon.sock` (chmod 600)
+- Transport: Unix domain socket (chmod 600)
+- Default path: `/tmp/bolt-daemon.sock` (override via `--socket-path <path>`)
 - Protocol: NDJSON (line-delimited JSON, 1 MiB cap per line)
 - Client policy: single-client, new connection kicks old
 - Fail-closed: no UI connected = pending/deny

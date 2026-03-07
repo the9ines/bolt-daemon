@@ -184,6 +184,15 @@ pub fn load_or_create_identity(path: &Path) -> Result<IdentityKeyPair, IdentityS
     }
 }
 
+/// Resolve identity key path from an explicit data directory.
+///
+/// Returns `<data_dir>/identity.key`. The data_dir is used as-is (no
+/// environment variable resolution). This takes precedence over
+/// `resolve_identity_path()` when `--data-dir` is provided.
+pub fn resolve_identity_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(DEFAULT_FILE_NAME)
+}
+
 // ── Internal helpers ────────────────────────────────────────
 
 /// Load and validate an existing identity key file.
@@ -296,6 +305,21 @@ mod tests {
             Some(v) => std::env::set_var("BOLT_IDENTITY_PATH", v),
             None => std::env::remove_var("BOLT_IDENTITY_PATH"),
         }
+    }
+
+    #[test]
+    fn resolve_from_data_dir_appends_key_name() {
+        let dd = PathBuf::from("/custom/data");
+        let path = resolve_identity_path_from_data_dir(&dd);
+        assert_eq!(path, PathBuf::from("/custom/data/identity.key"));
+    }
+
+    #[test]
+    fn resolve_from_data_dir_preserves_trailing_slash() {
+        let dd = PathBuf::from("/custom/data/");
+        let path = resolve_identity_path_from_data_dir(&dd);
+        // PathBuf normalizes trailing slash
+        assert_eq!(path, PathBuf::from("/custom/data/identity.key"));
     }
 
     #[test]

@@ -54,6 +54,6 @@ pub mod test_support {
     // Identity store
     pub use crate::identity_store::{
         ensure_parent_dir_secure, load_or_create_identity, resolve_identity_path,
-        validate_file_mode_0600, IdentityStoreError,
+        resolve_identity_path_from_data_dir, validate_file_mode_0600, IdentityStoreError,
     };
 }

@@ -50,6 +50,8 @@ The mode MUST be selected at startup. There is no runtime fallback between modes
 |------|---------|-------|
 | `--phase-timeout-secs` | `30` | Positive integer. Controls all phase deadlines. |
 | `--network-scope` | `lan` | Values: `lan`, `overlay`, `global` |
+| `--socket-path` | `/tmp/bolt-daemon.sock` | IPC Unix socket path. Non-empty string required. |
+| `--data-dir` | `~/.bolt` (identity), `~/.config/bolt-daemon` (trust) | Unified data directory. When set: identity at `<path>/identity.key`, trust at `<path>/pins/trust.json`. |
 
 ### Fail-Closed Rules (Rendezvous)
 

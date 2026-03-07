@@ -884,6 +884,7 @@ pub(crate) fn run_post_hello_loop(
 /// If the server is down or peer is unreachable, exit 1.
 pub fn run_offerer_rendezvous(
     args: &Args,
+    trust_path: &std::path::Path,
     identity: &bolt_core::identity::IdentityKeyPair,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed: these are validated in parse_args() but double-check here
@@ -1130,10 +1131,8 @@ pub fn run_offerer_rendezvous(
             identity_key_hex
         );
 
-        // Offerer has no Stage A — pass None. Use default trust path.
-        let offerer_trust_path = crate::ipc::trust::default_trust_path();
-        let stage_b =
-            crate::ipc::trust::enforce_stage_b(&offerer_trust_path, &identity_key_hex, None);
+        // Offerer has no Stage A — pass None. Trust path from caller.
+        let stage_b = crate::ipc::trust::enforce_stage_b(trust_path, &identity_key_hex, None);
         if stage_b == crate::ipc::trust::StageBResult::Deny {
             return Err(format!(
                 "[B5_STAGE_B] offerer: identity '{}' denied by TOFU pin — aborting",

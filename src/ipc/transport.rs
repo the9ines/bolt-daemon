@@ -48,9 +48,18 @@ impl IpcListener {
     /// On Windows with pipe path: creates a named pipe with current-user-only DACL.
     pub fn bind(path: &str) -> io::Result<(Self, PathBuf)> {
         #[cfg(windows)]
-        if is_windows_pipe_path(path) {
-            let listener = windows_pipe::NamedPipeListener::bind(path)?;
-            return Ok((Self::NamedPipe(listener), PathBuf::from(path)));
+        {
+            if is_windows_pipe_path(path) {
+                let listener = windows_pipe::NamedPipeListener::bind(path)?;
+                return Ok((Self::NamedPipe(listener), PathBuf::from(path)));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "on Windows, IPC path must be a named pipe (\\\\.\\ pipe\\...), got: {}",
+                    path
+                ),
+            ));
         }
 
         #[cfg(unix)]

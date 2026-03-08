@@ -19,6 +19,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -30,12 +31,15 @@ use bolt_core::identity::IdentityKeyPair;
 const KEY_FILE_LEN: usize = 64;
 
 /// Required file mode for the identity key file.
+#[cfg_attr(not(unix), allow(dead_code))]
 const KEY_FILE_MODE: u32 = 0o600;
 
 /// Required directory mode for the parent directory when created.
+#[cfg_attr(not(unix), allow(dead_code))]
 const KEY_DIR_MODE: u32 = 0o700;
 
 /// Maximum acceptable directory mode (owner-only permissions).
+#[cfg_attr(not(unix), allow(dead_code))]
 const KEY_DIR_MAX_MODE: u32 = 0o700;
 
 /// Environment variable for custom identity path override.
@@ -135,35 +139,51 @@ pub fn ensure_parent_dir_secure(path: &Path) -> Result<(), IdentityStoreError> {
     };
 
     if parent.exists() {
-        let meta = fs::metadata(parent)?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & !KEY_DIR_MAX_MODE != 0 {
-            return Err(IdentityStoreError::DirTooPermissive {
-                path: parent.to_path_buf(),
-                mode,
-            });
+        #[cfg(unix)]
+        {
+            let meta = fs::metadata(parent)?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & !KEY_DIR_MAX_MODE != 0 {
+                return Err(IdentityStoreError::DirTooPermissive {
+                    path: parent.to_path_buf(),
+                    mode,
+                });
+            }
         }
         Ok(())
     } else {
         fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(KEY_DIR_MODE))?;
-        eprintln!(
-            "[IDENTITY] created directory {:?} (mode {:04o})",
-            parent, KEY_DIR_MODE
-        );
+        #[cfg(unix)]
+        {
+            fs::set_permissions(parent, fs::Permissions::from_mode(KEY_DIR_MODE))?;
+            eprintln!(
+                "[IDENTITY] created directory {:?} (mode {:04o})",
+                parent, KEY_DIR_MODE
+            );
+        }
         Ok(())
     }
 }
 
 /// Validate that a key file has mode 0600.
+///
+/// On Windows, mode bits are not available; this is a no-op (security is
+/// handled by DACL / named-pipe ACLs instead).
 pub fn validate_file_mode_0600(path: &Path) -> Result<(), IdentityStoreError> {
-    let meta = fs::metadata(path)?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != KEY_FILE_MODE {
-        return Err(IdentityStoreError::FileTooPermissive {
-            path: path.to_path_buf(),
-            mode,
-        });
+    #[cfg(unix)]
+    {
+        let meta = fs::metadata(path)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != KEY_FILE_MODE {
+            return Err(IdentityStoreError::FileTooPermissive {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
     Ok(())
 }
@@ -247,6 +267,7 @@ fn create_identity(path: &Path) -> Result<IdentityKeyPair, IdentityStoreError> {
     let tmp_path = parent.join(&tmp_name);
 
     fs::write(&tmp_path, buf)?;
+    #[cfg(unix)]
     fs::set_permissions(&tmp_path, fs::Permissions::from_mode(KEY_FILE_MODE))?;
     fs::rename(&tmp_path, path)?;
 

@@ -27,6 +27,7 @@ use super::types::{Decision, IpcMessage, PairingRequestPayload};
 const DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Required file mode for the trust store file.
+#[cfg_attr(not(unix), allow(dead_code))]
 const TRUST_FILE_MODE: u32 = 0o600;
 
 // ── Pairing Policy ──────────────────────────────────────────
@@ -146,8 +147,6 @@ impl TrustStore {
     ///
     /// Fail-closed: if permission setting fails, the error is propagated.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -159,8 +158,12 @@ impl TrustStore {
         // Write to temp file
         std::fs::write(&tmp_path, &contents)?;
 
-        // Set 0600 on temp file before rename
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(TRUST_FILE_MODE))?;
+        // Set 0600 on temp file before rename (Unix only; Windows uses ACLs)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(TRUST_FILE_MODE))?;
+        }
 
         // fsync best-effort
         if let Ok(f) = std::fs::File::open(&tmp_path) {
@@ -170,17 +173,21 @@ impl TrustStore {
         // Atomic rename
         std::fs::rename(&tmp_path, path)?;
 
-        // Verify final mode
-        let meta = std::fs::metadata(path)?;
-        let actual = meta.permissions().mode() & 0o777;
-        if actual != TRUST_FILE_MODE {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "trust file mode {:04o} != expected {:04o}",
-                    actual, TRUST_FILE_MODE
-                ),
-            ));
+        // Verify final mode (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(path)?;
+            let actual = meta.permissions().mode() & 0o777;
+            if actual != TRUST_FILE_MODE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "trust file mode {:04o} != expected {:04o}",
+                        actual, TRUST_FILE_MODE
+                    ),
+                ));
+            }
         }
 
         Ok(())
@@ -401,6 +408,7 @@ pub fn check_pairing_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -767,6 +775,7 @@ mod tests {
 
     // ── B5: 0600 permissions ────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn save_enforces_0600_permissions() {
         let path = temp_trust_path();

@@ -549,7 +549,17 @@ fn test_send_offer(
 ) -> Option<Vec<u8>> {
     let d = std::fs::read(path).ok().filter(|v| !v.is_empty())?;
     let fh = ctx.has_capability("bolt.file-hash");
-    let o = ss.begin_send(d, "test-send.bin", fh).ok()?;
+    let hash = if fh {
+        Some(bolt_core::hash::sha256_hex(&d))
+    } else {
+        None
+    };
+    // Generate daemon-local transfer ID
+    let tid = format!("daemon-send-{:016x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() & 0xFFFF_FFFF_FFFF_FFFF);
+    let o = ss.begin_send(&tid, d, "test-send.bin", hash).ok()?;
     let j = crate::dc_messages::encode_dc_message(&crate::dc_messages::DcMessage::FileOffer {
         transfer_id: o.transfer_id,
         filename: o.filename,
@@ -776,7 +786,8 @@ pub(crate) fn run_post_hello_loop(
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileFinish { transfer_id, .. }) => {
-                        match transfer.on_file_finish(&transfer_id) {
+                        let verifier = crate::transfer::Sha256Verifier;
+                        match transfer.on_file_finish(&transfer_id, Some(&verifier)) {
                             Ok(()) => {
                                 if transfer.hash_verified() {
                                     eprintln!(

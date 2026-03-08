@@ -85,6 +85,7 @@ version = "0.0.1"
 dependencies = [
  "bolt-core",
  "bolt-rendezvous-protocol",
+ "bolt-transfer-core",
  "datachannel",
  "rand",
  "serde",
@@ -103,6 +104,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "bolt-transfer-core"
+version = "0.1.0"
 
 [[package]]
 name = "byteorder"

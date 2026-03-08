@@ -71,9 +71,10 @@ pub mod test_support {
     // Inner messages
     pub use crate::dc_messages::{encode_dc_message, parse_dc_message, DcMessage, DcParseError};
 
-    // Transfer SM
+    // Transfer SM (re-exported from bolt-transfer-core via adapter)
     pub use crate::transfer::{
-        SendChunk, SendOffer, SendSession, SendState, TransferError, TransferSession, TransferState,
+        SendChunk, SendOffer, SendSession, SendState, Sha256Verifier, TransferError,
+        TransferSession, TransferState,
     };
 
     // Identity store

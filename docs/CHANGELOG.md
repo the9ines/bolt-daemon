@@ -2,6 +2,39 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## T-STREAM-0 — Transfer Core Adapter (daemon-v0.2.36-tstream0-adapter) — 2026-03-08
+
+Daemon now consumes `bolt-transfer-core` crate instead of inline state machines.
+`src/transfer.rs` becomes a thin adapter/facade re-exporting from the core crate.
+
+### Changed
+- `src/transfer.rs` — replaced 1,188-line inline SM with thin adapter (47 lines):
+  - Re-exports `ReceiveSession`, `SendSession`, `TransferState`, `TransferError`, etc.
+  - Legacy type aliases (`TransferSession`, `SendState`) for backward compat
+  - `Sha256Verifier` — daemon-specific `IntegrityVerifier` impl using `bolt_core::hash`
+- `src/rendezvous.rs` — adapted to new `on_file_finish()` signature (verifier param)
+  and `begin_send()` signature (caller-provided transfer_id and hash)
+- `src/lib.rs` — added `Sha256Verifier` to test_support re-exports
+- `Cargo.toml` — added `bolt-transfer-core` path dependency
+
+### Evidence
+- 362 tests pass (195 lib + 128 main + 15 relay + 13 n6b1 + 11 n6b2), 0 regressions
+- `cargo clippy -- -D warnings` clean
+- `scripts/check_no_panic.sh` PASS
+- Zero duplicated SM logic (all state machines in bolt-transfer-core)
+
+### Files Changed
+- `Cargo.toml`
+- `src/transfer.rs`
+- `src/rendezvous.rs`
+- `src/lib.rs`
+- `docs/STATE.md`
+- `docs/CHANGELOG.md`
+
+**Tag:** `daemon-v0.2.36-tstream0-adapter`
+
+---
+
 ## N6-B2 — Windows Named Pipe Transport (B-DEP-N2-3)
 
 Resolves B-DEP-N2-3: transport abstraction supporting both Unix domain

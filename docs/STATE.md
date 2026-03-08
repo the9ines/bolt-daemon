@@ -4,10 +4,9 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.33-n6b2-windows-pipe` |
-| Commit (main) | `5ae8419` |
+| Tag (main) | `daemon-v0.2.36-tstream0-adapter` |
 | Branch | `main` |
-| Phase | N6-B2: B-DEP-N2-3 — Windows named pipe transport |
+| Phase | T-STREAM-0: Transfer core adapter — consumes `bolt-transfer-core` |
 
 ## Test Status
 

@@ -26,6 +26,7 @@ test-support = []
 
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
+bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
 datachannel = { version = "0.16", features = ["vendored"] }
 webrtc-sdp = "0.3"

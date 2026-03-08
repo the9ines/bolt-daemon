@@ -435,7 +435,7 @@ pub(crate) mod windows_pipe {
     // ── Named Pipe Listener ─────────────────────────────────
 
     /// Windows named pipe listener (server-side).
-    pub(crate) struct NamedPipeListener {
+    pub struct NamedPipeListener {
         handle: HANDLE,
         #[allow(dead_code)]
         pipe_name: Vec<u16>,
@@ -528,7 +528,7 @@ pub(crate) mod windows_pipe {
             let dup = duplicate_handle(self.handle)?;
 
             // Switch the duplicate to blocking mode for I/O.
-            let mut mode: u32 = PIPE_READMODE_BYTE | PIPE_WAIT;
+            let mode: u32 = PIPE_READMODE_BYTE | PIPE_WAIT;
             let ok = unsafe {
                 SetNamedPipeHandleState(dup, &mode, std::ptr::null_mut(), std::ptr::null_mut())
             };
@@ -574,8 +574,7 @@ pub(crate) mod windows_pipe {
     impl NamedPipeStream {
         /// Set blocking or non-blocking mode.
         pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-            let mut mode: u32 =
-                PIPE_READMODE_BYTE | if nonblocking { PIPE_NOWAIT } else { PIPE_WAIT };
+            let mode: u32 = PIPE_READMODE_BYTE | if nonblocking { PIPE_NOWAIT } else { PIPE_WAIT };
             let ok = unsafe {
                 SetNamedPipeHandleState(
                     self.handle,

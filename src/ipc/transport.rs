@@ -53,13 +53,13 @@ impl IpcListener {
                 let listener = windows_pipe::NamedPipeListener::bind(path)?;
                 return Ok((Self::NamedPipe(listener), PathBuf::from(path)));
             }
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "on Windows, IPC path must be a named pipe (\\\\.\\ pipe\\...), got: {}",
                     path
                 ),
-            ));
+            ))
         }
 
         #[cfg(unix)]
@@ -437,6 +437,7 @@ pub(crate) mod windows_pipe {
     /// Windows named pipe listener (server-side).
     pub(crate) struct NamedPipeListener {
         handle: HANDLE,
+        #[allow(dead_code)]
         pipe_name: Vec<u16>,
     }
 
@@ -529,7 +530,7 @@ pub(crate) mod windows_pipe {
             // Switch the duplicate to blocking mode for I/O.
             let mut mode: u32 = PIPE_READMODE_BYTE | PIPE_WAIT;
             let ok = unsafe {
-                SetNamedPipeHandleState(dup, &mut mode, std::ptr::null_mut(), std::ptr::null_mut())
+                SetNamedPipeHandleState(dup, &mode, std::ptr::null_mut(), std::ptr::null_mut())
             };
             if ok == 0 {
                 unsafe { CloseHandle(dup) };
@@ -560,7 +561,7 @@ pub(crate) mod windows_pipe {
     // ── Named Pipe Stream ───────────────────────────────────
 
     /// Windows named pipe stream (connected client handle).
-    pub(crate) struct NamedPipeStream {
+    pub struct NamedPipeStream {
         handle: HANDLE,
         /// Read timeout in milliseconds. 0 = no timeout (blocking).
         read_timeout_ms: AtomicU64,
@@ -578,7 +579,7 @@ pub(crate) mod windows_pipe {
             let ok = unsafe {
                 SetNamedPipeHandleState(
                     self.handle,
-                    &mut mode,
+                    &mode,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 )

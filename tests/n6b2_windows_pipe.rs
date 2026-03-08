@@ -4,6 +4,7 @@
 //! - Transport detection: all platforms (path format classification)
 //! - Unix regression: unix-only (IpcServer with IpcStream through transport layer)
 //! - Windows pipe: windows-only (NamedPipeListener + NamedPipeStream lifecycle)
+//! - Windows regression (R17): windows-only (N2 handshake/reconnect/fail-closed through named pipe)
 //! - Handshake ordering: unix (N2 handshake semantics through transport layer)
 //! - Reconnect/single-client: unix (kick-on-reconnect through transport layer)
 
@@ -60,6 +61,14 @@ fn default_ipc_path_not_empty() {
 #[test]
 fn default_ipc_path_is_unix_on_unix() {
     assert!(bolt_daemon::IPC_DEFAULT_PATH.ends_with(".sock"));
+}
+
+#[cfg(windows)]
+#[test]
+fn default_ipc_path_is_pipe_on_windows() {
+    assert!(bolt_daemon::ipc_transport_is_windows_pipe(
+        bolt_daemon::IPC_DEFAULT_PATH
+    ));
 }
 
 // ── Unix Regression: IpcServer through transport layer ──────
@@ -246,12 +255,11 @@ mod windows_pipe_tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
-    /// Verify named pipe client connection lifecycle.
+    /// Verify named pipe client connection lifecycle (version.status + daemon.status).
     #[test]
     fn named_pipe_connection_lifecycle() {
         use bolt_daemon::ipc_server_start;
         use std::fs::OpenOptions;
-        use std::os::windows::fs::OpenOptionsExt;
 
         let pipe_path = r"\\.\pipe\bolt-n6b2-test-lifecycle";
         let server = ipc_server_start(pipe_path).unwrap();
@@ -276,7 +284,7 @@ mod windows_pipe_tests {
         (&client).write_all(line.as_bytes()).unwrap();
         (&client).flush().unwrap();
 
-        // Read version.status + daemon.status.
+        // Read version.status.
         let mut reader = BufReader::new(&client);
         let mut resp = String::new();
         reader.read_line(&mut resp).unwrap();
@@ -284,9 +292,169 @@ mod windows_pipe_tests {
         assert_eq!(parsed["type"], "version.status");
         assert_eq!(parsed["payload"]["compatible"], true);
 
+        // Read daemon.status (must follow version.status — N2 ordering).
+        let mut resp2 = String::new();
+        reader.read_line(&mut resp2).unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(parsed2["type"], "daemon.status");
+        assert_eq!(parsed2["payload"]["ui_connected"], true);
+
         std::thread::sleep(Duration::from_millis(100));
         assert!(server.is_ui_connected());
 
+        drop(client);
+        drop(server);
+    }
+}
+
+// ── Windows Regression: N2 semantics through named pipe (R17) ──
+
+#[cfg(windows)]
+mod windows_regression {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Duration;
+
+    fn unique_pipe_path(test_name: &str) -> String {
+        format!(
+            r"\\.\pipe\bolt-r17-{}-{}",
+            test_name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn open_pipe(path: &str) -> std::fs::File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("failed to connect to named pipe")
+    }
+
+    fn send_handshake(client: &std::fs::File, app_version: &str) {
+        let msg = serde_json::json!({
+            "id": "cli-0",
+            "kind": "decision",
+            "type": "version.handshake",
+            "ts_ms": 0,
+            "payload": { "app_version": app_version }
+        });
+        let mut line = serde_json::to_string(&msg).unwrap();
+        line.push('\n');
+        (&*client).write_all(line.as_bytes()).unwrap();
+        (&*client).flush().unwrap();
+    }
+
+    fn read_line(reader: &mut BufReader<&std::fs::File>) -> Option<serde_json::Value> {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => serde_json::from_str(&line).ok(),
+            Err(_) => None,
+        }
+    }
+
+    /// R17-A4: Verify N2 handshake ordering through Windows named pipe.
+    /// version.handshake → version.status → daemon.status
+    #[test]
+    fn n2_handshake_ordering_through_named_pipe() {
+        use bolt_daemon::ipc_server_start;
+
+        let path = unique_pipe_path("handshake");
+        let server = ipc_server_start(&path).unwrap();
+
+        let client = open_pipe(&path);
+        send_handshake(&client, env!("CARGO_PKG_VERSION"));
+
+        let mut reader = BufReader::new(&client);
+
+        // First: version.status
+        let msg1 = read_line(&mut reader).expect("expected version.status");
+        assert_eq!(msg1["type"], "version.status");
+        assert_eq!(msg1["payload"]["compatible"], true);
+
+        // Second: daemon.status
+        let msg2 = read_line(&mut reader).expect("expected daemon.status");
+        assert_eq!(msg2["type"], "daemon.status");
+        assert_eq!(msg2["payload"]["ui_connected"], true);
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(server.is_ui_connected());
+
+        drop(reader);
+        drop(client);
+        drop(server);
+    }
+
+    /// R17-A5: Verify single-client kick-on-reconnect through Windows named pipe.
+    #[test]
+    fn single_client_kick_on_reconnect_through_named_pipe() {
+        use bolt_daemon::ipc_server_start;
+
+        let path = unique_pipe_path("reconnect");
+        let server = ipc_server_start(&path).unwrap();
+
+        // First client connects and completes handshake.
+        let client1 = open_pipe(&path);
+        send_handshake(&client1, env!("CARGO_PKG_VERSION"));
+        let mut r1 = BufReader::new(&client1);
+        let _ = read_line(&mut r1); // version.status
+        let _ = read_line(&mut r1); // daemon.status
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(server.is_ui_connected());
+
+        // Disconnect first client.
+        drop(r1);
+        drop(client1);
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Second client connects — should succeed (kick semantics).
+        let client2 = open_pipe(&path);
+        send_handshake(&client2, env!("CARGO_PKG_VERSION"));
+        let mut r2 = BufReader::new(&client2);
+
+        let msg1 = read_line(&mut r2).expect("expected version.status for client2");
+        assert_eq!(msg1["type"], "version.status");
+        assert_eq!(msg1["payload"]["compatible"], true);
+
+        let msg2 = read_line(&mut r2).expect("expected daemon.status for client2");
+        assert_eq!(msg2["type"], "daemon.status");
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(server.is_ui_connected());
+
+        drop(r2);
+        drop(client2);
+        drop(server);
+    }
+
+    /// R17-A4: Verify incompatible version fails closed through Windows named pipe.
+    #[test]
+    fn incompatible_version_fails_closed_through_named_pipe() {
+        use bolt_daemon::ipc_server_start;
+
+        let path = unique_pipe_path("incompat");
+        let server = ipc_server_start(&path).unwrap();
+
+        let client = open_pipe(&path);
+        send_handshake(&client, "99.99.0");
+        let mut reader = BufReader::new(&client);
+
+        let msg = read_line(&mut reader).expect("expected version.status");
+        assert_eq!(msg["payload"]["compatible"], false);
+
+        // Should disconnect — no daemon.status.
+        let next = read_line(&mut reader);
+        assert!(next.is_none());
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!server.is_ui_connected());
+
+        drop(reader);
         drop(client);
         drop(server);
     }

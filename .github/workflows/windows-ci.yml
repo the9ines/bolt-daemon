@@ -1,0 +1,41 @@
+name: Windows CI (R17)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-check:
+    name: Windows Runtime Validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout bolt-daemon
+        uses: actions/checkout@v4
+        with:
+          path: bolt-daemon
+
+      - name: Checkout bolt-core-sdk (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: the9ines/bolt-core-sdk
+          path: bolt-core-sdk
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        working-directory: bolt-daemon
+        run: cargo fmt --check
+
+      - name: cargo clippy (deny warnings)
+        working-directory: bolt-daemon
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test (default features)
+        working-directory: bolt-daemon
+        run: cargo test -- --nocapture
+
+      - name: cargo test (test-support feature)
+        working-directory: bolt-daemon
+        run: cargo test --features test-support -- --nocapture

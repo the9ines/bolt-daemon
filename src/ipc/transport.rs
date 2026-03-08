@@ -34,7 +34,7 @@ pub const DEFAULT_IPC_PATH: &str = r"\\.\pipe\bolt-daemon";
 // ── IPC Listener ────────────────────────────────────────────
 
 /// Platform-aware IPC listener. Wraps Unix domain socket or Windows named pipe.
-pub(crate) enum IpcListener {
+pub enum IpcListener {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixListener),
     #[cfg(windows)]
@@ -123,7 +123,7 @@ impl IpcListener {
 // ── IPC Stream ──────────────────────────────────────────────
 
 /// Platform-aware IPC stream (connected client).
-pub(crate) enum IpcStream {
+pub enum IpcStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     #[cfg(windows)]

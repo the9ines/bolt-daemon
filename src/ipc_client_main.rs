@@ -1,19 +1,16 @@
 //! bolt-ipc-client — Dev harness for the daemon IPC channel.
 //!
-//! Connects to the bolt-daemon Unix socket, prints incoming events,
-//! and auto-replies to approval prompts.
+//! Connects to the bolt-daemon IPC endpoint (Unix socket or Windows named pipe),
+//! prints incoming events, and auto-replies to approval prompts.
 //!
 //! Usage:
 //!   bolt-ipc-client [--socket <path>] [--auto-allow]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-
-const DEFAULT_SOCKET: &str = "/tmp/bolt-daemon.sock";
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let mut socket_path = DEFAULT_SOCKET.to_string();
+    let mut socket_path = bolt_daemon::IPC_DEFAULT_PATH.to_string();
     let mut auto_allow = false;
 
     let mut i = 1;
@@ -45,23 +42,7 @@ fn main() {
     };
     eprintln!("[ipc-client] connecting to {socket_path} (auto-reply: {decision_str})");
 
-    let stream = match UnixStream::connect(&socket_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[ipc-client] FATAL: failed to connect to {socket_path}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let read_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[ipc-client] FATAL: failed to clone stream: {e}");
-            std::process::exit(1);
-        }
-    };
-    let mut writer = stream;
-    let reader = BufReader::new(read_stream);
+    let (reader, mut writer) = connect_ipc(&socket_path);
 
     eprintln!("[ipc-client] connected, sending version.handshake...");
 
@@ -196,6 +177,56 @@ fn main() {
     }
 
     eprintln!("[ipc-client] disconnected");
+}
+
+/// Connect to the IPC endpoint and return (reader, writer) pair.
+#[cfg(unix)]
+fn connect_ipc(
+    path: &str,
+) -> (
+    BufReader<std::os::unix::net::UnixStream>,
+    std::os::unix::net::UnixStream,
+) {
+    use std::os::unix::net::UnixStream;
+    let stream = match UnixStream::connect(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: failed to connect to {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let read_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: failed to clone stream: {e}");
+            std::process::exit(1);
+        }
+    };
+    (BufReader::new(read_stream), stream)
+}
+
+/// Connect to the IPC endpoint (Windows named pipe) and return (reader, writer) pair.
+#[cfg(windows)]
+fn connect_ipc(path: &str) -> (BufReader<std::fs::File>, std::fs::File) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: failed to connect to {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let read_file = match file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[ipc-client] FATAL: failed to clone pipe handle: {e}");
+            std::process::exit(1);
+        }
+    };
+    (BufReader::new(read_file), file)
 }
 
 fn now_ms() -> u64 {

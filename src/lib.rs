@@ -37,7 +37,9 @@ pub fn ipc_server_start(path: &str) -> std::io::Result<ipc::server::IpcServer> {
 }
 
 /// Re-export: bind a raw IPC listener (for integration tests).
-pub fn ipc_transport_bind(path: &str) -> std::io::Result<(ipc::transport::IpcListener, std::path::PathBuf)> {
+pub fn ipc_transport_bind(
+    path: &str,
+) -> std::io::Result<(ipc::transport::IpcListener, std::path::PathBuf)> {
     ipc::transport::IpcListener::bind(path)
 }
 

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! SA1 Phase A — Identity store integration tests.
 //!
 //! Validates: persistence, idempotency, permission hardening, corruption fail-closed.

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! N6-B1: B-DEP-N1-1 tests — `--socket-path` and `--data-dir` CLI flags.
 //!
 //! Validates CLI parsing, path resolution, IPC server with custom socket path,

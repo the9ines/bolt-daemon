@@ -292,20 +292,23 @@ pub(crate) mod windows_pipe {
 
     use windows_sys::Win32::Foundation::DuplicateHandle;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE,
+        CloseHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE,
+        ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, FALSE, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetTokenInformation, TokenUser,
-        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+    };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe,
-        SetNamedPipeHandleState, PIPE_ACCESS_DUPLEX, PIPE_NOWAIT, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows_sys::Win32::System::Threading::DUPLICATE_SAME_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// SDDL revision constant.
@@ -323,7 +326,7 @@ pub(crate) mod windows_pipe {
     fn current_user_sid_string() -> io::Result<String> {
         unsafe {
             // Open process token.
-            let mut token_handle: HANDLE = 0;
+            let mut token_handle: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) == 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -736,7 +739,7 @@ pub(crate) mod windows_pipe {
 
     /// Duplicate a Windows HANDLE for the current process.
     fn duplicate_handle(handle: HANDLE) -> io::Result<HANDLE> {
-        let mut dup: HANDLE = 0;
+        let mut dup: HANDLE = std::ptr::null_mut();
         let ok = unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),

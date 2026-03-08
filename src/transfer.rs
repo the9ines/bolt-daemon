@@ -1,11 +1,12 @@
-//! Transfer state machine for post-HELLO file transfer control (B3-P2, B4).
+//! Transfer state machine for post-HELLO file transfer control (B3-P2, B4, B-XFER-1).
 //!
 //! Implements a deterministic transfer session tracker integrated into
 //! `run_post_hello_loop`. Phase B3-P2 scope: FileOffer auto-accept,
 //! chunk receive with in-memory reassembly, transfer completion.
 //! Phase B4 scope: receiver-side SHA-256 hash verification gated by
 //! bolt.file-hash capability negotiation.
-//! No disk I/O, no send-side streaming, no concurrent transfers.
+//! Phase B-XFER-1 scope: sender-side pause/resume control (Sending ↔ Paused).
+//! No disk I/O, no concurrent transfers.
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -280,10 +281,22 @@ impl TransferSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendState {
     Idle,
-    OfferSent { transfer_id: String },
-    Sending { transfer_id: String },
-    Completed { transfer_id: String },
-    Cancelled { transfer_id: String },
+    OfferSent {
+        transfer_id: String,
+    },
+    Sending {
+        transfer_id: String,
+    },
+    /// B-XFER-1: Sending paused. No new chunks enqueued until resumed.
+    Paused {
+        transfer_id: String,
+    },
+    Completed {
+        transfer_id: String,
+    },
+    Cancelled {
+        transfer_id: String,
+    },
 }
 
 /// Metadata returned by `begin_send()`.
@@ -420,10 +433,12 @@ impl SendSession {
         }
     }
 
-    /// Receiver cancelled. Transitions OfferSent/Sending → Cancelled.
+    /// Receiver cancelled. Transitions OfferSent/Sending/Paused → Cancelled.
     pub fn on_cancel(&mut self, transfer_id: &str) -> Result<(), TransferError> {
         match &self.state {
-            SendState::OfferSent { transfer_id: tid } | SendState::Sending { transfer_id: tid } => {
+            SendState::OfferSent { transfer_id: tid }
+            | SendState::Sending { transfer_id: tid }
+            | SendState::Paused { transfer_id: tid } => {
                 if transfer_id != tid {
                     return Err(TransferError::InvalidTransition(
                         "transfer_id mismatch".to_string(),
@@ -438,6 +453,56 @@ impl SendSession {
                 "no active outbound transfer".to_string(),
             )),
         }
+    }
+
+    /// B-XFER-1: Pause sending. Transitions Sending → Paused.
+    pub fn on_pause(&mut self, transfer_id: &str) -> Result<(), TransferError> {
+        match &self.state {
+            SendState::Sending { transfer_id: tid } => {
+                if transfer_id != tid {
+                    return Err(TransferError::InvalidTransition(
+                        "transfer_id mismatch".to_string(),
+                    ));
+                }
+                let tid = tid.clone();
+                self.state = SendState::Paused { transfer_id: tid };
+                Ok(())
+            }
+            SendState::Paused { .. } => {
+                // Idempotent: already paused.
+                Ok(())
+            }
+            _ => Err(TransferError::InvalidTransition(
+                "not in sending state".to_string(),
+            )),
+        }
+    }
+
+    /// B-XFER-1: Resume sending. Transitions Paused → Sending.
+    pub fn on_resume(&mut self, transfer_id: &str) -> Result<(), TransferError> {
+        match &self.state {
+            SendState::Paused { transfer_id: tid } => {
+                if transfer_id != tid {
+                    return Err(TransferError::InvalidTransition(
+                        "transfer_id mismatch".to_string(),
+                    ));
+                }
+                let tid = tid.clone();
+                self.state = SendState::Sending { transfer_id: tid };
+                Ok(())
+            }
+            SendState::Sending { .. } => {
+                // Idempotent: already sending.
+                Ok(())
+            }
+            _ => Err(TransferError::InvalidTransition("not paused".to_string())),
+        }
+    }
+
+    /// B-XFER-1: Returns true if send session is in Sending state with chunks remaining.
+    /// Used by the loop to drive incremental chunk sending.
+    pub fn is_send_active(&self) -> bool {
+        matches!(self.state, SendState::Sending { .. }) && self.cursor < self.payload.len()
     }
 
     /// Yield next chunk. Must be Sending. Returns None when all chunks yielded.
@@ -918,6 +983,178 @@ mod tests {
             err.to_string().contains("not all chunks yielded"),
             "expected 'not all chunks yielded', got: {err}"
         );
+    }
+
+    // ── B-XFER-1: pause/resume tests ──
+
+    #[test]
+    fn bxfer1_pause_during_send() {
+        let mut ss = SendSession::new();
+        let payload = vec![0u8; 32768]; // 2 chunks
+        let offer = ss.begin_send(payload, "big.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Sending { .. }));
+
+        // Send one chunk
+        let chunk = ss.next_chunk().unwrap();
+        assert!(chunk.is_some());
+
+        // Pause
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Paused { .. }));
+
+        // next_chunk should fail when paused
+        let err = ss.next_chunk().unwrap_err();
+        assert!(err.to_string().contains("not in sending state"));
+    }
+
+    #[test]
+    fn bxfer1_pause_then_resume_continues() {
+        let mut ss = SendSession::new();
+        let payload = vec![0xAB; 40960]; // 3 chunks
+        let offer = ss.begin_send(payload.clone(), "multi.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+
+        // Send first chunk
+        let c0 = ss.next_chunk().unwrap().unwrap();
+        assert_eq!(c0.chunk_index, 0);
+
+        // Pause
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Paused { .. }));
+        assert!(!ss.is_send_active()); // paused = not active
+
+        // Resume
+        ss.on_resume(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Sending { .. }));
+        assert!(ss.is_send_active());
+
+        // Continue from chunk 1 (not 0)
+        let c1 = ss.next_chunk().unwrap().unwrap();
+        assert_eq!(c1.chunk_index, 1);
+        let c2 = ss.next_chunk().unwrap().unwrap();
+        assert_eq!(c2.chunk_index, 2);
+        assert!(ss.next_chunk().unwrap().is_none());
+
+        // Finish
+        let mut reassembled = Vec::new();
+        reassembled.extend_from_slice(&c0.data);
+        reassembled.extend_from_slice(&c1.data);
+        reassembled.extend_from_slice(&c2.data);
+        assert_eq!(reassembled, payload);
+        ss.finish().unwrap();
+        assert!(matches!(ss.state(), SendState::Completed { .. }));
+    }
+
+    #[test]
+    fn bxfer1_pause_then_cancel() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 32768], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        ss.next_chunk().unwrap();
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Paused { .. }));
+
+        // Cancel while paused
+        ss.on_cancel(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Cancelled { .. }));
+    }
+
+    #[test]
+    fn bxfer1_resume_when_not_paused() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+
+        // Resume while Sending — idempotent (already sending)
+        ss.on_resume(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Sending { .. }));
+    }
+
+    #[test]
+    fn bxfer1_pause_when_not_sending() {
+        let mut ss = SendSession::new();
+        let err = ss.on_pause("some-tid").unwrap_err();
+        assert!(err.to_string().contains("not in sending state"));
+    }
+
+    #[test]
+    fn bxfer1_resume_when_idle() {
+        let mut ss = SendSession::new();
+        let err = ss.on_resume("some-tid").unwrap_err();
+        assert!(err.to_string().contains("not paused"));
+    }
+
+    #[test]
+    fn bxfer1_pause_wrong_transfer_id() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+
+        let err = ss.on_pause("wrong-id").unwrap_err();
+        assert!(err.to_string().contains("transfer_id mismatch"));
+    }
+
+    #[test]
+    fn bxfer1_resume_wrong_transfer_id() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        ss.on_pause(&offer.transfer_id).unwrap();
+
+        let err = ss.on_resume("wrong-id").unwrap_err();
+        assert!(err.to_string().contains("transfer_id mismatch"));
+    }
+
+    #[test]
+    fn bxfer1_repeated_pause_idempotent() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Paused { .. }));
+        // Second pause — idempotent
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(matches!(ss.state(), SendState::Paused { .. }));
+    }
+
+    #[test]
+    fn bxfer1_is_send_active_states() {
+        let mut ss = SendSession::new();
+        assert!(!ss.is_send_active()); // Idle
+
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        assert!(!ss.is_send_active()); // OfferSent
+
+        ss.on_accept(&offer.transfer_id).unwrap();
+        assert!(ss.is_send_active()); // Sending with chunks
+
+        ss.on_pause(&offer.transfer_id).unwrap();
+        assert!(!ss.is_send_active()); // Paused
+
+        ss.on_resume(&offer.transfer_id).unwrap();
+        assert!(ss.is_send_active()); // Sending again
+
+        // Consume all chunks
+        while ss.next_chunk().unwrap().is_some() {}
+        assert!(!ss.is_send_active()); // Sending but no more chunks
+
+        ss.finish().unwrap();
+        assert!(!ss.is_send_active()); // Completed
+    }
+
+    #[test]
+    fn bxfer1_finish_rejects_paused() {
+        let mut ss = SendSession::new();
+        let offer = ss.begin_send(vec![0u8; 100], "f.bin", false).unwrap();
+        ss.on_accept(&offer.transfer_id).unwrap();
+        while ss.next_chunk().unwrap().is_some() {}
+        ss.on_pause(&offer.transfer_id).unwrap();
+
+        // finish() requires Sending, not Paused
+        let err = ss.finish().unwrap_err();
+        assert!(err.to_string().contains("not in sending state"));
     }
 
     #[test]

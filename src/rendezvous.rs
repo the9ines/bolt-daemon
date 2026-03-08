@@ -599,6 +599,49 @@ pub(crate) fn run_post_hello_loop(
             Duration::from_millis(200),
         );
 
+        // B-XFER-1: incremental chunk sending — send one chunk per loop iteration
+        // when send session is active (Sending state with chunks remaining).
+        // This replaces the tight while-let loop from B3-P3, allowing incoming
+        // Pause/Resume/Cancel messages to be processed between chunks.
+        if send_session.is_send_active() {
+            match send_session.next_chunk() {
+                Ok(Some(chunk)) => {
+                    let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
+                    let msg = crate::dc_messages::DcMessage::FileChunk {
+                        transfer_id: chunk.transfer_id,
+                        chunk_index: chunk.chunk_index,
+                        total_chunks: chunk.total_chunks,
+                        payload: payload_b64,
+                    };
+                    let json = crate::dc_messages::encode_dc_message(&msg)
+                        .map_err(|e| format!("[B-XFER-1] encode chunk: {e}"))?;
+                    let env = crate::envelope::encode_envelope(&json, session)?;
+                    send_fn(&env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                }
+                Ok(None) => {
+                    // All chunks sent — send FileFinish
+                    let tid =
+                        send_session
+                            .finish()
+                            .map_err(|te| -> Box<dyn std::error::Error> {
+                                format!("[B-XFER-1] finish error: {te}").into()
+                            })?;
+                    let finish_msg = crate::dc_messages::DcMessage::FileFinish {
+                        transfer_id: tid,
+                        file_hash: None,
+                    };
+                    let finish_json = crate::dc_messages::encode_dc_message(&finish_msg)
+                        .map_err(|e| format!("[B-XFER-1] encode finish: {e}"))?;
+                    let finish_env = crate::envelope::encode_envelope(&finish_json, session)?;
+                    send_fn(&finish_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    eprintln!("[B-XFER-1] outbound transfer completed");
+                }
+                Err(te) => {
+                    return Err(format!("[B-XFER-1] chunk error: {te}").into());
+                }
+            }
+        }
+
         let raw = match dc_msg_rx.recv_timeout(poll_timeout) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -776,52 +819,40 @@ pub(crate) fn run_post_hello_loop(
                             }
                         }
                     }
-                    // B3-P3: FileAccept — drive send-side SM if active, else absorb.
+                    // B3-P3: FileAccept — transition send SM to Sending, then
+                    // incremental chunk sending happens at top of loop (B-XFER-1).
                     Ok(crate::dc_messages::DcMessage::FileAccept { transfer_id }) => {
                         match send_session.on_accept(&transfer_id) {
                             Ok(()) => {
-                                // Stream all chunks, then finish
-                                while let Some(chunk) = send_session.next_chunk().map_err(
-                                    |te| -> Box<dyn std::error::Error> {
-                                        format!("[B3-P3] chunk error: {te}").into()
-                                    },
-                                )? {
-                                    let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
-                                    let msg = crate::dc_messages::DcMessage::FileChunk {
-                                        transfer_id: chunk.transfer_id,
-                                        chunk_index: chunk.chunk_index,
-                                        total_chunks: chunk.total_chunks,
-                                        payload: payload_b64,
-                                    };
-                                    let json = crate::dc_messages::encode_dc_message(&msg)
-                                        .map_err(|e| format!("[B3-P3] encode chunk: {e}"))?;
-                                    let env = crate::envelope::encode_envelope(&json, session)?;
-                                    send_fn(&env)
-                                        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-                                }
-
-                                // All chunks sent — send FileFinish
-                                let tid = send_session.finish().map_err(
-                                    |te| -> Box<dyn std::error::Error> {
-                                        format!("[B3-P3] finish error: {te}").into()
-                                    },
-                                )?;
-                                let finish_msg = crate::dc_messages::DcMessage::FileFinish {
-                                    transfer_id: tid,
-                                    file_hash: None,
-                                };
-                                let finish_json =
-                                    crate::dc_messages::encode_dc_message(&finish_msg)
-                                        .map_err(|e| format!("[B3-P3] encode finish: {e}"))?;
-                                let finish_env =
-                                    crate::envelope::encode_envelope(&finish_json, session)?;
-                                send_fn(&finish_env)
-                                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-                                eprintln!("[B3-P3] outbound transfer completed");
+                                eprintln!("[B-XFER-1] FileAccept — send session active");
                             }
                             Err(te) => {
                                 // No active outbound transfer — log and continue (not disconnect).
                                 eprintln!("[B3-P3] FileAccept ignored: {te}");
+                            }
+                        }
+                        continue;
+                    }
+                    // B-XFER-1: Pause — transition send SM to Paused.
+                    Ok(crate::dc_messages::DcMessage::Pause { transfer_id }) => {
+                        match send_session.on_pause(&transfer_id) {
+                            Ok(()) => {
+                                eprintln!("[B-XFER-1] send paused");
+                            }
+                            Err(te) => {
+                                eprintln!("[B-XFER-1] Pause ignored: {te}");
+                            }
+                        }
+                        continue;
+                    }
+                    // B-XFER-1: Resume — transition send SM back to Sending.
+                    Ok(crate::dc_messages::DcMessage::Resume { transfer_id }) => {
+                        match send_session.on_resume(&transfer_id) {
+                            Ok(()) => {
+                                eprintln!("[B-XFER-1] send resumed");
+                            }
+                            Err(te) => {
+                                eprintln!("[B-XFER-1] Resume ignored: {te}");
                             }
                         }
                         continue;
@@ -841,8 +872,7 @@ pub(crate) fn run_post_hello_loop(
                     }
                     _ => {
                         // Everything else: fall through to route_inner_message.
-                        // Preserves existing behavior for ping, pong, app_message, error,
-                        // and remaining transfer messages (Pause, Resume → InvalidState).
+                        // Preserves existing behavior for ping, pong, app_message, error.
                         match crate::envelope::route_inner_message(&inner, session) {
                             Ok(Some(reply)) => {
                                 send_fn(&reply).map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -2893,8 +2923,8 @@ mod tests {
     }
 
     #[test]
-    fn b3p3_pause_still_disconnects() {
-        // Pause remains unimplemented — should cause INVALID_STATE disconnect.
+    fn bxfer1_pause_no_disconnect() {
+        // B-XFER-1: Pause is now handled at loop level — should NOT disconnect.
         let (sess_a, sess_b) = make_b6_session_pair();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -2912,8 +2942,35 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
         assert!(
-            result.is_err(),
-            "Pause should still cause disconnect (not carved out)"
+            result.is_ok(),
+            "Pause should be absorbed without disconnect, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn bxfer1_resume_no_disconnect() {
+        // B-XFER-1: Resume is now handled at loop level — should NOT disconnect.
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let resume = crate::dc_messages::DcMessage::Resume {
+            transfer_id: "some-tid".to_string(),
+        };
+        let resume_json = crate::dc_messages::encode_dc_message(&resume).unwrap();
+        let env = crate::envelope::encode_envelope(&resume_json, &sess_a).unwrap();
+        tx.send(env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        assert!(
+            result.is_ok(),
+            "Resume should be absorbed without disconnect, got: {:?}",
+            result.unwrap_err()
         );
     }
 }

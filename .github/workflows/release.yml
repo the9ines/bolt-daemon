@@ -22,7 +22,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             cross: false
           - target: aarch64-apple-darwin
             os: macos-14
@@ -81,10 +81,12 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
-      - name: Install cross
+      - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.cross
         shell: bash
-        run: cargo install cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # --- Validation gates (native targets only) ---
 
@@ -98,13 +100,13 @@ jobs:
         if: ${{ !matrix.cross }}
         working-directory: bolt-daemon
         shell: bash
-        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy -- -D warnings
 
       - name: cargo test
         if: ${{ !matrix.cross }}
         working-directory: bolt-daemon
         shell: bash
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo test
 
       # --- Build ---
 
@@ -114,13 +116,15 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }} --bin bolt-daemon --bin bolt-relay
 
-      - name: Build (cross)
+      - name: Build (cross aarch64-linux)
         if: matrix.cross
         working-directory: bolt-daemon
         shell: bash
         env:
-          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/bolt-core-sdk:${{ github.workspace }}/bolt-core-sdk"
-        run: cross build --release --target ${{ matrix.target }} --bin bolt-daemon --bin bolt-relay
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: cargo build --release --target ${{ matrix.target }} --bin bolt-daemon --bin bolt-relay
 
       # --- Verify binaries ---
 

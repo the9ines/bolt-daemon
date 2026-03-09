@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.37-relarch1-multiarch-matrix` |
+| Tag (main) | `daemon-v0.2.38-relarch1-multiarch-matrix` |
 | Branch | `main` |
 | Phase | REL-ARCH1: Multi-arch daemon build/package matrix |
 
@@ -31,7 +31,7 @@
 | B-DEP-N2 | DONE | IPC version handshake + daemon.status in default mode, `daemon-v0.2.31-bdep-n2-ipc-unblock` |
 | N6-B1 | DONE | `--socket-path` and `--data-dir` CLI flags (B-DEP-N1-1), `daemon-v0.2.32-n6b1-path-flags` |
 | N6-B2 | DONE | Windows named pipe transport (B-DEP-N2-3), `daemon-v0.2.33-n6b2-windows-pipe` |
-| REL-ARCH1 | DONE | Multi-arch build/package matrix, `daemon-v0.2.37-relarch1-multiarch-matrix` |
+| REL-ARCH1 | DONE | Multi-arch build/package matrix, `daemon-v0.2.38-relarch1-multiarch-matrix` (`ab56606`) |
 
 ## Release Artifacts
 
@@ -41,11 +41,11 @@ Release workflow (`.github/workflows/release.yml`) triggers on `daemon-v*` tag p
 
 | Target | Runner | Strategy | Shipped Binaries |
 |--------|--------|----------|-----------------|
-| `x86_64-apple-darwin` | `macos-13` | Native | bolt-daemon, bolt-relay |
+| `x86_64-apple-darwin` | `macos-14` | Native (cross-compile) | bolt-daemon, bolt-relay |
 | `aarch64-apple-darwin` | `macos-14` | Native | bolt-daemon, bolt-relay |
 | `x86_64-pc-windows-msvc` | `windows-latest` | Native | bolt-daemon.exe, bolt-relay.exe |
 | `x86_64-unknown-linux-gnu` | `ubuntu-latest` | Native | bolt-daemon, bolt-relay |
-| `aarch64-unknown-linux-gnu` | `ubuntu-latest` | Cross (`cross`) | bolt-daemon, bolt-relay |
+| `aarch64-unknown-linux-gnu` | `ubuntu-latest` | Cross (native gcc toolchain) | bolt-daemon, bolt-relay |
 
 ### Archive Naming
 

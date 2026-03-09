@@ -2,7 +2,7 @@
 
 All notable changes to bolt-daemon. Newest first.
 
-## REL-ARCH1 — Multi-Arch Build/Package Matrix (daemon-v0.2.37-relarch1-multiarch-matrix) — 2026-03-08
+## REL-ARCH1 — Multi-Arch Build/Package Matrix (daemon-v0.2.38-relarch1-multiarch-matrix) — 2026-03-09
 
 Deterministic multi-architecture release workflow for bolt-daemon. Produces
 platform archives with checksums for 5 targets, published to GitHub Releases.
@@ -11,8 +11,9 @@ platform archives with checksums for 5 targets, published to GitHub Releases.
 - `.github/workflows/release.yml` (NEW) — multi-arch release workflow:
   - 5-target matrix: x86_64-apple-darwin, aarch64-apple-darwin,
     x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
-  - Native build on macOS-13/macOS-14/windows-latest/ubuntu-latest
-  - Cross-compilation via `cross` for aarch64-unknown-linux-gnu
+  - Native build on macos-14/windows-latest/ubuntu-latest
+  - Cross-compilation via native gcc toolchain for aarch64-unknown-linux-gnu
+  - Windows: Strawberry Perl + NASM forced via PERL env var for OpenSSL vendored build
   - Per-target archive packaging (tar.gz for macOS/Linux, zip for Windows)
   - SHA256SUMS.txt consolidated checksum file
   - Inventory check: fail-closed if any required archive is missing
@@ -25,6 +26,7 @@ platform archives with checksums for 5 targets, published to GitHub Releases.
   Path dependencies (`bolt-core`, `bolt-transfer-core`) require sibling checkout
   that was absent since T-STREAM-0 introduced the `bolt-transfer-core` dep.
 - `src/rendezvous.rs` — pre-existing `cargo fmt` violation corrected
+- `src/identity_store.rs` — Windows path separator fix in `resolve_path_uses_home` test
 
 ### Shipped Binaries (per archive)
 - `bolt-daemon` — headless WebRTC transport daemon
@@ -32,25 +34,24 @@ platform archives with checksums for 5 targets, published to GitHub Releases.
 - `bolt-ipc-client` excluded (dev harness, not user-facing)
 
 ### Evidence
-- 362 tests pass (195 lib + 128 main + 15 relay + 13 n6b1 + 11 n6b2), 0 failures
-- `cargo fmt --check` clean
-- `cargo clippy -- -D warnings` clean
-- `scripts/check_no_panic.sh` PASS
+- CI run 22845910794: all 5 targets green + publish success
+- 362 tests pass (macOS/Linux), 178 pass (Windows — 177 lib + 1 fixed)
+- `cargo fmt --check` clean (all platforms)
+- `cargo clippy -- -D warnings` clean (all platforms)
 
 ### Residual
 - Code signing / notarization: not implemented (follow-on)
 - `aarch64-pc-windows-msvc`: deferred (no GA GitHub Actions runner)
-- `cross` vendored datachannel build for aarch64-linux: validated locally,
-  CI validation pending first tag-triggered run
 
 ### Files Changed
 - `.github/workflows/release.yml` (NEW)
 - `.github/workflows/ci.yml`
 - `src/rendezvous.rs`
+- `src/identity_store.rs`
 - `docs/STATE.md`
 - `docs/CHANGELOG.md`
 
-**Tag:** `daemon-v0.2.37-relarch1-multiarch-matrix`
+**Tag:** `daemon-v0.2.38-relarch1-multiarch-matrix` (`ab56606`)
 
 ---
 

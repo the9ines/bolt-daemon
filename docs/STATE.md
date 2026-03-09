@@ -4,13 +4,13 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.36-tstream0-adapter` |
+| Tag (main) | `daemon-v0.2.37-relarch1-multiarch-matrix` |
 | Branch | `main` |
-| Phase | T-STREAM-0: Transfer core adapter — consumes `bolt-transfer-core` |
+| Phase | REL-ARCH1: Multi-arch daemon build/package matrix |
 
 ## Test Status
 
-- 458 tests with test-support + 3 ignored E2E (389 default + 11 N6-B2 integration)
+- 362 tests pass (195 lib + 128 main + 15 relay + 13 n6b1 + 11 n6b2), 0 failures
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - `scripts/check_no_panic.sh` PASS
@@ -31,6 +31,36 @@
 | B-DEP-N2 | DONE | IPC version handshake + daemon.status in default mode, `daemon-v0.2.31-bdep-n2-ipc-unblock` |
 | N6-B1 | DONE | `--socket-path` and `--data-dir` CLI flags (B-DEP-N1-1), `daemon-v0.2.32-n6b1-path-flags` |
 | N6-B2 | DONE | Windows named pipe transport (B-DEP-N2-3), `daemon-v0.2.33-n6b2-windows-pipe` |
+| REL-ARCH1 | DONE | Multi-arch build/package matrix, `daemon-v0.2.37-relarch1-multiarch-matrix` |
+
+## Release Artifacts
+
+Release workflow (`.github/workflows/release.yml`) triggers on `daemon-v*` tag push or `workflow_dispatch`.
+
+### Target Matrix
+
+| Target | Runner | Strategy | Shipped Binaries |
+|--------|--------|----------|-----------------|
+| `x86_64-apple-darwin` | `macos-13` | Native | bolt-daemon, bolt-relay |
+| `aarch64-apple-darwin` | `macos-14` | Native | bolt-daemon, bolt-relay |
+| `x86_64-pc-windows-msvc` | `windows-latest` | Native | bolt-daemon.exe, bolt-relay.exe |
+| `x86_64-unknown-linux-gnu` | `ubuntu-latest` | Native | bolt-daemon, bolt-relay |
+| `aarch64-unknown-linux-gnu` | `ubuntu-latest` | Cross (`cross`) | bolt-daemon, bolt-relay |
+
+### Archive Naming
+
+- macOS/Linux: `bolt-daemon-<version>-<target>.tar.gz`
+- Windows: `bolt-daemon-<version>-<target>.zip`
+- Checksums: `SHA256SUMS.txt` (consolidated, one entry per archive)
+
+### Excluded Binaries
+
+- `bolt-ipc-client` — dev harness, not shipped in release archives
+
+### Residual
+
+- Code signing / notarization: not implemented (follow-on)
+- `aarch64-pc-windows-msvc`: deferred (no GA GitHub Actions runner)
 
 ## Daemon Modes
 
@@ -167,6 +197,7 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | webrtc-sdp | 0.3 | SDP parsing |
 | tungstenite | 0.24 | Sync WebSocket client (rendezvous signaling) |
 | bolt-core | path | Canonical hash, encoding, crypto primitives |
+| bolt-transfer-core | path | Transport-agnostic transfer state machine |
 | bolt-rendezvous-protocol | 0.1.0 | Canonical signaling types (git dep, tag-pinned) |
 | serde/serde_json | 1.x | Serialization |
 | rand | 0.8 | Peer ID generation |

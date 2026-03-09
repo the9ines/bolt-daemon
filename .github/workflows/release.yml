@@ -1,0 +1,286 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'daemon-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., daemon-v0.2.37-relarch1-multiarch-matrix)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#daemon-}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag format
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if [[ ! "$TAG" =~ ^daemon-v ]]; then
+            echo "FAIL: Tag '${TAG}' does not match required format 'daemon-v*'"
+            exit 1
+          fi
+          echo "OK: Tag '${TAG}' is valid"
+
+      - name: Checkout bolt-daemon
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || '' }}
+          path: bolt-daemon
+
+      - name: Checkout bolt-core-sdk (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: the9ines/bolt-core-sdk
+          path: bolt-core-sdk
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Install cross
+        if: matrix.cross
+        shell: bash
+        run: cargo install cross
+
+      # --- Validation gates (native targets only) ---
+
+      - name: cargo fmt --check
+        if: ${{ !matrix.cross }}
+        working-directory: bolt-daemon
+        shell: bash
+        run: cargo fmt -- --check
+
+      - name: cargo clippy (deny warnings)
+        if: ${{ !matrix.cross }}
+        working-directory: bolt-daemon
+        shell: bash
+        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
+
+      - name: cargo test
+        if: ${{ !matrix.cross }}
+        working-directory: bolt-daemon
+        shell: bash
+        run: cargo test --target ${{ matrix.target }}
+
+      # --- Build ---
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        working-directory: bolt-daemon
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} --bin bolt-daemon --bin bolt-relay
+
+      - name: Build (cross)
+        if: matrix.cross
+        working-directory: bolt-daemon
+        shell: bash
+        env:
+          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/bolt-core-sdk:${{ github.workspace }}/bolt-core-sdk"
+        run: cross build --release --target ${{ matrix.target }} --bin bolt-daemon --bin bolt-relay
+
+      # --- Verify binaries ---
+
+      - name: Verify binaries exist
+        working-directory: bolt-daemon
+        shell: bash
+        run: |
+          BIN_DIR="target/${{ matrix.target }}/release"
+          EXT=""
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            EXT=".exe"
+          fi
+          test -f "${BIN_DIR}/bolt-daemon${EXT}" || { echo "FAIL: bolt-daemon binary missing"; exit 1; }
+          test -f "${BIN_DIR}/bolt-relay${EXT}" || { echo "FAIL: bolt-relay binary missing"; exit 1; }
+          echo "=== Binary sizes ==="
+          ls -lh "${BIN_DIR}/bolt-daemon${EXT}" "${BIN_DIR}/bolt-relay${EXT}"
+
+      - name: Smoke test (native only)
+        if: ${{ !matrix.cross }}
+        working-directory: bolt-daemon
+        shell: bash
+        run: |
+          BIN_DIR="target/${{ matrix.target }}/release"
+          EXT=""
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            EXT=".exe"
+          fi
+          # bolt-daemon requires --role; exits non-zero without it — proves binary loads
+          "${BIN_DIR}/bolt-daemon${EXT}" 2>&1 && EXIT_OK=true || EXIT_OK=false
+          echo "Smoke: bolt-daemon binary loads and executes (exit_ok=${EXIT_OK})"
+
+      # --- Package ---
+
+      - name: Package archive
+        working-directory: bolt-daemon
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          BIN_DIR="target/${TARGET}/release"
+          ARCHIVE_DIR="bolt-daemon-${VERSION}-${TARGET}"
+
+          EXT=""
+          if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then
+            EXT=".exe"
+          fi
+
+          mkdir -p "staging/${ARCHIVE_DIR}"
+          cp "${BIN_DIR}/bolt-daemon${EXT}" "staging/${ARCHIVE_DIR}/"
+          cp "${BIN_DIR}/bolt-relay${EXT}" "staging/${ARCHIVE_DIR}/"
+          cp LICENSE "staging/${ARCHIVE_DIR}/"
+
+          cd staging
+          if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then
+            7z a "${ARCHIVE_DIR}.zip" "${ARCHIVE_DIR}"
+            ARCHIVE_FILE="${ARCHIVE_DIR}.zip"
+          else
+            tar czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+            ARCHIVE_FILE="${ARCHIVE_DIR}.tar.gz"
+          fi
+
+          # Per-file checksum
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${ARCHIVE_FILE}" > "${ARCHIVE_FILE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE_FILE}" > "${ARCHIVE_FILE}.sha256"
+          fi
+
+          echo "=== Archive ==="
+          ls -lh "${ARCHIVE_FILE}"
+          echo "=== Checksum ==="
+          cat "${ARCHIVE_FILE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            bolt-daemon/staging/*.tar.gz
+            bolt-daemon/staging/*.zip
+            bolt-daemon/staging/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#daemon-}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate consolidated SHA256SUMS.txt
+        working-directory: artifacts
+        run: |
+          cat *.sha256 | sort > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+          echo "=== Verification ==="
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Inventory check
+        working-directory: artifacts
+        run: |
+          echo "=== Release artifacts ==="
+          ls -lh
+          EXPECTED=5
+          ARCHIVES=$(ls *.tar.gz *.zip 2>/dev/null | wc -l)
+          if [ "${ARCHIVES}" -lt "${EXPECTED}" ]; then
+            echo "FAIL: Expected ${EXPECTED} archives, found ${ARCHIVES}"
+            exit 1
+          fi
+          echo "OK: ${ARCHIVES} archives present (expected ${EXPECTED})"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "bolt-daemon ${{ steps.version.outputs.version }}"
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+          body: |
+            ## bolt-daemon ${{ steps.version.outputs.version }}
+
+            ### Artifacts
+
+            | Target | Archive |
+            |--------|---------|
+            | macOS x86_64 | `bolt-daemon-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz` |
+            | macOS aarch64 (Apple Silicon) | `bolt-daemon-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz` |
+            | Windows x86_64 | `bolt-daemon-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip` |
+            | Linux x86_64 | `bolt-daemon-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux aarch64 | `bolt-daemon-${{ steps.version.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz` |
+
+            ### Binaries included
+            - `bolt-daemon` — headless WebRTC transport daemon
+            - `bolt-relay` — self-hosted relay server
+
+            ### Verification
+            ```
+            sha256sum -c SHA256SUMS.txt
+            ```

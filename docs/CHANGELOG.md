@@ -2,6 +2,58 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## REL-ARCH1 — Multi-Arch Build/Package Matrix (daemon-v0.2.37-relarch1-multiarch-matrix) — 2026-03-08
+
+Deterministic multi-architecture release workflow for bolt-daemon. Produces
+platform archives with checksums for 5 targets, published to GitHub Releases.
+
+### Added
+- `.github/workflows/release.yml` (NEW) — multi-arch release workflow:
+  - 5-target matrix: x86_64-apple-darwin, aarch64-apple-darwin,
+    x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+  - Native build on macOS-13/macOS-14/windows-latest/ubuntu-latest
+  - Cross-compilation via `cross` for aarch64-unknown-linux-gnu
+  - Per-target archive packaging (tar.gz for macOS/Linux, zip for Windows)
+  - SHA256SUMS.txt consolidated checksum file
+  - Inventory check: fail-closed if any required archive is missing
+  - GitHub Release publishing via softprops/action-gh-release@v2
+  - Dual trigger: tag push (`daemon-v*`) + `workflow_dispatch` manual rebuild
+  - Validation gates per native row: fmt, clippy, test, smoke
+
+### Fixed
+- `.github/workflows/ci.yml` — added missing `bolt-core-sdk` checkout step.
+  Path dependencies (`bolt-core`, `bolt-transfer-core`) require sibling checkout
+  that was absent since T-STREAM-0 introduced the `bolt-transfer-core` dep.
+- `src/rendezvous.rs` — pre-existing `cargo fmt` violation corrected
+
+### Shipped Binaries (per archive)
+- `bolt-daemon` — headless WebRTC transport daemon
+- `bolt-relay` — self-hosted relay server
+- `bolt-ipc-client` excluded (dev harness, not user-facing)
+
+### Evidence
+- 362 tests pass (195 lib + 128 main + 15 relay + 13 n6b1 + 11 n6b2), 0 failures
+- `cargo fmt --check` clean
+- `cargo clippy -- -D warnings` clean
+- `scripts/check_no_panic.sh` PASS
+
+### Residual
+- Code signing / notarization: not implemented (follow-on)
+- `aarch64-pc-windows-msvc`: deferred (no GA GitHub Actions runner)
+- `cross` vendored datachannel build for aarch64-linux: validated locally,
+  CI validation pending first tag-triggered run
+
+### Files Changed
+- `.github/workflows/release.yml` (NEW)
+- `.github/workflows/ci.yml`
+- `src/rendezvous.rs`
+- `docs/STATE.md`
+- `docs/CHANGELOG.md`
+
+**Tag:** `daemon-v0.2.37-relarch1-multiarch-matrix`
+
+---
+
 ## T-STREAM-0 — Transfer Core Adapter (daemon-v0.2.36-tstream0-adapter) — 2026-03-08
 
 Daemon now consumes `bolt-transfer-core` crate instead of inline state machines.

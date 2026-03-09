@@ -88,6 +88,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      - name: Setup Windows build tools (Strawberry Perl for OpenSSL)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:/Strawberry/perl/bin" >> "$GITHUB_PATH"
+
       # --- Validation gates (native targets only) ---
 
       - name: cargo fmt --check

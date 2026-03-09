@@ -303,7 +303,9 @@ mod tests {
         let path = resolve_identity_path();
         // HOME should be set in test environment
         if let Ok(p) = path {
-            assert!(p.to_string_lossy().ends_with(".bolt/identity.key"));
+            let expected: std::path::PathBuf =
+                [".bolt", "identity.key"].iter().collect();
+            assert!(p.ends_with(&expected));
         }
 
         // Restore

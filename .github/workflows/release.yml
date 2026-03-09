@@ -88,11 +88,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Setup Windows build tools (Strawberry Perl for OpenSSL)
+      - name: Setup Windows build tools (Strawberry Perl + NASM for OpenSSL)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          echo "C:/Strawberry/perl/bin" >> "$GITHUB_PATH"
+          # Strawberry Perl is required for OpenSSL vendored build
+          # Git Bash MSYS2 perl lacks required modules; force Strawberry via PERL env
+          if (!(Test-Path "C:\Strawberry\perl\bin\perl.exe")) {
+            choco install strawberryperl -y --no-progress
+          }
+          choco install nasm -y --no-progress
+          echo "PERL=C:\Strawberry\perl\bin\perl.exe" >> $env:GITHUB_ENV
+          echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
       # --- Validation gates (native targets only) ---
 

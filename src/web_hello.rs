@@ -15,10 +15,17 @@
 //! (in the web offer/answer `publicKey` field).
 //!
 //! Fail-closed: any parse, decrypt, or schema error rejects the message.
+//!
+//! RC2-EXEC-E (AC-RC-07): HelloState, HelloError, and negotiate_capabilities
+//! are now canonical in bolt_core::session. This module re-exports them and
+//! retains profile-level codec types (WebHelloOuter/Inner, serde structs).
 
 use bolt_core::crypto::{seal_box_payload, KeyPair};
 use bolt_core::encoding::to_base64;
 use serde::{Deserialize, Serialize};
+
+// ── Shared core re-exports (AC-RC-07) ─────────────────────────
+pub use bolt_core::session::{negotiate_capabilities, HelloError, HelloState};
 
 // ── Interop Hello Mode ──────────────────────────────────────
 
@@ -44,16 +51,7 @@ pub fn daemon_capabilities() -> Vec<String> {
     DAEMON_CAPABILITIES.iter().map(|s| s.to_string()).collect()
 }
 
-/// Compute the intersection of local and remote capability sets.
-pub fn negotiate_capabilities(local: &[String], remote: &[String]) -> Vec<String> {
-    local
-        .iter()
-        .filter(|cap| remote.contains(cap))
-        .cloned()
-        .collect()
-}
-
-// ── Wire types ──────────────────────────────────────────────
+// ── Wire types (profile-level, stays in daemon) ─────────────
 
 /// Outer HELLO frame: `{"type":"hello","payload":"<sealed base64>"}`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -74,92 +72,7 @@ pub struct WebHelloInner {
     pub capabilities: Vec<String>,
 }
 
-// ── Exactly-once guard ──────────────────────────────────────
-
-/// Tracks whether the HELLO exchange has completed.
-/// Rejects duplicate HELLOs (fail-closed).
-/// Wired into SessionContext at runtime (INTEROP-3).
-#[derive(Default)]
-pub struct HelloState {
-    completed: bool,
-}
-
-impl HelloState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Mark HELLO as completed. Returns Err if already completed.
-    pub fn mark_completed(&mut self) -> Result<(), &'static str> {
-        if self.completed {
-            return Err("[INTEROP-2_HELLO_FAIL] duplicate HELLO — exactly-once violation");
-        }
-        self.completed = true;
-        Ok(())
-    }
-
-    #[allow(dead_code)] // Called via SessionContext::is_hello_complete(); tested
-    pub fn is_completed(&self) -> bool {
-        self.completed
-    }
-}
-
-// ── HELLO-phase error codes ─────────────────────────────────
-
-/// Error codes for HELLO-phase protocol violations.
-///
-/// Wire codes align with PROTOCOL_ENFORCEMENT.md Appendix A registry.
-/// Parallel to `EnvelopeError` but for the HELLO exchange phase.
-#[derive(Debug)]
-pub enum HelloError {
-    /// HELLO outer frame unparseable (not UTF-8, not JSON, wrong outer type).
-    ParseError(String),
-    /// HELLO sealed payload fails decryption (wrong key, tampered).
-    DecryptFail(String),
-    /// HELLO inner payload missing required fields or wrong types.
-    SchemaError(String),
-    /// Identity key does not match pinned key (TOFU violation).
-    KeyMismatch(String),
-    /// Duplicate HELLO received after exchange already completed.
-    DuplicateHello,
-    /// Legacy downgrade attempt: raw `bolt-hello-v1` payload in WebHelloV1 mode.
-    DowngradeAttempt,
-}
-
-impl HelloError {
-    /// Wire error code string for DcErrorMessage.
-    ///
-    /// Aligned with PROTOCOL_ENFORCEMENT.md Appendix A registry.
-    pub fn code(&self) -> &'static str {
-        match self {
-            HelloError::ParseError(_) => "HELLO_PARSE_ERROR",
-            HelloError::DecryptFail(_) => "HELLO_DECRYPT_FAIL",
-            HelloError::SchemaError(_) => "HELLO_SCHEMA_ERROR",
-            HelloError::KeyMismatch(_) => "KEY_MISMATCH",
-            HelloError::DuplicateHello => "DUPLICATE_HELLO",
-            HelloError::DowngradeAttempt => "PROTOCOL_VIOLATION",
-        }
-    }
-}
-
-impl std::fmt::Display for HelloError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HelloError::ParseError(detail) => write!(f, "HELLO parse error: {detail}"),
-            HelloError::DecryptFail(detail) => write!(f, "HELLO decrypt failure: {detail}"),
-            HelloError::SchemaError(detail) => write!(f, "HELLO schema error: {detail}"),
-            HelloError::KeyMismatch(detail) => write!(f, "identity key mismatch: {detail}"),
-            HelloError::DuplicateHello => write!(f, "duplicate HELLO — exactly-once violation"),
-            HelloError::DowngradeAttempt => {
-                write!(f, "legacy 'bolt-hello-v1' payload — downgrade refused")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HelloError {}
-
-// ── Key helpers ─────────────────────────────────────────────
+// ── Key helpers (profile-level, stays in daemon) ────────────
 
 /// Decode a base64 identity public key into a fixed-size array.
 pub fn decode_public_key(b64: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {

@@ -65,8 +65,8 @@ pub mod test_support {
         parse_hello_typed, HelloError, HelloState, WebHelloInner,
     };
 
-    // Session
-    pub use crate::session::SessionContext;
+    // Session (canonical in bolt_core::session since RC2-EXEC-E)
+    pub use crate::session::{SessionContext, SessionState};
 
     // Inner messages
     pub use crate::dc_messages::{encode_dc_message, parse_dc_message, DcMessage, DcParseError};

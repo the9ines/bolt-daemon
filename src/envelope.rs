@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::session::SessionContext;
+use bolt_core::session::SessionContext;
 
 // ── Wire types ──────────────────────────────────────────────
 
@@ -123,44 +123,20 @@ impl fmt::Display for EnvelopeError {
 impl std::error::Error for EnvelopeError {}
 
 // ── Canonical error code registry ──────────────────────────
+//
+// RC2-EXEC-E (AC-RC-07): The canonical wire error code registry now lives
+// in bolt_core::errors::WIRE_ERROR_CODES (26 codes: 11 PROTOCOL + 11
+// ENFORCEMENT + 4 BTR). The daemon's former 22-code CANONICAL_ERROR_CODES
+// was a subset missing BTR codes. Validation now uses the complete registry.
 
-/// Canonical wire error code registry — 22 codes (11 PROTOCOL + 11 ENFORCEMENT).
-///
-/// Source: PROTOCOL.md §10 (v0.1.3-spec). Every error frame sent on the wire
-/// MUST use a code from this array. Implementations MUST reject inbound error
-/// frames carrying codes not listed here (→ PROTOCOL_VIOLATION + disconnect).
-pub const CANONICAL_ERROR_CODES: &[&str] = &[
-    // PROTOCOL class (11)
-    "VERSION_MISMATCH",
-    "ENCRYPTION_FAILED",
-    "INTEGRITY_FAILED",
-    "REPLAY_DETECTED",
-    "TRANSFER_FAILED",
-    "LIMIT_EXCEEDED",
-    "CONNECTION_LOST",
-    "PEER_NOT_FOUND",
-    "ALREADY_CONNECTED",
-    "INVALID_STATE",
-    "KEY_MISMATCH",
-    // ENFORCEMENT class (11)
-    "DUPLICATE_HELLO",
-    "ENVELOPE_REQUIRED",
-    "ENVELOPE_UNNEGOTIATED",
-    "ENVELOPE_DECRYPT_FAIL",
-    "ENVELOPE_INVALID",
-    "HELLO_PARSE_ERROR",
-    "HELLO_DECRYPT_FAIL",
-    "HELLO_SCHEMA_ERROR",
-    "INVALID_MESSAGE",
-    "UNKNOWN_MESSAGE_TYPE",
-    "PROTOCOL_VIOLATION",
-];
+/// Re-export for backward compatibility with test_support consumers.
+pub use bolt_core::errors::WIRE_ERROR_CODES as CANONICAL_ERROR_CODES;
 
 /// Validate an inbound remote error message against the canonical registry.
 ///
 /// Checks:
 /// - `code` field exists and is a non-empty string
-/// - `code` matches a registered canonical error code
+/// - `code` matches a registered canonical error code (bolt_core::errors)
 /// - `message` field, if present, is a string
 ///
 /// Returns validated (code, message) on success.
@@ -190,7 +166,7 @@ pub fn validate_inbound_error(
         }
     };
 
-    if !CANONICAL_ERROR_CODES.contains(&code) {
+    if !bolt_core::errors::is_valid_wire_error_code(code) {
         return Err(EnvelopeError::ProtocolViolation(format!(
             "inbound error: unknown error code '{code}'"
         )));
@@ -724,15 +700,16 @@ mod tests {
     // ── PROTO-HARDEN-2A: registry expansion tests ────────────
 
     #[test]
-    fn canonical_registry_has_exactly_22_codes() {
-        assert_eq!(CANONICAL_ERROR_CODES.len(), 22);
+    fn canonical_registry_has_expected_code_count() {
+        // RC2-EXEC-E: Now uses bolt_core::errors::WIRE_ERROR_CODES (26 = 11P + 11E + 4BTR)
+        assert_eq!(CANONICAL_ERROR_CODES.len(), 26);
     }
 
     #[test]
     fn canonical_registry_all_unique() {
         let mut seen = std::collections::HashSet::new();
-        for code in CANONICAL_ERROR_CODES {
-            assert!(seen.insert(*code), "duplicate code: {code}");
+        for code in &CANONICAL_ERROR_CODES {
+            assert!(seen.insert(code), "duplicate code: {code}");
         }
     }
 

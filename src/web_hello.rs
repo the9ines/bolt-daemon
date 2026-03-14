@@ -44,7 +44,11 @@ pub enum InteropHelloMode {
 ///
 /// SA15 superseded: `bolt.file-hash` now implemented (B4). Receiver-side
 /// SHA-256 verification after reassembly. Mismatch → INTEGRITY_FAILED + disconnect.
-pub const DAEMON_CAPABILITIES: &[&str] = &["bolt.profile-envelope-v1", "bolt.file-hash"];
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    "bolt.profile-envelope-v1",
+    "bolt.file-hash",
+    "bolt.transfer-ratchet-v1",
+];
 
 /// Return daemon capabilities as owned Strings.
 pub fn daemon_capabilities() -> Vec<String> {

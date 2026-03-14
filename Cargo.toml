@@ -24,6 +24,7 @@ path = "src/ipc_client_main.rs"
 [features]
 test-support = []
 transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
+transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
@@ -35,6 +36,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.24"
 rand = "0.8"
+
+# WebSocket transport (RC5 PM-RC-02) — feature-gated
+tokio-tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 
 # QUIC transport (RC3 reference path) — feature-gated
 quinn = { version = "0.11", optional = true }
@@ -64,7 +69,9 @@ bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr", features = ["test-support"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [profile.dev]
 opt-level = 0

@@ -187,13 +187,12 @@ impl QuicFramedStream {
 ///
 /// # RC3 REFERENCE MODE ONLY
 /// Not for production. No identity binding.
-fn generate_self_signed_cert()
-    -> Result<(Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>), QuicTransportError>
-{
+fn generate_self_signed_cert(
+) -> Result<(Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>), QuicTransportError> {
     let cert_params = rcgen::CertificateParams::new(vec!["bolt-rc3-reference".to_string()])
         .map_err(|e| QuicTransportError::Tls(format!("cert params: {e}")))?;
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| QuicTransportError::Tls(format!("keygen: {e}")))?;
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| QuicTransportError::Tls(format!("keygen: {e}")))?;
     let cert = cert_params
         .self_signed(&key_pair)
         .map_err(|e| QuicTransportError::Tls(format!("self-sign: {e}")))?;
@@ -389,7 +388,9 @@ pub struct QuicDialer;
 
 impl QuicDialer {
     /// Connect to a remote QUIC endpoint and open a bidirectional stream.
-    pub async fn connect(remote: SocketAddr) -> Result<(Endpoint, QuicFramedStream), QuicTransportError> {
+    pub async fn connect(
+        remote: SocketAddr,
+    ) -> Result<(Endpoint, QuicFramedStream), QuicTransportError> {
         let client_config = build_client_config()?;
 
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
@@ -563,11 +564,11 @@ mod tests {
 
         // Send 5 messages of varying sizes
         let payloads: Vec<Vec<u8>> = vec![
-            vec![0u8; 1],         // 1 byte
-            vec![1u8; 100],       // 100 bytes
-            vec![2u8; 16384],     // 16 KiB (default chunk size)
-            vec![3u8; 65536],     // 64 KiB
-            vec![],               // empty message
+            vec![0u8; 1],     // 1 byte
+            vec![1u8; 100],   // 100 bytes
+            vec![2u8; 16384], // 16 KiB (default chunk size)
+            vec![3u8; 65536], // 64 KiB
+            vec![],           // empty message
         ];
 
         for p in &payloads {

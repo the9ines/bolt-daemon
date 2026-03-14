@@ -17,6 +17,12 @@ pub mod transfer;
 #[doc(hidden)]
 pub mod web_hello;
 
+/// WebSocket server endpoint (RC5 PM-RC-02).
+/// Feature-gated behind `transport-ws`.
+#[cfg(feature = "transport-ws")]
+#[doc(hidden)]
+pub mod ws_endpoint;
+
 /// Deterministic payload exchanged during the legacy hello protocol.
 /// Used by `web_hello::parse_hello_message` for no-downgrade detection.
 pub const HELLO_PAYLOAD: &[u8] = b"bolt-hello-v1";

@@ -49,10 +49,7 @@ async fn ac_rc_13_quic_smoke_1mib_transfer() {
         let received_hash = sha256_hex(&received);
 
         // Send ack
-        stream
-            .send_message(received_hash.as_bytes())
-            .await
-            .unwrap();
+        stream.send_message(received_hash.as_bytes()).await.unwrap();
 
         // Wait for dialer to finish before dropping endpoint.
         // Otherwise quinn's Endpoint::drop sends CONNECTION_CLOSE

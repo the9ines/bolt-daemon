@@ -17,10 +17,7 @@ use bolt_daemon::quic_transport::{QuicDialer, QuicListener};
 /// deterministic key material. Both contexts share the same transfer root key
 /// and start at chain_index 0 — equivalent to two peers after a successful
 /// DH ratchet step producing identical transfer_root_key.
-fn create_matched_btr_contexts() -> (
-    bolt_btr::BtrTransferContext,
-    bolt_btr::BtrTransferContext,
-) {
+fn create_matched_btr_contexts() -> (bolt_btr::BtrTransferContext, bolt_btr::BtrTransferContext) {
     let transfer_id = [0x42u8; 16];
     // Deterministic transfer root key for test reproducibility
     let trk = bolt_core::hash::sha256(b"rc3-btr-over-quic-test-key");
@@ -105,10 +102,7 @@ async fn ac_rc_14_btr_multi_chunk_transfer_over_quic() {
         for _ in 0..count {
             let idx_bytes = stream.recv_message().await.unwrap();
             let sealed = stream.recv_message().await.unwrap();
-            received.push((
-                u32::from_be_bytes(idx_bytes.try_into().unwrap()),
-                sealed,
-            ));
+            received.push((u32::from_be_bytes(idx_bytes.try_into().unwrap()), sealed));
         }
         stream.finish().await.ok();
         listener.close();
@@ -206,10 +200,7 @@ async fn ac_rc_14_quic_framing_preserves_sealed_bytes() {
         for _ in 0..count {
             let idx_bytes = stream.recv_message().await.unwrap();
             let sealed = stream.recv_message().await.unwrap();
-            received.push((
-                u32::from_be_bytes(idx_bytes.try_into().unwrap()),
-                sealed,
-            ));
+            received.push((u32::from_be_bytes(idx_bytes.try_into().unwrap()), sealed));
         }
         stream.finish().await.ok();
         listener.close();

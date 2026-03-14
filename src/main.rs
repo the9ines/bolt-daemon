@@ -29,6 +29,8 @@ pub(crate) mod web_signal;
 #[cfg(feature = "transport-quic")]
 mod quic_transport;
 
+#[cfg(feature = "transport-ws")]
+pub(crate) use bolt_daemon::ws_endpoint;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -143,6 +145,10 @@ pub(crate) struct Args {
     /// QUIC connect address (offerer, e.g. "192.168.1.50:4433").
     #[cfg(feature = "transport-quic")]
     pub(crate) quic_connect: Option<String>,
+    /// WebSocket listen address (e.g. "127.0.0.1:9100").
+    /// When present, spawns a WS endpoint alongside the existing transport.
+    #[cfg(feature = "transport-ws")]
+    pub(crate) ws_listen: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -182,6 +188,8 @@ fn parse_args_from(argv: &[String]) -> Args {
     let mut quic_listen = None;
     #[cfg(feature = "transport-quic")]
     let mut quic_connect = None;
+    #[cfg(feature = "transport-ws")]
+    let mut ws_listen = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -486,6 +494,17 @@ fn parse_args_from(argv: &[String]) -> Args {
                     }
                 });
             }
+            #[cfg(feature = "transport-ws")]
+            "--ws-listen" => {
+                i += 1;
+                ws_listen = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--ws-listen requires an address (e.g. 127.0.0.1:9100)");
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -598,6 +617,8 @@ fn parse_args_from(argv: &[String]) -> Args {
         quic_listen,
         #[cfg(feature = "transport-quic")]
         quic_connect,
+        #[cfg(feature = "transport-ws")]
+        ws_listen,
     }
 }
 
@@ -1194,7 +1215,10 @@ fn run_smoke_quic_listener(args: &Args) -> Result<(), smoke::SmokeError> {
             let expected_payload = smoke::generate_payload(args.smoke_config.bytes);
             let expected_hash = smoke::sha256_hex(&expected_payload);
 
-            eprintln!("[smoke-quic-listener] waiting for {} bytes...", args.smoke_config.bytes);
+            eprintln!(
+                "[smoke-quic-listener] waiting for {} bytes...",
+                args.smoke_config.bytes
+            );
             let start = std::time::Instant::now();
 
             let mut received = Vec::with_capacity(args.smoke_config.bytes);
@@ -1261,7 +1285,9 @@ fn run_smoke_quic_dialer(args: &Args) -> Result<(), smoke::SmokeError> {
     let connect_addr: std::net::SocketAddr = args
         .quic_connect
         .as_deref()
-        .ok_or_else(|| smoke::SmokeError::Signaling("--quic-connect required for QUIC offerer".to_string()))?
+        .ok_or_else(|| {
+            smoke::SmokeError::Signaling("--quic-connect required for QUIC offerer".to_string())
+        })?
         .parse()
         .map_err(|e| smoke::SmokeError::Signaling(format!("parse connect addr: {e}")))?;
 
@@ -1283,7 +1309,10 @@ fn run_smoke_quic_dialer(args: &Args) -> Result<(), smoke::SmokeError> {
             let payload = smoke::generate_payload(args.smoke_config.bytes);
             let expected_hash = smoke::sha256_hex(&payload);
 
-            eprintln!("[smoke-quic-dialer] sending {} bytes...", args.smoke_config.bytes);
+            eprintln!(
+                "[smoke-quic-dialer] sending {} bytes...",
+                args.smoke_config.bytes
+            );
             let start = std::time::Instant::now();
 
             // Send payload in 64 KiB chunks (matching DataChannel smoke chunk size)
@@ -1315,8 +1344,9 @@ fn run_smoke_quic_dialer(args: &Args) -> Result<(), smoke::SmokeError> {
                 0.0
             };
 
-            let received_hash = String::from_utf8(ack)
-                .map_err(|_| smoke::SmokeError::DataChannel("invalid ack: not UTF-8".to_string()))?;
+            let received_hash = String::from_utf8(ack).map_err(|_| {
+                smoke::SmokeError::DataChannel("invalid ack: not UTF-8".to_string())
+            })?;
 
             if received_hash != expected_hash {
                 return Err(smoke::SmokeError::IntegrityMismatch {
@@ -1511,6 +1541,43 @@ fn main() {
                     eprintln!("[bolt-daemon] FATAL: {}", e);
                     std::process::exit(1);
                 }
+            };
+
+            // ── WS endpoint (RC5 PM-RC-02) ────────────────────────
+            // When --ws-listen is provided, spawn a WebSocket endpoint
+            // on a tokio runtime alongside the existing transport path.
+            #[cfg(feature = "transport-ws")]
+            let _ws_shutdown_tx = if let Some(ref ws_addr_str) = args.ws_listen {
+                let ws_addr: std::net::SocketAddr = match ws_addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!(
+                            "[WS_ENDPOINT] FATAL: invalid --ws-listen address '{ws_addr_str}': {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let ws_identity = bolt_core::crypto::KeyPair {
+                    public_key: identity.public_key,
+                    secret_key: identity.secret_key,
+                };
+                let ws_config = ws_endpoint::WsEndpointConfig {
+                    listen_addr: ws_addr,
+                    identity_keypair: ws_identity,
+                };
+                eprintln!("[WS_ENDPOINT] starting on {ws_addr}");
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx).await {
+                            eprintln!("[WS_ENDPOINT] FATAL: {e}");
+                        }
+                    });
+                });
+                Some(shutdown_tx)
+            } else {
+                None
             };
 
             let role = match args.role.as_ref() {

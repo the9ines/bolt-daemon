@@ -26,6 +26,10 @@ mod rendezvous;
 mod smoke;
 pub(crate) mod web_signal;
 
+#[cfg(feature = "transport-quic")]
+mod quic_transport;
+
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -90,6 +94,16 @@ pub(crate) enum SimulateEvent {
     IncomingTransfer,
 }
 
+/// Selects the peer-to-peer transport backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportMode {
+    /// WebRTC DataChannel via libdatachannel (default, existing path).
+    DataChannel,
+    /// QUIC via quinn (RC3 reference path, requires `transport-quic` feature).
+    #[cfg(feature = "transport-quic")]
+    Quic,
+}
+
 /// Selects which DataChannel mode the daemon uses after HELLO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InteropDcMode {
@@ -122,6 +136,13 @@ pub(crate) struct Args {
     pub(crate) interop_dc: InteropDcMode,
     pub(crate) socket_path: Option<String>,
     pub(crate) data_dir: Option<String>,
+    pub(crate) transport_mode: TransportMode,
+    /// QUIC listen address (answerer, e.g. "0.0.0.0:4433").
+    #[cfg(feature = "transport-quic")]
+    pub(crate) quic_listen: Option<String>,
+    /// QUIC connect address (offerer, e.g. "192.168.1.50:4433").
+    #[cfg(feature = "transport-quic")]
+    pub(crate) quic_connect: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -156,6 +177,11 @@ fn parse_args_from(argv: &[String]) -> Args {
     let mut interop_dc = None;
     let mut socket_path = None;
     let mut data_dir = None;
+    let mut transport_mode = None;
+    #[cfg(feature = "transport-quic")]
+    let mut quic_listen = None;
+    #[cfg(feature = "transport-quic")]
+    let mut quic_connect = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -418,6 +444,48 @@ fn parse_args_from(argv: &[String]) -> Args {
                     }
                 });
             }
+            "--transport" => {
+                i += 1;
+                transport_mode = Some(match argv.get(i).map(|s| s.as_str()) {
+                    Some("datachannel") => TransportMode::DataChannel,
+                    #[cfg(feature = "transport-quic")]
+                    Some("quic") => TransportMode::Quic,
+                    #[cfg(not(feature = "transport-quic"))]
+                    Some("quic") => {
+                        eprintln!("FATAL: --transport quic requires the 'transport-quic' feature");
+                        std::process::exit(1);
+                    }
+                    other => {
+                        eprintln!(
+                            "--transport must be 'datachannel' or 'quic', got {:?}",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
+            #[cfg(feature = "transport-quic")]
+            "--quic-listen" => {
+                i += 1;
+                quic_listen = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--quic-listen requires an address (e.g. 0.0.0.0:4433)");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            #[cfg(feature = "transport-quic")]
+            "--quic-connect" => {
+                i += 1;
+                quic_connect = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--quic-connect requires an address (e.g. 192.168.1.50:4433)");
+                        std::process::exit(1);
+                    }
+                });
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -525,6 +593,11 @@ fn parse_args_from(argv: &[String]) -> Args {
         interop_dc: interop_dc_val,
         socket_path,
         data_dir,
+        transport_mode: transport_mode.unwrap_or(TransportMode::DataChannel),
+        #[cfg(feature = "transport-quic")]
+        quic_listen,
+        #[cfg(feature = "transport-quic")]
+        quic_connect,
     }
 }
 
@@ -1079,6 +1152,196 @@ fn run_smoke_rendezvous(args: &Args) -> Result<(), smoke::SmokeError> {
     })
 }
 
+// ── QUIC smoke mode (RC3 reference path) ─────────────────────
+
+#[cfg(feature = "transport-quic")]
+fn run_smoke_quic_listener(args: &Args) -> Result<(), smoke::SmokeError> {
+    use quic_transport::QuicListener;
+
+    let listen_addr: std::net::SocketAddr = args
+        .quic_listen
+        .as_deref()
+        .unwrap_or("0.0.0.0:4433")
+        .parse()
+        .map_err(|e| smoke::SmokeError::Signaling(format!("parse listen addr: {e}")))?;
+
+    // Build tokio runtime for QUIC async operations
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| smoke::SmokeError::DataChannel(format!("tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let listener = QuicListener::bind(listen_addr)
+            .map_err(|e| smoke::SmokeError::Signaling(format!("QUIC bind: {e}")))?;
+
+        eprintln!(
+            "[smoke-quic-listener] listening on {} (waiting for dialer...)",
+            listener.local_addr()
+        );
+
+        let mut stream = listener
+            .accept()
+            .await
+            .map_err(|e| smoke::SmokeError::DataChannel(format!("QUIC accept: {e}")))?;
+
+        eprintln!("[smoke-quic-listener] connection accepted, starting transfer");
+
+        for run in 1..=args.smoke_config.repeat {
+            if args.smoke_config.repeat > 1 {
+                eprintln!("[smoke] run {}/{}", run, args.smoke_config.repeat);
+            }
+
+            // Receive payload
+            let expected_payload = smoke::generate_payload(args.smoke_config.bytes);
+            let expected_hash = smoke::sha256_hex(&expected_payload);
+
+            eprintln!("[smoke-quic-listener] waiting for {} bytes...", args.smoke_config.bytes);
+            let start = std::time::Instant::now();
+
+            let mut received = Vec::with_capacity(args.smoke_config.bytes);
+            loop {
+                let msg = stream
+                    .recv_message()
+                    .await
+                    .map_err(|e| smoke::SmokeError::DataChannel(format!("recv: {e}")))?;
+                if msg.is_empty() {
+                    break; // end-of-transfer sentinel
+                }
+                received.extend_from_slice(&msg);
+                if received.len() >= args.smoke_config.bytes {
+                    break;
+                }
+            }
+
+            received.truncate(args.smoke_config.bytes);
+
+            let elapsed = start.elapsed();
+            let latency_ms = elapsed.as_millis() as u64;
+            let throughput_mbps = if latency_ms > 0 {
+                (args.smoke_config.bytes as f64 / 1_000_000.0) / (latency_ms as f64 / 1_000.0)
+            } else {
+                0.0
+            };
+
+            let received_hash = smoke::sha256_hex(&received);
+
+            // Send SHA-256 ack
+            stream
+                .send_message(received_hash.as_bytes())
+                .await
+                .map_err(|e| smoke::SmokeError::DataChannel(format!("ack send: {e}")))?;
+
+            if received_hash != expected_hash {
+                return Err(smoke::SmokeError::IntegrityMismatch {
+                    expected: expected_hash,
+                    received: received_hash,
+                });
+            }
+
+            let report = smoke::SmokeReport::success(
+                args.smoke_config.bytes,
+                expected_hash,
+                received_hash,
+                latency_ms,
+                throughput_mbps,
+                args.smoke_config.repeat,
+            );
+            report.print(args.smoke_config.json);
+        }
+
+        stream.finish().await.ok();
+        listener.close();
+        Ok(())
+    })
+}
+
+#[cfg(feature = "transport-quic")]
+fn run_smoke_quic_dialer(args: &Args) -> Result<(), smoke::SmokeError> {
+    use quic_transport::QuicDialer;
+
+    let connect_addr: std::net::SocketAddr = args
+        .quic_connect
+        .as_deref()
+        .ok_or_else(|| smoke::SmokeError::Signaling("--quic-connect required for QUIC offerer".to_string()))?
+        .parse()
+        .map_err(|e| smoke::SmokeError::Signaling(format!("parse connect addr: {e}")))?;
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| smoke::SmokeError::DataChannel(format!("tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let (endpoint, mut stream) = QuicDialer::connect(connect_addr)
+            .await
+            .map_err(|e| smoke::SmokeError::Signaling(format!("QUIC connect: {e}")))?;
+
+        eprintln!("[smoke-quic-dialer] connected, starting transfer");
+
+        for run in 1..=args.smoke_config.repeat {
+            if args.smoke_config.repeat > 1 {
+                eprintln!("[smoke] run {}/{}", run, args.smoke_config.repeat);
+            }
+
+            let payload = smoke::generate_payload(args.smoke_config.bytes);
+            let expected_hash = smoke::sha256_hex(&payload);
+
+            eprintln!("[smoke-quic-dialer] sending {} bytes...", args.smoke_config.bytes);
+            let start = std::time::Instant::now();
+
+            // Send payload in 64 KiB chunks (matching DataChannel smoke chunk size)
+            const SEND_CHUNK_SIZE: usize = 65_536;
+            for chunk in payload.chunks(SEND_CHUNK_SIZE) {
+                stream
+                    .send_message(chunk)
+                    .await
+                    .map_err(|e| smoke::SmokeError::DataChannel(format!("send: {e}")))?;
+            }
+
+            // Send empty sentinel to signal end-of-transfer
+            stream
+                .send_message(&[])
+                .await
+                .map_err(|e| smoke::SmokeError::DataChannel(format!("send sentinel: {e}")))?;
+
+            // Wait for SHA-256 ack
+            let ack = stream
+                .recv_message()
+                .await
+                .map_err(|e| smoke::SmokeError::DataChannel(format!("recv ack: {e}")))?;
+
+            let elapsed = start.elapsed();
+            let latency_ms = elapsed.as_millis() as u64;
+            let throughput_mbps = if latency_ms > 0 {
+                (args.smoke_config.bytes as f64 / 1_000_000.0) / (latency_ms as f64 / 1_000.0)
+            } else {
+                0.0
+            };
+
+            let received_hash = String::from_utf8(ack)
+                .map_err(|_| smoke::SmokeError::DataChannel("invalid ack: not UTF-8".to_string()))?;
+
+            if received_hash != expected_hash {
+                return Err(smoke::SmokeError::IntegrityMismatch {
+                    expected: expected_hash,
+                    received: received_hash,
+                });
+            }
+
+            let report = smoke::SmokeReport::success(
+                args.smoke_config.bytes,
+                expected_hash,
+                received_hash,
+                latency_ms,
+                throughput_mbps,
+                args.smoke_config.repeat,
+            );
+            report.print(args.smoke_config.json);
+        }
+
+        stream.finish().await.ok();
+        endpoint.close(0u32.into(), b"done");
+        Ok(())
+    })
+}
+
 // ── Simulate mode ────────────────────────────────────────────
 
 fn run_simulate(simulate_event: SimulateEvent) {
@@ -1178,11 +1441,12 @@ fn run_simulate(simulate_event: SimulateEvent) {
 fn main() {
     let args = parse_args();
     eprintln!(
-        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} pairing={:?} interop_signal={:?} interop_hello={:?} interop_dc={:?} timeout={}s socket_path={:?} data_dir={:?}",
+        "[bolt-daemon] role={:?} signal={:?} scope={:?} mode={:?} transport={:?} pairing={:?} interop_signal={:?} interop_hello={:?} interop_dc={:?} timeout={}s socket_path={:?} data_dir={:?}",
         args.role,
         args.signal_mode,
         args.network_scope,
         args.daemon_mode,
+        args.transport_mode,
         args.pairing_policy,
         args.interop_signal,
         args.interop_hello,
@@ -1288,6 +1552,32 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+
+            // QUIC transport path (RC3 reference)
+            #[cfg(feature = "transport-quic")]
+            if matches!(args.transport_mode, TransportMode::Quic) {
+                let result = match role {
+                    Role::Offerer => run_smoke_quic_dialer(&args),
+                    Role::Answerer => run_smoke_quic_listener(&args),
+                };
+                match result {
+                    Ok(()) => {
+                        eprintln!("[bolt-daemon] exit 0");
+                        std::process::exit(smoke::EXIT_SUCCESS);
+                    }
+                    Err(e) => {
+                        let report = smoke::SmokeReport::failure(
+                            &e,
+                            args.smoke_config.bytes,
+                            args.smoke_config.repeat,
+                        );
+                        report.print(args.smoke_config.json);
+                        std::process::exit(e.exit_code());
+                    }
+                }
+            }
+
+            // DataChannel transport path (existing)
             let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_smoke_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_smoke_answerer(&args),

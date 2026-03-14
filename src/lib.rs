@@ -46,6 +46,12 @@ pub fn ipc_transport_bind(
 #[doc(hidden)]
 pub mod ipc;
 
+/// QUIC transport adapter (RC3 reference path).
+/// Feature-gated behind `transport-quic`.
+#[cfg(feature = "transport-quic")]
+#[doc(hidden)]
+pub mod quic_transport;
+
 /// Test-only re-exports for integration tests.
 ///
 /// Gated behind `--features test-support` so release builds carry no

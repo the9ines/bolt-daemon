@@ -25,6 +25,28 @@ use crate::{
     NetworkScope, SignalBundle, DC_LABEL, HELLO_PAYLOAD,
 };
 
+// ── EN3e IPC event helpers ──────────────────────────────────
+
+/// Convert a Vec<u8> or slice to &[u8; 32], returning zeros if wrong length.
+fn to_32(v: &[u8]) -> [u8; 32] {
+    let mut arr = [0u8; 32];
+    if v.len() >= 32 {
+        arr.copy_from_slice(&v[..32]);
+    }
+    arr
+}
+
+/// Emit an IPC event to the UI client if available. Non-blocking, best-effort.
+fn emit_ipc(
+    ipc_server: Option<&crate::ipc::server::IpcServer>,
+    msg_type: &str,
+    payload: serde_json::Value,
+) {
+    if let Some(server) = ipc_server {
+        server.emit_event(crate::ipc::types::IpcMessage::new_event(msg_type, payload));
+    }
+}
+
 // ── Constants ───────────────────────────────────────────────
 
 /// Current payload version. Reject any payload with a different version.
@@ -929,6 +951,7 @@ pub(crate) fn run_post_hello_loop(
 /// If the server is down or peer is unreachable, exit 1.
 pub fn run_offerer_rendezvous(
     args: &Args,
+    ipc_server: Option<&crate::ipc::server::IpcServer>,
     trust_path: &std::path::Path,
     identity: &bolt_core::identity::IdentityKeyPair,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1129,6 +1152,10 @@ pub fn run_offerer_rendezvous(
         .ok_or("phase timeout expired waiting for DataChannel open")?;
     dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[offerer] DataChannel open");
+    emit_ipc(ipc_server, "session.connected", serde_json::json!({
+        "remote_peer_id": to_peer,
+        "negotiated_capabilities": []
+    }));
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
@@ -1194,6 +1221,25 @@ pub fn run_offerer_rendezvous(
             "[INTEROP-2] HELLO exchange complete — remote_identity={}, negotiated_caps={:?}",
             remote_hello.identity_public_key, negotiated
         );
+
+        // EN3e: Compute and emit SAS code via IPC (offerer)
+        {
+            let sas = bolt_core::sas::compute_sas(
+                &identity.public_key,
+                &to_32(&bolt_core::encoding::from_base64(&remote_hello.identity_public_key).unwrap_or_default()),
+                &local_session.public_key,
+                &to_32(&bolt_core::encoding::from_base64(remote_pk_b64_str).unwrap_or_default()),
+            );
+            eprintln!("[SAS] {sas}");
+            emit_ipc(ipc_server, "session.sas", serde_json::json!({
+                "sas": sas,
+                "remote_identity_pk_b64": remote_hello.identity_public_key,
+            }));
+            emit_ipc(ipc_server, "session.connected", serde_json::json!({
+                "remote_peer_id": to_peer,
+                "negotiated_capabilities": negotiated,
+            }));
+        }
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
         // N4: Move ownership via .take() instead of cloning secret key material.
@@ -1476,6 +1522,10 @@ pub fn run_answerer_rendezvous(
         .ok_or("phase timeout expired waiting for DataChannel open")?;
     ch.dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[answerer] DataChannel open");
+    emit_ipc(ipc_server, "session.connected", serde_json::json!({
+        "remote_peer_id": expect_peer,
+        "negotiated_capabilities": []
+    }));
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
@@ -1535,6 +1585,29 @@ pub fn run_answerer_rendezvous(
             "[INTEROP-2] HELLO exchange complete — remote_identity={}, negotiated_caps={:?}",
             remote_hello.identity_public_key, negotiated
         );
+
+        // EN3e: Compute and emit SAS code via IPC
+        {
+            let local_identity_b64 = bolt_core::encoding::to_base64(&identity.public_key);
+            let local_session_b64 = bolt_core::encoding::to_base64(&local_session.public_key);
+            let remote_session_b64 = remote_pk_b64_str;
+            let sas = bolt_core::sas::compute_sas(
+                &identity.public_key,
+                &to_32(&bolt_core::encoding::from_base64(&remote_hello.identity_public_key).unwrap_or_default()),
+                &local_session.public_key,
+                &to_32(&bolt_core::encoding::from_base64(remote_session_b64).unwrap_or_default()),
+            );
+            eprintln!("[SAS] {sas}");
+            emit_ipc(ipc_server, "session.sas", serde_json::json!({
+                "sas": sas,
+                "remote_identity_pk_b64": remote_hello.identity_public_key,
+            }));
+            // Update session.connected with negotiated caps
+            emit_ipc(ipc_server, "session.connected", serde_json::json!({
+                "remote_peer_id": expect_peer,
+                "negotiated_capabilities": negotiated,
+            }));
+        }
 
         // ── B5 Stage B (answerer): decode identity + enforce TOFU pin ──
         let ans_remote_identity_bytes =

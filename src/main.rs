@@ -1591,7 +1591,7 @@ fn main() {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
                 (Role::Offerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_offerer_rendezvous(&args, &trust_path, &identity)
+                    rendezvous::run_offerer_rendezvous(&args, ipc_server.as_ref(), &trust_path, &identity)
                 }
                 (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(
                     &args,

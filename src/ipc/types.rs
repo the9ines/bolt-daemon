@@ -69,6 +69,56 @@ pub struct DaemonStatusPayload {
     pub version: String,
 }
 
+// ── Session Lifecycle Payloads (daemon -> UI, EN3e) ─────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionConnectedPayload {
+    pub remote_peer_id: String,
+    pub negotiated_capabilities: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionSasPayload {
+    pub sas: String,
+    pub remote_identity_pk_b64: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionErrorPayload {
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionEndedPayload {
+    pub reason: String,
+}
+
+// ── Transfer Lifecycle Payloads (daemon -> UI, EN3e) ────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TransferStartedPayload {
+    pub transfer_id: String,
+    pub file_name: String,
+    pub file_size_bytes: u64,
+    pub direction: String, // "send" or "receive"
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TransferProgressPayload {
+    pub transfer_id: String,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub progress: f32, // 0.0 - 1.0
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TransferCompletePayload {
+    pub transfer_id: String,
+    pub file_name: String,
+    pub bytes_transferred: u64,
+    pub verified: bool,
+}
+
 // ── Version Handshake Payloads ───────────────────────────────
 
 /// Payload for `version.handshake` (app -> daemon, first message after connect).

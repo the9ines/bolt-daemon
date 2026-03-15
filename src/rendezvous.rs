@@ -614,6 +614,7 @@ pub(crate) fn run_post_hello_loop(
     mut send_fn: impl FnMut(&[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     deadline: Instant,
     session: &crate::session::SessionContext,
+    ipc_server: Option<&crate::ipc::server::IpcServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const PING_INTERVAL: Duration = Duration::from_secs(2);
     let mut last_ping = Instant::now();
@@ -642,6 +643,22 @@ pub(crate) fn run_post_hello_loop(
         if send_session.is_send_active() {
             match send_session.next_chunk() {
                 Ok(Some(chunk)) => {
+                    // EN3f: capture transfer_id before move
+                    let tid_ref = chunk.transfer_id.clone();
+                    let chunk_idx = chunk.chunk_index;
+                    let total = chunk.total_chunks;
+                    let chunk_len = chunk.data.len();
+
+                    // EN3f: emit transfer.started on first chunk
+                    if chunk_idx == 0 {
+                        emit_ipc(ipc_server, "transfer.started", serde_json::json!({
+                            "transfer_id": tid_ref,
+                            "file_name": "outgoing",
+                            "file_size_bytes": 0,
+                            "direction": "send"
+                        }));
+                    }
+
                     let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
                     let msg = crate::dc_messages::DcMessage::FileChunk {
                         transfer_id: chunk.transfer_id,
@@ -653,6 +670,17 @@ pub(crate) fn run_post_hello_loop(
                         .map_err(|e| format!("[B-XFER-1] encode chunk: {e}"))?;
                     let env = crate::envelope::encode_envelope(&json, session)?;
                     send_fn(&env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+                    // EN3f: emit transfer.progress after each sent chunk
+                    let progress = if total > 0 {
+                        (chunk_idx + 1) as f64 / total as f64
+                    } else { 0.0 };
+                    emit_ipc(ipc_server, "transfer.progress", serde_json::json!({
+                        "transfer_id": tid_ref,
+                        "bytes_transferred": (chunk_idx + 1) as u64 * chunk_len as u64,
+                        "total_bytes": total as u64 * chunk_len as u64,
+                        "progress": progress
+                    }));
                 }
                 Ok(None) => {
                     // All chunks sent — send FileFinish
@@ -662,6 +690,7 @@ pub(crate) fn run_post_hello_loop(
                             .map_err(|te| -> Box<dyn std::error::Error> {
                                 format!("[B-XFER-1] finish error: {te}").into()
                             })?;
+                    let tid_clone = tid.clone();
                     let finish_msg = crate::dc_messages::DcMessage::FileFinish {
                         transfer_id: tid,
                         file_hash: None,
@@ -671,8 +700,19 @@ pub(crate) fn run_post_hello_loop(
                     let finish_env = crate::envelope::encode_envelope(&finish_json, session)?;
                     send_fn(&finish_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
                     eprintln!("[B-XFER-1] outbound transfer completed");
+                    // EN3f: emit transfer.complete for send
+                    emit_ipc(ipc_server, "transfer.complete", serde_json::json!({
+                        "transfer_id": tid_clone,
+                        "file_name": "outgoing",
+                        "bytes_transferred": 0,
+                        "verified": false
+                    }));
                 }
                 Err(te) => {
+                    emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
+                        "transfer_id": "",
+                        "reason": format!("chunk error: {te}")
+                    }));
                     return Err(format!("[B-XFER-1] chunk error: {te}").into());
                 }
             }
@@ -764,12 +804,20 @@ pub(crate) fn run_post_hello_loop(
                         };
 
                         // Send FileAccept
+                        let tid_clone = tid.clone();
                         let accept = crate::dc_messages::DcMessage::FileAccept { transfer_id: tid };
                         let accept_json = crate::dc_messages::encode_dc_message(&accept)
                             .map_err(|e| format!("[B3] encode accept: {e}"))?;
                         let accept_env = crate::envelope::encode_envelope(&accept_json, session)?;
                         send_fn(&accept_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
                         eprintln!("[B3] FileOffer accepted via FileAccept");
+                        // EN3f: emit transfer.started for receive
+                        emit_ipc(ipc_server, "transfer.started", serde_json::json!({
+                            "transfer_id": tid_clone,
+                            "file_name": "incoming",
+                            "file_size_bytes": size,
+                            "direction": "receive"
+                        }));
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileChunk {
@@ -801,6 +849,10 @@ pub(crate) fn run_post_hello_loop(
                         if let Err(te) = transfer.on_file_chunk(&transfer_id, chunk_index, &data) {
                             let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
                             eprintln!("[B3] chunk error: {e}");
+                            emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
+                                "transfer_id": transfer_id,
+                                "reason": format!("chunk error: {e}")
+                            }));
                             let err_payload = crate::envelope::build_error_payload(
                                 e.code(),
                                 &e.to_string(),
@@ -809,19 +861,35 @@ pub(crate) fn run_post_hello_loop(
                             let _ = send_fn(&err_payload);
                             return Err(format!("[B6] {e}").into());
                         }
+                        // EN3f: emit transfer.progress after each received chunk
+                        emit_ipc(ipc_server, "transfer.progress", serde_json::json!({
+                            "transfer_id": transfer_id,
+                            "bytes_transferred": (chunk_index + 1) as u64 * data.len() as u64,
+                            "total_bytes": 0,
+                            "progress": chunk_index as f64
+                        }));
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileFinish { transfer_id, .. }) => {
                         let verifier = crate::transfer::Sha256Verifier;
                         match transfer.on_file_finish(&transfer_id, Some(&verifier)) {
                             Ok(()) => {
-                                if transfer.hash_verified() {
+                                let verified = transfer.hash_verified();
+                                if verified {
                                     eprintln!(
                                         "[B4_VERIFY_OK] transfer completed with hash verification"
                                     );
                                 } else {
                                     eprintln!("[B3] transfer completed");
                                 }
+                                // EN3f: emit transfer.complete for receive
+                                let bytes = transfer.completed_bytes().map(|b| b.len() as u64).unwrap_or(0);
+                                emit_ipc(ipc_server, "transfer.complete", serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "file_name": "incoming",
+                                    "bytes_transferred": bytes,
+                                    "verified": verified
+                                }));
                                 #[cfg(feature = "test-support")]
                                 if let Some(ref p) = test_send_path {
                                     if let Some(e) = test_send_offer(p, &mut send_session, session)
@@ -834,6 +902,10 @@ pub(crate) fn run_post_hello_loop(
                             Err(crate::transfer::TransferError::IntegrityFailed(ref detail)) => {
                                 // B4: Hash mismatch → INTEGRITY_FAILED + disconnect
                                 eprintln!("[B4] integrity failed: {detail}");
+                                emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "reason": format!("integrity failed: {detail}")
+                                }));
                                 let err_payload = crate::envelope::build_error_payload(
                                     "INTEGRITY_FAILED",
                                     detail,
@@ -1270,7 +1342,7 @@ pub fn run_offerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&dc_msg_rx, &mut send_fn, deadline, &session)?;
+            run_post_hello_loop(&dc_msg_rx, &mut send_fn, deadline, &session, ipc_server)?;
         }
     } else {
         // Legacy daemon HELLO
@@ -1668,7 +1740,7 @@ pub fn run_answerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, deadline, &session)?;
+            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, deadline, &session, ipc_server)?;
         } else {
             thread::sleep(Duration::from_millis(500));
         }
@@ -2307,7 +2379,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(100);
         let send_fn =
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_ok(), "loop should exit cleanly on deadline");
     }
 
@@ -2331,7 +2403,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_ok());
 
         // Verify pong was sent
@@ -2363,7 +2435,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_err(),
             "unknown message type should cause disconnect"
@@ -2383,7 +2455,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_err(), "malformed frame should cause disconnect");
     }
 
@@ -2416,7 +2488,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_ok(), "FileOffer should not cause disconnect");
 
         // Verify FileAccept was sent
@@ -2472,7 +2544,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_err(), "second FileOffer should cause disconnect");
         let err_str = result.unwrap_err().to_string();
         assert!(
@@ -2555,7 +2627,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "full transfer should exit cleanly, got: {:?}",
@@ -2599,7 +2671,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_err(),
             "chunk before offer should cause disconnect"
@@ -2621,7 +2693,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_ok(), "rx disconnect should be a clean exit");
     }
 
@@ -2682,7 +2754,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "correct hash should succeed, got: {:?}",
@@ -2756,7 +2828,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(result.is_err(), "hash mismatch should disconnect");
         let err_str = result.unwrap_err().to_string();
         assert!(
@@ -2809,7 +2881,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_err(),
             "missing hash when negotiated should disconnect"
@@ -2882,7 +2954,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "hash on wire should be ignored when not negotiated, got: {:?}",
@@ -2943,7 +3015,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "no hash, no negotiation should succeed, got: {:?}",
@@ -2975,7 +3047,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "FileAccept with no active send should not disconnect, got: {:?}",
@@ -3002,7 +3074,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "Cancel with no active send should not disconnect, got: {:?}",
@@ -3028,7 +3100,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "Pause should be absorbed without disconnect, got: {:?}",
@@ -3054,7 +3126,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b);
+        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
         assert!(
             result.is_ok(),
             "Resume should be absorbed without disconnect, got: {:?}",

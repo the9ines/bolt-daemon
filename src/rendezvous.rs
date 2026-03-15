@@ -1342,7 +1342,7 @@ pub fn run_offerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&dc_msg_rx, &mut send_fn, deadline, &session, ipc_server)?;
+            run_post_hello_loop(&dc_msg_rx, &mut send_fn, std::time::Instant::now() + std::time::Duration::from_secs(3600), &session, ipc_server)?;
         }
     } else {
         // Legacy daemon HELLO
@@ -1740,7 +1740,7 @@ pub fn run_answerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, deadline, &session, ipc_server)?;
+            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, std::time::Instant::now() + std::time::Duration::from_secs(3600), &session, ipc_server)?;
         } else {
             thread::sleep(Duration::from_millis(500));
         }

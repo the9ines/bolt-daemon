@@ -281,7 +281,22 @@ fn parse_args_from(argv: &[String]) -> Args {
             "--peer-id" => {
                 i += 1;
                 peer_id = Some(match argv.get(i) {
-                    Some(p) => p.clone(),
+                    Some(p) => {
+                        let normalized: String = p.chars().filter(|c| *c != '-').collect();
+                        if normalized.is_empty() {
+                            eprintln!("error: --peer-id value is empty after removing hyphens");
+                            std::process::exit(1);
+                        }
+                        if normalized.len() > 16 {
+                            eprintln!("error: --peer-id too long (max 16 characters, got {} after removing hyphens)", normalized.len());
+                            std::process::exit(1);
+                        }
+                        if !normalized.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            eprintln!("error: --peer-id must contain only letters, digits, and hyphens. Got: {:?}", p);
+                            std::process::exit(1);
+                        }
+                        normalized
+                    }
                     None => {
                         eprintln!("--peer-id requires a value");
                         std::process::exit(1);

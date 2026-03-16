@@ -612,7 +612,7 @@ fn test_send_offer(
 pub(crate) fn run_post_hello_loop(
     dc_msg_rx: &mpsc::Receiver<Vec<u8>>,
     mut send_fn: impl FnMut(&[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     session: &crate::session::SessionContext,
     ipc_server: Option<&crate::ipc::server::IpcServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -624,17 +624,21 @@ pub(crate) fn run_post_hello_loop(
     let test_send_path = std::env::var("BOLT_TEST_SEND_PAYLOAD_PATH").ok();
 
     loop {
-        if Instant::now() >= deadline {
-            eprintln!("[B6] post-HELLO loop deadline — clean exit");
-            return Ok(());
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                eprintln!("[B6] post-HELLO loop deadline — clean exit");
+                return Ok(());
+            }
         }
 
-        let poll_timeout = std::cmp::min(
-            deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO),
-            Duration::from_millis(200),
-        );
+        let poll_timeout = match deadline {
+            Some(d) => std::cmp::min(
+                d.checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO),
+                Duration::from_millis(200),
+            ),
+            None => Duration::from_millis(200),
+        };
 
         // B-XFER-1: incremental chunk sending — send one chunk per loop iteration
         // when send session is active (Sending state with chunks remaining).
@@ -1342,7 +1346,7 @@ pub fn run_offerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&dc_msg_rx, &mut send_fn, std::time::Instant::now() + std::time::Duration::from_secs(3600), &session, ipc_server)?;
+            run_post_hello_loop(&dc_msg_rx, &mut send_fn, None, &session, ipc_server)?;
         }
     } else {
         // Legacy daemon HELLO
@@ -1740,7 +1744,7 @@ pub fn run_answerer_rendezvous(
                     dc.send(bytes)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 };
-            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, std::time::Instant::now() + std::time::Duration::from_secs(3600), &session, ipc_server)?;
+            run_post_hello_loop(&ch.dc_msg_rx, &mut send_fn, None, &session, ipc_server)?;
         } else {
             thread::sleep(Duration::from_millis(500));
         }
@@ -2379,8 +2383,80 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(100);
         let send_fn =
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_ok(), "loop should exit cleanly on deadline");
+    }
+
+    /// None deadline: loop runs until channel disconnects, not wall-clock.
+    /// This proves the 30s signaling deadline no longer kills the session.
+    #[test]
+    fn b6_no_deadline_runs_until_disconnect() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Send a ping, then drop the channel to trigger disconnect exit
+        let ping = crate::dc_messages::DcMessage::Ping { ts_ms: 1 };
+        let ping_json = crate::dc_messages::encode_dc_message(&ping).unwrap();
+        let ping_env = crate::envelope::encode_envelope(&ping_json, &sess_a).unwrap();
+        tx.send(ping_env).unwrap();
+        drop(tx);
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+        let start = Instant::now();
+        let result = run_post_hello_loop(&rx, send_fn, None, &sess_b, None);
+        let elapsed = start.elapsed();
+
+        // Should exit via disconnect, not timeout. Must complete quickly (< 2s).
+        assert!(result.is_ok(), "loop should exit cleanly on disconnect");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "loop exited via disconnect in {elapsed:?}, not stuck waiting"
+        );
+    }
+
+    /// With Some(deadline), the pre-connect bounded timeout still fires.
+    #[test]
+    fn b6_some_deadline_still_enforced() {
+        let (_, sess_b) = make_b6_session_pair();
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
+        assert!(result.is_ok(), "bounded deadline should still exit cleanly");
+    }
+
+    /// None deadline with delayed disconnect: survives beyond old 30s window.
+    #[test]
+    fn b6_no_deadline_survives_beyond_30s_window() {
+        let (sess_a, sess_b) = make_b6_session_pair();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // Spawn a thread that waits 500ms then drops the channel.
+        // This simulates a session that lives beyond any signaling deadline.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            // Send a message so the loop processes something
+            let ping = crate::dc_messages::DcMessage::Ping { ts_ms: 99 };
+            let ping_json = crate::dc_messages::encode_dc_message(&ping).unwrap();
+            let ping_env = crate::envelope::encode_envelope(&ping_json, &sess_a).unwrap();
+            let _ = tx.send(ping_env);
+            // drop tx — channel closes, loop exits
+        });
+
+        let send_fn =
+            |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+        let start = Instant::now();
+        let result = run_post_hello_loop(&rx, send_fn, None, &sess_b, None);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        // Must have survived at least 400ms (proving no early deadline kill)
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "session lasted {elapsed:?} — should survive beyond any fixed deadline"
+        );
     }
 
     #[test]
@@ -2403,7 +2479,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_ok());
 
         // Verify pong was sent
@@ -2435,7 +2511,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_err(),
             "unknown message type should cause disconnect"
@@ -2455,7 +2531,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_err(), "malformed frame should cause disconnect");
     }
 
@@ -2488,7 +2564,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_ok(), "FileOffer should not cause disconnect");
 
         // Verify FileAccept was sent
@@ -2544,7 +2620,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_err(), "second FileOffer should cause disconnect");
         let err_str = result.unwrap_err().to_string();
         assert!(
@@ -2627,7 +2703,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "full transfer should exit cleanly, got: {:?}",
@@ -2671,7 +2747,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_err(),
             "chunk before offer should cause disconnect"
@@ -2693,7 +2769,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_ok(), "rx disconnect should be a clean exit");
     }
 
@@ -2754,7 +2830,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "correct hash should succeed, got: {:?}",
@@ -2828,7 +2904,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(result.is_err(), "hash mismatch should disconnect");
         let err_str = result.unwrap_err().to_string();
         assert!(
@@ -2881,7 +2957,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_err(),
             "missing hash when negotiated should disconnect"
@@ -2954,7 +3030,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "hash on wire should be ignored when not negotiated, got: {:?}",
@@ -3015,7 +3091,7 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "no hash, no negotiation should succeed, got: {:?}",
@@ -3047,7 +3123,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "FileAccept with no active send should not disconnect, got: {:?}",
@@ -3074,7 +3150,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "Cancel with no active send should not disconnect, got: {:?}",
@@ -3100,7 +3176,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "Pause should be absorbed without disconnect, got: {:?}",
@@ -3126,7 +3202,7 @@ mod tests {
             |_bytes: &[u8]| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = run_post_hello_loop(&rx, send_fn, deadline, &sess_b, None);
+        let result = run_post_hello_loop(&rx, send_fn, Some(deadline), &sess_b, None);
         assert!(
             result.is_ok(),
             "Resume should be absorbed without disconnect, got: {:?}",

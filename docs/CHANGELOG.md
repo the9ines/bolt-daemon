@@ -2,6 +2,41 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## N-STREAM-TIMEOUT — Post-HELLO Deadline Decoupling (daemon-v0.2.45, daemon-v0.2.46) — 2026-03-16
+
+Decoupled the post-HELLO session loop deadline from the signaling-phase timeout.
+Sessions are now heartbeat-driven with no wall-clock deadline after connection.
+
+### Fixed
+- `src/rendezvous.rs` — `run_post_hello_loop()` deadline parameter changed from
+  `Instant` to `Option<Instant>`. Production callers pass `None` (no deadline).
+  Test callers pass `Some(bounded_deadline)` for deterministic tests.
+- Eliminates the ~30s session drop caused by the signaling deadline leaking into
+  the connected data exchange loop.
+
+### Added
+- 3 regression tests: `b6_no_deadline_runs_until_disconnect`,
+  `b6_some_deadline_still_enforced`, `b6_no_deadline_survives_beyond_30s_window`
+- `docs/NSTREAM_TIMEOUT_EVIDENCE.md` — root cause, code change, test matrix,
+  live two-device operational proof (Mac Studio + MacBook Pro, 253s stable,
+  3 reconnect cycles, 0 failures)
+
+### Tags
+- `daemon-v0.2.45-nstream-timeout-hardening` (`ed74bae`) — code fix + unit tests
+- `daemon-v0.2.46-nstream-operational-proof` (`fcf7a85`) — live drill evidence
+
+## EN3f — Transfer Lifecycle IPC Events (daemon-v0.2.44-en3f-transfer-ipc-events) — 2026-03-15
+
+### Added
+- Transfer lifecycle IPC events in rendezvous post-HELLO loop:
+  `transfer.started`, `transfer.progress`, `transfer.completed`, `transfer.failed`
+
+## EN3e — Session + Transfer IPC Events (daemon-v0.2.43-en3e-ipc-session-events) — 2026-03-15
+
+### Added
+- Session lifecycle IPC events: `session.connected`, `session.sas`,
+  `session.disconnected`
+
 ## REL-ARCH1 — Multi-Arch Build/Package Matrix (daemon-v0.2.38-relarch1-multiarch-matrix) — 2026-03-09
 
 Deterministic multi-architecture release workflow for bolt-daemon. Produces

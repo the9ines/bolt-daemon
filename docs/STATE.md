@@ -4,13 +4,13 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.38-relarch1-multiarch-matrix` |
+| Tag (main) | `daemon-v0.2.46-nstream-operational-proof` |
 | Branch | `main` |
-| Phase | REL-ARCH1: Multi-arch daemon build/package matrix |
+| Phase | N-STREAM-TIMEOUT: Post-HELLO deadline decoupled, operational proof DONE |
 
 ## Test Status
 
-- 362 tests pass (195 lib + 128 main + 15 relay + 13 n6b1 + 11 n6b2), 0 failures
+- 436 tests pass (186 lib + 131 integration + 50 ipc + 15 sa1-sep + 13 sa1-store + 12 session + 11 en3-e2e + 5 relay + others), 0 failures
 - `cargo fmt --check` clean
 - `cargo clippy -- -D warnings` 0 warnings
 - `scripts/check_no_panic.sh` PASS
@@ -32,6 +32,9 @@
 | N6-B1 | DONE | `--socket-path` and `--data-dir` CLI flags (B-DEP-N1-1), `daemon-v0.2.32-n6b1-path-flags` |
 | N6-B2 | DONE | Windows named pipe transport (B-DEP-N2-3), `daemon-v0.2.33-n6b2-windows-pipe` |
 | REL-ARCH1 | DONE | Multi-arch build/package matrix, `daemon-v0.2.38-relarch1-multiarch-matrix` (`ab56606`) |
+| EN3e | DONE | Session + transfer IPC events, `daemon-v0.2.43-en3e-ipc-session-events` |
+| EN3f | DONE | Transfer lifecycle IPC events, `daemon-v0.2.44-en3f-transfer-ipc-events` |
+| N-STREAM-TIMEOUT | DONE | Post-HELLO deadline decoupled from signaling phase; heartbeat-driven sessions. Live two-device proof: 253s stable, 3 reconnect cycles. `daemon-v0.2.45-nstream-timeout-hardening` (`ed74bae`), `daemon-v0.2.46-nstream-operational-proof` (`fcf7a85`) |
 
 ## Release Artifacts
 

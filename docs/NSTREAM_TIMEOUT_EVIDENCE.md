@@ -96,14 +96,58 @@ cargo test --features test-support
 
 ## 5. Stability Evidence Beyond 30s
 
+### Unit test proof
+
 `b6_no_deadline_survives_beyond_30s_window` creates a session with `None` deadline and keeps the channel open for 500ms before disconnecting. The loop survives the full duration — proving no fixed deadline kills the session.
 
-In production, the session will run indefinitely until the peer disconnects or heartbeat fails. The 30s signaling deadline only applies to pre-connect phases.
+### Live two-device operational proof (2026-03-16)
 
-**Note:** Full two-device >30s stability proof requires operator-assisted testing (connect two devices, wait >30s, verify session persists). This test proves the code path is correct; operational proof is deferred to the next cross-device drill.
+**Machines:**
+| Machine | Role | IP | Arch |
+|---------|------|----|------|
+| Mac Studio | Host (answerer) | 192.168.4.210 | aarch64 |
+| MacBook Pro | Join (offerer) | 192.168.4.249 | x86_64 |
+
+**Exact revisions:**
+| Component | Commit | Verified |
+|-----------|--------|----------|
+| bolt-daemon | `ed74bae` | `git rev-parse HEAD` before build on both machines |
+| bolt-core-sdk (bolt-ui) | `f2d8f17` | Used for bolt-ui binary path resolution only |
+| bolt-rendezvous | `aa8bed0` | Running on Mac Studio :3001 |
+
+**Binary path verification:**
+- Mac Studio: `/Users/oberfelder/Desktop/the9ines.com/bolt-ecosystem/bolt-daemon/target/release/bolt-daemon` (built Mar 16 10:29)
+- MBP: `~/Desktop/bolt-daemon-intel` (built from `/tmp/drill-v2/bolt-daemon` at `ed74bae`, Mar 16 10:33)
+- Stale `~/Desktop/bolt-daemon-mac` (Mar 15 14:52) was replaced before drill
+
+**Session 1 — stability hold:**
+| Checkpoint | Timestamp (UTC) | Status |
+|------------|-----------------|--------|
+| Connect | 15:51:16Z | SAS `01753A` matched both sides |
+| T+30s (old failure boundary) | 15:51:46Z | ALIVE — heartbeating |
+| T+60s | 15:52:16Z | ALIVE — heartbeating |
+| T+180s (3-min target) | 15:54:22Z | ALIVE — heartbeating |
+| Intentional kill | 15:55:29Z | 253 seconds total (4.2 min) |
+
+**Reconnect cycles:**
+| Cycle | Kill time | Reconnect time | Status |
+|-------|-----------|----------------|--------|
+| 1 | 15:55:29Z | 15:55:52Z | CONNECTED, heartbeating |
+| 2 | 15:56:10Z | 15:56:33Z | CONNECTED, heartbeating |
+| 3 | 15:58:01Z | 15:58:22Z | CONNECTED, heartbeating |
+
+**Failure string grep across ALL logs:**
+- `[B6] post-HELLO loop deadline`: **0 occurrences** (CLEAN)
+- `FATAL`: **0 occurrences** during connected sessions
+- `signal server not listening`: **0 occurrences**
+- `daemon not responding`: **0 occurrences**
+- `Daemon exited unexpectedly`: **0 occurrences**
+
+**Discovery during drill:**
+- Peer IDs with hyphens (e.g., `studio-host`) are rejected by rendezvous server ("Peer code must be alphanumeric"). Retried with alphanumeric IDs. This is a rendezvous validation constraint, not a timeout issue.
 
 ## 6. Residual Risks
 
-1. **No maximum session duration** — production sessions run until disconnect. If a session hangs with no heartbeat failure, it persists indefinitely. Mitigated by: ping/pong heartbeat every 2s, channel close detection on disconnect.
-2. **Two-device operational proof** — The >30s stability has been proven at the code level (unit test) but not yet in a live cross-device session. Next drill should verify.
-3. **Legacy daemon HELLO path** — Still uses the original signaling deadline. This is correct: legacy mode does a single send/recv, not a long-running session.
+1. **No maximum session duration** — production sessions run until disconnect. Mitigated by: ping/pong heartbeat every 2s, channel close detection on disconnect.
+2. **Legacy daemon HELLO path** — Still uses the original signaling deadline. Correct: legacy mode does a single send/recv, not a long-running session.
+3. **Rendezvous peer ID validation** — Hyphenated peer IDs are silently rejected with a connection reset. bolt-ui should validate peer IDs before sending to rendezvous, or rendezvous should return a clear error instead of dropping the connection.

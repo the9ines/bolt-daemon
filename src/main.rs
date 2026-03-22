@@ -32,6 +32,9 @@ mod quic_transport;
 #[cfg(feature = "transport-ws")]
 pub(crate) use bolt_daemon::ws_endpoint;
 
+#[cfg(feature = "transport-webtransport")]
+pub(crate) use bolt_daemon::wt_endpoint;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -149,6 +152,19 @@ pub(crate) struct Args {
     /// When present, spawns a WS endpoint alongside the existing transport.
     #[cfg(feature = "transport-ws")]
     pub(crate) ws_listen: Option<String>,
+    /// WebTransport listen address (e.g. "127.0.0.1:4433").
+    /// When present, spawns a WebTransport/HTTP3 endpoint alongside existing transport.
+    #[cfg(feature = "transport-webtransport")]
+    pub(crate) wt_listen: Option<String>,
+    /// Path to PEM-encoded TLS certificate for WebTransport.
+    #[cfg(feature = "transport-webtransport")]
+    pub(crate) wt_cert: Option<String>,
+    /// Path to PEM-encoded TLS private key for WebTransport.
+    #[cfg(feature = "transport-webtransport")]
+    pub(crate) wt_key: Option<String>,
+    /// Kill-switch: force-disable WebTransport even if --wt-listen is provided (WTI4).
+    #[cfg(feature = "transport-webtransport")]
+    pub(crate) no_wt: bool,
 }
 
 fn parse_args() -> Args {
@@ -190,6 +206,14 @@ fn parse_args_from(argv: &[String]) -> Args {
     let mut quic_connect = None;
     #[cfg(feature = "transport-ws")]
     let mut ws_listen = None;
+    #[cfg(feature = "transport-webtransport")]
+    let mut wt_listen = None;
+    #[cfg(feature = "transport-webtransport")]
+    let mut wt_cert = None;
+    #[cfg(feature = "transport-webtransport")]
+    let mut wt_key = None;
+    #[cfg(feature = "transport-webtransport")]
+    let mut no_wt = false;
 
     let mut i = 1;
     while i < argv.len() {
@@ -520,6 +544,43 @@ fn parse_args_from(argv: &[String]) -> Args {
                     }
                 });
             }
+            #[cfg(feature = "transport-webtransport")]
+            "--wt-listen" => {
+                i += 1;
+                wt_listen = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--wt-listen requires an address (e.g. 127.0.0.1:4433)");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            #[cfg(feature = "transport-webtransport")]
+            "--wt-cert" => {
+                i += 1;
+                wt_cert = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--wt-cert requires a path to a PEM certificate file");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            #[cfg(feature = "transport-webtransport")]
+            "--wt-key" => {
+                i += 1;
+                wt_key = Some(match argv.get(i) {
+                    Some(a) if !a.is_empty() => a.clone(),
+                    _ => {
+                        eprintln!("--wt-key requires a path to a PEM private key file");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            #[cfg(feature = "transport-webtransport")]
+            "--no-wt" => {
+                no_wt = true;
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -634,6 +695,14 @@ fn parse_args_from(argv: &[String]) -> Args {
         quic_connect,
         #[cfg(feature = "transport-ws")]
         ws_listen,
+        #[cfg(feature = "transport-webtransport")]
+        wt_listen,
+        #[cfg(feature = "transport-webtransport")]
+        wt_cert,
+        #[cfg(feature = "transport-webtransport")]
+        wt_key,
+        #[cfg(feature = "transport-webtransport")]
+        no_wt,
     }
 }
 
@@ -1558,6 +1627,15 @@ fn main() {
                 }
             };
 
+            // ── WT enablement (WTI4) ─────────────────────────────────
+            // WT is enabled when --wt-listen is configured AND --no-wt
+            // is NOT set. This controls both endpoint spawning and
+            // capability advertisement in HELLO.
+            #[cfg(feature = "transport-webtransport")]
+            let wt_enabled = args.wt_listen.is_some() && !args.no_wt;
+            #[cfg(not(feature = "transport-webtransport"))]
+            let wt_enabled = false;
+
             // ── WS endpoint (RC5 PM-RC-02) ────────────────────────
             // When --ws-listen is provided, spawn a WebSocket endpoint
             // on a tokio runtime alongside the existing transport path.
@@ -1580,6 +1658,7 @@ fn main() {
                 let ws_config = ws_endpoint::WsEndpointConfig {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
+                    wt_enabled,
                 };
                 eprintln!("[WS_ENDPOINT] starting on {ws_addr}");
                 std::thread::spawn(move || {
@@ -1587,6 +1666,61 @@ fn main() {
                     rt.block_on(async {
                         if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx).await {
                             eprintln!("[WS_ENDPOINT] FATAL: {e}");
+                        }
+                    });
+                });
+                Some(shutdown_tx)
+            } else {
+                None
+            };
+
+            // ── WT endpoint (WTI2/WTI4) ──────────────────────────────
+            // When --wt-listen is provided AND --no-wt is NOT set, spawn
+            // a WebTransport/HTTP3 endpoint on a tokio runtime.
+            #[cfg(feature = "transport-webtransport")]
+            let _wt_shutdown_tx = if wt_enabled {
+                let wt_addr_str = args.wt_listen.as_ref().unwrap(); // safe: wt_enabled implies wt_listen.is_some()
+                let wt_addr_str = wt_addr_str.as_str();
+                let wt_addr: std::net::SocketAddr = match wt_addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!(
+                            "[WT_ENDPOINT] FATAL: invalid --wt-listen address '{wt_addr_str}': {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let wt_cert = match args.wt_cert.as_ref() {
+                    Some(c) => c.clone(),
+                    None => {
+                        eprintln!("[WT_ENDPOINT] FATAL: --wt-listen requires --wt-cert");
+                        std::process::exit(1);
+                    }
+                };
+                let wt_key = match args.wt_key.as_ref() {
+                    Some(k) => k.clone(),
+                    None => {
+                        eprintln!("[WT_ENDPOINT] FATAL: --wt-listen requires --wt-key");
+                        std::process::exit(1);
+                    }
+                };
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let wt_identity = bolt_core::crypto::KeyPair {
+                    public_key: identity.public_key,
+                    secret_key: identity.secret_key,
+                };
+                let wt_config = wt_endpoint::WtEndpointConfig {
+                    listen_addr: wt_addr,
+                    identity_keypair: wt_identity,
+                    cert_path: wt_cert,
+                    key_path: wt_key,
+                };
+                eprintln!("[WT_ENDPOINT] starting on {wt_addr}");
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = wt_endpoint::run_wt_endpoint(wt_config, shutdown_rx).await {
+                            eprintln!("[WT_ENDPOINT] FATAL: {e}");
                         }
                     });
                 });
@@ -1605,9 +1739,12 @@ fn main() {
             let result = match (role, &args.signal_mode) {
                 (Role::Offerer, SignalMode::File) => run_offerer(&args),
                 (Role::Answerer, SignalMode::File) => run_answerer(&args),
-                (Role::Offerer, SignalMode::Rendezvous) => {
-                    rendezvous::run_offerer_rendezvous(&args, ipc_server.as_ref(), &trust_path, &identity)
-                }
+                (Role::Offerer, SignalMode::Rendezvous) => rendezvous::run_offerer_rendezvous(
+                    &args,
+                    ipc_server.as_ref(),
+                    &trust_path,
+                    &identity,
+                ),
                 (Role::Answerer, SignalMode::Rendezvous) => rendezvous::run_answerer_rendezvous(
                     &args,
                     ipc_server.as_ref(),
@@ -1999,5 +2136,102 @@ mod tests {
             Some("/home/user/.local/share/localbolt")
         );
         assert_eq!(args.signal_mode, SignalMode::Rendezvous);
+    }
+
+    // ── WTI2: --wt-listen, --wt-cert, --wt-key CLI parse tests ──
+
+    #[cfg(feature = "transport-webtransport")]
+    #[test]
+    fn wti2_wt_listen_parsed() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+            "--wt-listen",
+            "127.0.0.1:4433",
+            "--wt-cert",
+            "/etc/certs/cert.pem",
+            "--wt-key",
+            "/etc/certs/key.pem",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.wt_listen.as_deref(), Some("127.0.0.1:4433"));
+        assert_eq!(args.wt_cert.as_deref(), Some("/etc/certs/cert.pem"));
+        assert_eq!(args.wt_key.as_deref(), Some("/etc/certs/key.pem"));
+    }
+
+    #[cfg(feature = "transport-webtransport")]
+    #[test]
+    fn wti2_wt_flags_default_none() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+        ]);
+        let args = parse_args_from(&argv);
+        assert!(args.wt_listen.is_none());
+        assert!(args.wt_cert.is_none());
+        assert!(args.wt_key.is_none());
+        assert!(!args.no_wt);
+    }
+
+    #[cfg(feature = "transport-webtransport")]
+    #[test]
+    fn wti4_no_wt_flag_parsed() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+            "--wt-listen",
+            "127.0.0.1:4433",
+            "--wt-cert",
+            "/etc/certs/cert.pem",
+            "--wt-key",
+            "/etc/certs/key.pem",
+            "--no-wt",
+        ]);
+        let args = parse_args_from(&argv);
+        assert!(args.no_wt);
+        assert_eq!(args.wt_listen.as_deref(), Some("127.0.0.1:4433"));
+    }
+
+    #[cfg(feature = "transport-webtransport")]
+    #[test]
+    fn wti4_no_wt_default_false() {
+        let argv = make_argv(&[
+            "--role",
+            "offerer",
+            "--signal",
+            "file",
+            "--interop-signal",
+            "daemon_v1",
+            "--interop-hello",
+            "daemon_hello_v1",
+            "--interop-dc",
+            "daemon_dc_v1",
+        ]);
+        let args = parse_args_from(&argv);
+        assert!(!args.no_wt);
     }
 }

@@ -47,6 +47,9 @@ pub struct WsEndpointConfig {
     pub listen_addr: SocketAddr,
     /// Persistent identity keypair (long-lived, loaded from store).
     pub identity_keypair: KeyPair,
+    /// Whether WebTransport is enabled on this daemon (WTI4).
+    /// Controls capability advertisement in HELLO.
+    pub wt_enabled: bool,
 }
 
 // ── Public entry point ───────────────────────────────────────
@@ -70,6 +73,7 @@ pub async fn run_ws_endpoint(
     // KeyPair doesn't impl Clone, so we store the raw bytes.
     let identity_pk = Arc::new(config.identity_keypair.public_key);
     let identity_sk = Arc::new(config.identity_keypair.secret_key);
+    let wt_enabled = config.wt_enabled;
 
     loop {
         tokio::select! {
@@ -84,7 +88,7 @@ pub async fn run_ws_endpoint(
                                 public_key: *pk,
                                 secret_key: *sk,
                             };
-                            if let Err(e) = handle_connection(stream, peer_addr, &identity).await {
+                            if let Err(e) = handle_connection(stream, peer_addr, &identity, wt_enabled).await {
                                 eprintln!("[WS_SESSION] {peer_addr} error: {e}");
                             }
                             eprintln!("[WS_SESSION] {peer_addr} closed");
@@ -118,6 +122,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     identity: &KeyPair,
+    wt_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Step 1: WebSocket upgrade ────────────────────────────
     let ws_stream = accept_async(stream)
@@ -221,7 +226,7 @@ async fn handle_connection(
     );
 
     // ── Step 5: Negotiate capabilities ───────────────────────
-    let local_caps = daemon_capabilities();
+    let local_caps = daemon_capabilities(wt_enabled);
     let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
     eprintln!("[WS_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
 
@@ -418,6 +423,7 @@ mod tests {
         let config = WsEndpointConfig {
             listen_addr: addr,
             identity_keypair: identity,
+            wt_enabled: false,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -453,6 +459,7 @@ mod tests {
         let config = WsEndpointConfig {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
+            wt_enabled: false,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -537,6 +544,7 @@ mod tests {
         let config = WsEndpointConfig {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
+            wt_enabled: false,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -638,6 +646,7 @@ mod tests {
         let config = WsEndpointConfig {
             listen_addr: addr,
             identity_keypair: identity,
+            wt_enabled: false,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

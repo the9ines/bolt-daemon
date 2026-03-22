@@ -100,15 +100,24 @@ async fn connect_and_handshake(
         other => panic!("expected text, got {other:?}"),
     };
 
-    let inner =
-        parse_hello_message(hello_text.as_bytes(), &daemon_session_pk, &browser_session_kp)
-            .unwrap();
+    let inner = parse_hello_message(
+        hello_text.as_bytes(),
+        &daemon_session_pk,
+        &browser_session_kp,
+    )
+    .unwrap();
 
     // Negotiate capabilities (intersection of daemon + browser)
     let negotiated =
         bolt_core::session::negotiate_capabilities(&inner.capabilities, &inner.capabilities);
 
-    (sink, source, browser_session_kp, daemon_session_pk, negotiated)
+    (
+        sink,
+        source,
+        browser_session_kp,
+        daemon_session_pk,
+        negotiated,
+    )
 }
 
 // ── AC-RC-23: BTR capability negotiation over WS ─────────
@@ -122,6 +131,7 @@ async fn ac_rc_23_ws_hello_negotiates_btr_capability() {
     let config = WsEndpointConfig {
         listen_addr: addr,
         identity_keypair: copy_keypair(&daemon_identity),
+        wt_enabled: false,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -182,9 +192,7 @@ async fn ac_rc_23_btr_sealed_chunk_over_ws() {
         "chain_index": chain_index,
         "sealed": to_base64(&sealed),
     });
-    sink.send(Message::Text(payload.to_string()))
-        .await
-        .unwrap();
+    sink.send(Message::Text(payload.to_string())).await.unwrap();
 
     // Receive echo
     let echo = source.next().await.unwrap().unwrap();
@@ -256,9 +264,7 @@ async fn ac_rc_23_btr_multi_chunk_transfer_over_ws() {
             "chain_index": idx,
             "sealed": to_base64(sealed),
         });
-        sink.send(Message::Text(payload.to_string()))
-            .await
-            .unwrap();
+        sink.send(Message::Text(payload.to_string())).await.unwrap();
     }
 
     // Receive echoes and decrypt
@@ -318,9 +324,7 @@ async fn ac_rc_23_btr_tampered_chunk_detected_over_ws() {
         "chain_index": chain_index,
         "sealed": to_base64(&sealed),
     });
-    sink.send(Message::Text(payload.to_string()))
-        .await
-        .unwrap();
+    sink.send(Message::Text(payload.to_string())).await.unwrap();
 
     let echo = source.next().await.unwrap().unwrap();
     let echo_text = match echo {
@@ -389,9 +393,7 @@ async fn ac_rc_23_ws_framing_preserves_sealed_bytes() {
             "chain_index": idx,
             "sealed": to_base64(sealed),
         });
-        sink.send(Message::Text(payload.to_string()))
-            .await
-            .unwrap();
+        sink.send(Message::Text(payload.to_string())).await.unwrap();
     }
 
     // Verify byte-level equality after WS round-trip

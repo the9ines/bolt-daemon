@@ -616,7 +616,7 @@ fn d_e2e_a_live_transfer_hash_verified() {
     assert_eq!(remote_hello.msg_type, "hello");
 
     // Negotiate capabilities
-    let local_caps = daemon_capabilities();
+    let local_caps = daemon_capabilities(false);
     let negotiated = negotiate_capabilities(&local_caps, &remote_hello.capabilities);
     assert!(
         negotiated.contains(&"bolt.profile-envelope-v1".to_string()),

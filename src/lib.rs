@@ -52,6 +52,12 @@ pub fn ipc_transport_bind(
 #[doc(hidden)]
 pub mod ipc;
 
+/// WebTransport/HTTP3 server endpoint (WTI2).
+/// Feature-gated behind `transport-webtransport`.
+#[cfg(feature = "transport-webtransport")]
+#[doc(hidden)]
+pub mod wt_endpoint;
+
 /// QUIC transport adapter (RC3 reference path).
 /// Feature-gated behind `transport-quic`.
 #[cfg(feature = "transport-quic")]

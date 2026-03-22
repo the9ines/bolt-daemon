@@ -655,12 +655,16 @@ pub(crate) fn run_post_hello_loop(
 
                     // EN3f: emit transfer.started on first chunk
                     if chunk_idx == 0 {
-                        emit_ipc(ipc_server, "transfer.started", serde_json::json!({
-                            "transfer_id": tid_ref,
-                            "file_name": "outgoing",
-                            "file_size_bytes": 0,
-                            "direction": "send"
-                        }));
+                        emit_ipc(
+                            ipc_server,
+                            "transfer.started",
+                            serde_json::json!({
+                                "transfer_id": tid_ref,
+                                "file_name": "outgoing",
+                                "file_size_bytes": 0,
+                                "direction": "send"
+                            }),
+                        );
                     }
 
                     let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
@@ -678,13 +682,19 @@ pub(crate) fn run_post_hello_loop(
                     // EN3f: emit transfer.progress after each sent chunk
                     let progress = if total > 0 {
                         (chunk_idx + 1) as f64 / total as f64
-                    } else { 0.0 };
-                    emit_ipc(ipc_server, "transfer.progress", serde_json::json!({
-                        "transfer_id": tid_ref,
-                        "bytes_transferred": (chunk_idx + 1) as u64 * chunk_len as u64,
-                        "total_bytes": total as u64 * chunk_len as u64,
-                        "progress": progress
-                    }));
+                    } else {
+                        0.0
+                    };
+                    emit_ipc(
+                        ipc_server,
+                        "transfer.progress",
+                        serde_json::json!({
+                            "transfer_id": tid_ref,
+                            "bytes_transferred": (chunk_idx + 1) as u64 * chunk_len as u64,
+                            "total_bytes": total as u64 * chunk_len as u64,
+                            "progress": progress
+                        }),
+                    );
                 }
                 Ok(None) => {
                     // All chunks sent — send FileFinish
@@ -705,18 +715,26 @@ pub(crate) fn run_post_hello_loop(
                     send_fn(&finish_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
                     eprintln!("[B-XFER-1] outbound transfer completed");
                     // EN3f: emit transfer.complete for send
-                    emit_ipc(ipc_server, "transfer.complete", serde_json::json!({
-                        "transfer_id": tid_clone,
-                        "file_name": "outgoing",
-                        "bytes_transferred": 0,
-                        "verified": false
-                    }));
+                    emit_ipc(
+                        ipc_server,
+                        "transfer.complete",
+                        serde_json::json!({
+                            "transfer_id": tid_clone,
+                            "file_name": "outgoing",
+                            "bytes_transferred": 0,
+                            "verified": false
+                        }),
+                    );
                 }
                 Err(te) => {
-                    emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
-                        "transfer_id": "",
-                        "reason": format!("chunk error: {te}")
-                    }));
+                    emit_ipc(
+                        ipc_server,
+                        "transfer.failed",
+                        serde_json::json!({
+                            "transfer_id": "",
+                            "reason": format!("chunk error: {te}")
+                        }),
+                    );
                     return Err(format!("[B-XFER-1] chunk error: {te}").into());
                 }
             }
@@ -816,12 +834,16 @@ pub(crate) fn run_post_hello_loop(
                         send_fn(&accept_env).map_err(|e| -> Box<dyn std::error::Error> { e })?;
                         eprintln!("[B3] FileOffer accepted via FileAccept");
                         // EN3f: emit transfer.started for receive
-                        emit_ipc(ipc_server, "transfer.started", serde_json::json!({
-                            "transfer_id": tid_clone,
-                            "file_name": "incoming",
-                            "file_size_bytes": size,
-                            "direction": "receive"
-                        }));
+                        emit_ipc(
+                            ipc_server,
+                            "transfer.started",
+                            serde_json::json!({
+                                "transfer_id": tid_clone,
+                                "file_name": "incoming",
+                                "file_size_bytes": size,
+                                "direction": "receive"
+                            }),
+                        );
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileChunk {
@@ -853,10 +875,14 @@ pub(crate) fn run_post_hello_loop(
                         if let Err(te) = transfer.on_file_chunk(&transfer_id, chunk_index, &data) {
                             let e = crate::envelope::EnvelopeError::InvalidState(te.to_string());
                             eprintln!("[B3] chunk error: {e}");
-                            emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
-                                "transfer_id": transfer_id,
-                                "reason": format!("chunk error: {e}")
-                            }));
+                            emit_ipc(
+                                ipc_server,
+                                "transfer.failed",
+                                serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "reason": format!("chunk error: {e}")
+                                }),
+                            );
                             let err_payload = crate::envelope::build_error_payload(
                                 e.code(),
                                 &e.to_string(),
@@ -866,12 +892,16 @@ pub(crate) fn run_post_hello_loop(
                             return Err(format!("[B6] {e}").into());
                         }
                         // EN3f: emit transfer.progress after each received chunk
-                        emit_ipc(ipc_server, "transfer.progress", serde_json::json!({
-                            "transfer_id": transfer_id,
-                            "bytes_transferred": (chunk_index + 1) as u64 * data.len() as u64,
-                            "total_bytes": 0,
-                            "progress": chunk_index as f64
-                        }));
+                        emit_ipc(
+                            ipc_server,
+                            "transfer.progress",
+                            serde_json::json!({
+                                "transfer_id": transfer_id,
+                                "bytes_transferred": (chunk_index + 1) as u64 * data.len() as u64,
+                                "total_bytes": 0,
+                                "progress": chunk_index as f64
+                            }),
+                        );
                         continue;
                     }
                     Ok(crate::dc_messages::DcMessage::FileFinish { transfer_id, .. }) => {
@@ -887,13 +917,20 @@ pub(crate) fn run_post_hello_loop(
                                     eprintln!("[B3] transfer completed");
                                 }
                                 // EN3f: emit transfer.complete for receive
-                                let bytes = transfer.completed_bytes().map(|b| b.len() as u64).unwrap_or(0);
-                                emit_ipc(ipc_server, "transfer.complete", serde_json::json!({
-                                    "transfer_id": transfer_id,
-                                    "file_name": "incoming",
-                                    "bytes_transferred": bytes,
-                                    "verified": verified
-                                }));
+                                let bytes = transfer
+                                    .completed_bytes()
+                                    .map(|b| b.len() as u64)
+                                    .unwrap_or(0);
+                                emit_ipc(
+                                    ipc_server,
+                                    "transfer.complete",
+                                    serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "file_name": "incoming",
+                                        "bytes_transferred": bytes,
+                                        "verified": verified
+                                    }),
+                                );
                                 #[cfg(feature = "test-support")]
                                 if let Some(ref p) = test_send_path {
                                     if let Some(e) = test_send_offer(p, &mut send_session, session)
@@ -906,10 +943,14 @@ pub(crate) fn run_post_hello_loop(
                             Err(crate::transfer::TransferError::IntegrityFailed(ref detail)) => {
                                 // B4: Hash mismatch → INTEGRITY_FAILED + disconnect
                                 eprintln!("[B4] integrity failed: {detail}");
-                                emit_ipc(ipc_server, "transfer.failed", serde_json::json!({
-                                    "transfer_id": transfer_id,
-                                    "reason": format!("integrity failed: {detail}")
-                                }));
+                                emit_ipc(
+                                    ipc_server,
+                                    "transfer.failed",
+                                    serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "reason": format!("integrity failed: {detail}")
+                                    }),
+                                );
                                 let err_payload = crate::envelope::build_error_payload(
                                     "INTEGRITY_FAILED",
                                     detail,
@@ -1228,10 +1269,14 @@ pub fn run_offerer_rendezvous(
         .ok_or("phase timeout expired waiting for DataChannel open")?;
     dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[offerer] DataChannel open");
-    emit_ipc(ipc_server, "session.connected", serde_json::json!({
-        "remote_peer_id": to_peer,
-        "negotiated_capabilities": []
-    }));
+    emit_ipc(
+        ipc_server,
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": to_peer,
+            "negotiated_capabilities": []
+        }),
+    );
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
@@ -1290,7 +1335,7 @@ pub fn run_offerer_rendezvous(
         }
 
         // Negotiate capabilities
-        let local_caps = crate::web_hello::daemon_capabilities();
+        let local_caps = crate::web_hello::daemon_capabilities(false);
         let negotiated =
             crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
         eprintln!(
@@ -1302,19 +1347,30 @@ pub fn run_offerer_rendezvous(
         {
             let sas = bolt_core::sas::compute_sas(
                 &identity.public_key,
-                &to_32(&bolt_core::encoding::from_base64(&remote_hello.identity_public_key).unwrap_or_default()),
+                &to_32(
+                    &bolt_core::encoding::from_base64(&remote_hello.identity_public_key)
+                        .unwrap_or_default(),
+                ),
                 &local_session.public_key,
                 &to_32(&bolt_core::encoding::from_base64(remote_pk_b64_str).unwrap_or_default()),
             );
             eprintln!("[SAS] {sas}");
-            emit_ipc(ipc_server, "session.sas", serde_json::json!({
-                "sas": sas,
-                "remote_identity_pk_b64": remote_hello.identity_public_key,
-            }));
-            emit_ipc(ipc_server, "session.connected", serde_json::json!({
-                "remote_peer_id": to_peer,
-                "negotiated_capabilities": negotiated,
-            }));
+            emit_ipc(
+                ipc_server,
+                "session.sas",
+                serde_json::json!({
+                    "sas": sas,
+                    "remote_identity_pk_b64": remote_hello.identity_public_key,
+                }),
+            );
+            emit_ipc(
+                ipc_server,
+                "session.connected",
+                serde_json::json!({
+                    "remote_peer_id": to_peer,
+                    "negotiated_capabilities": negotiated,
+                }),
+            );
         }
 
         // ── INTEROP-3: Session context uses ephemeral session keypair ────
@@ -1598,10 +1654,14 @@ pub fn run_answerer_rendezvous(
         .ok_or("phase timeout expired waiting for DataChannel open")?;
     ch.dc_open_rx.recv_timeout(remaining)?;
     eprintln!("[answerer] DataChannel open");
-    emit_ipc(ipc_server, "session.connected", serde_json::json!({
-        "remote_peer_id": expect_peer,
-        "negotiated_capabilities": []
-    }));
+    emit_ipc(
+        ipc_server,
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": expect_peer,
+            "negotiated_capabilities": []
+        }),
+    );
 
     // ── DataChannel HELLO exchange ──────────────────────────
     if use_web_hello {
@@ -1654,7 +1714,7 @@ pub fn run_answerer_rendezvous(
         eprintln!("[INTEROP-2] sent encrypted HELLO reply");
 
         // Negotiate capabilities
-        let local_caps = crate::web_hello::daemon_capabilities();
+        let local_caps = crate::web_hello::daemon_capabilities(false);
         let negotiated =
             crate::web_hello::negotiate_capabilities(&local_caps, &remote_hello.capabilities);
         eprintln!(
@@ -1669,20 +1729,31 @@ pub fn run_answerer_rendezvous(
             let remote_session_b64 = remote_pk_b64_str;
             let sas = bolt_core::sas::compute_sas(
                 &identity.public_key,
-                &to_32(&bolt_core::encoding::from_base64(&remote_hello.identity_public_key).unwrap_or_default()),
+                &to_32(
+                    &bolt_core::encoding::from_base64(&remote_hello.identity_public_key)
+                        .unwrap_or_default(),
+                ),
                 &local_session.public_key,
                 &to_32(&bolt_core::encoding::from_base64(remote_session_b64).unwrap_or_default()),
             );
             eprintln!("[SAS] {sas}");
-            emit_ipc(ipc_server, "session.sas", serde_json::json!({
-                "sas": sas,
-                "remote_identity_pk_b64": remote_hello.identity_public_key,
-            }));
+            emit_ipc(
+                ipc_server,
+                "session.sas",
+                serde_json::json!({
+                    "sas": sas,
+                    "remote_identity_pk_b64": remote_hello.identity_public_key,
+                }),
+            );
             // Update session.connected with negotiated caps
-            emit_ipc(ipc_server, "session.connected", serde_json::json!({
-                "remote_peer_id": expect_peer,
-                "negotiated_capabilities": negotiated,
-            }));
+            emit_ipc(
+                ipc_server,
+                "session.connected",
+                serde_json::json!({
+                    "remote_peer_id": expect_peer,
+                    "negotiated_capabilities": negotiated,
+                }),
+            );
         }
 
         // ── B5 Stage B (answerer): decode identity + enforce TOFU pin ──

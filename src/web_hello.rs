@@ -51,8 +51,15 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
 ];
 
 /// Return daemon capabilities as owned Strings.
-pub fn daemon_capabilities() -> Vec<String> {
-    DAEMON_CAPABILITIES.iter().map(|s| s.to_string()).collect()
+///
+/// When `wt_enabled` is true, the WebTransport capability is included
+/// so peers know this daemon can accept WebTransport sessions (WTI4).
+pub fn daemon_capabilities(wt_enabled: bool) -> Vec<String> {
+    let mut caps: Vec<String> = DAEMON_CAPABILITIES.iter().map(|s| s.to_string()).collect();
+    if wt_enabled {
+        caps.push("bolt.transport-webtransport-v1".to_string());
+    }
+    caps
 }
 
 // ── Wire types (profile-level, stays in daemon) ─────────────
@@ -106,11 +113,14 @@ pub fn build_hello_message(
     session_kp: &KeyPair,
     remote_public_key: &[u8; 32],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Default to base capabilities (no WT). Endpoints that need WT
+    // advertisement use daemon_capabilities(true) for negotiation;
+    // the HELLO response capabilities are informational.
     let inner = WebHelloInner {
         msg_type: "hello".to_string(),
         version: 1,
         identity_public_key: to_base64(identity_pk),
-        capabilities: daemon_capabilities(),
+        capabilities: daemon_capabilities(false),
     };
     let inner_json = serde_json::to_vec(&inner)?;
     let sealed = seal_box_payload(&inner_json, remote_public_key, &session_kp.secret_key)
@@ -288,7 +298,7 @@ mod tests {
             msg_type: "hello".to_string(),
             version: 1,
             identity_public_key: to_base64(&kp_a.public_key),
-            capabilities: daemon_capabilities(),
+            capabilities: daemon_capabilities(false),
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
 
@@ -490,7 +500,19 @@ mod tests {
     fn b4_daemon_capabilities_includes_file_hash() {
         assert!(DAEMON_CAPABILITIES.contains(&"bolt.file-hash"));
         assert!(DAEMON_CAPABILITIES.contains(&"bolt.profile-envelope-v1"));
-        assert!(daemon_capabilities().contains(&"bolt.file-hash".to_string()));
+        assert!(daemon_capabilities(false).contains(&"bolt.file-hash".to_string()));
+    }
+
+    #[test]
+    fn wti4_daemon_capabilities_wt_when_enabled() {
+        let caps = daemon_capabilities(true);
+        assert!(caps.contains(&"bolt.transport-webtransport-v1".to_string()));
+    }
+
+    #[test]
+    fn wti4_daemon_capabilities_no_wt_when_disabled() {
+        let caps = daemon_capabilities(false);
+        assert!(!caps.contains(&"bolt.transport-webtransport-v1".to_string()));
     }
 
     // ── SA17: max capabilities length enforcement ───────────

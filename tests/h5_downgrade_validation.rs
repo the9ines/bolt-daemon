@@ -647,7 +647,7 @@ fn no_runtime_flag_disables_envelope_after_negotiation() {
 fn capability_negotiation_is_intersection_only() {
     // Verify negotiate_capabilities computes intersection.
     // A peer cannot inject capabilities the other doesn't support.
-    let local = daemon_capabilities();
+    let local = daemon_capabilities(false);
     let remote = vec!["bolt.some-other-cap".to_string()];
     let negotiated = negotiate_capabilities(&local, &remote);
     assert!(negotiated.is_empty());
@@ -656,7 +656,7 @@ fn capability_negotiation_is_intersection_only() {
 
 #[test]
 fn capability_negotiation_both_must_agree() {
-    let local = daemon_capabilities();
+    let local = daemon_capabilities(false);
     let remote = vec!["bolt.profile-envelope-v1".to_string()];
     let negotiated = negotiate_capabilities(&local, &remote);
     assert_eq!(negotiated, vec!["bolt.profile-envelope-v1".to_string()]);

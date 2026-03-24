@@ -1919,13 +1919,21 @@ fn main() {
                             if signal_path.exists() {
                                 if let Ok(path_str) = std::fs::read_to_string(&signal_path) {
                                     let path_str = path_str.trim();
-                                    if !path_str.is_empty() {
-                                        eprintln!("[WS_TRANSFER] send signal: {path_str}");
-                                        let _ = std::fs::remove_file(&signal_path);
-                                        match ws_endpoint::send_file_to_browser(path_str) {
-                                            Ok(()) => eprintln!("[WS_TRANSFER] send complete"),
-                                            Err(e) => eprintln!("[WS_TRANSFER] send error: {e}"),
-                                        }
+                                    let _ = std::fs::remove_file(&signal_path);
+                                    if path_str.is_empty() {
+                                        continue;
+                                    }
+
+                                    // Validate the file-to-send path
+                                    if let Err(e) = ws_endpoint::validate_send_file_path(path_str) {
+                                        eprintln!("[WS_TRANSFER] REJECTED send signal: {e}");
+                                        continue;
+                                    }
+
+                                    eprintln!("[WS_TRANSFER] send signal: {path_str}");
+                                    match ws_endpoint::send_file_to_browser(path_str) {
+                                        Ok(()) => eprintln!("[WS_TRANSFER] send complete"),
+                                        Err(e) => eprintln!("[WS_TRANSFER] send error: {e}"),
                                     }
                                 }
                             }

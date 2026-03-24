@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn b3_file_chunk_routes_to_ok_none() {
         let (sess_a, _) = make_session_pair();
-        let chunk_json = r#"{"type":"file-chunk","transferId":"t1","chunkIndex":0,"totalChunks":1,"payload":"dGVzdA=="}"#;
+        let chunk_json = r#"{"type":"file-chunk","transferId":"t1","filename":"test.bin","chunkIndex":0,"totalChunks":1,"chunk":"dGVzdA==","fileSize":4}"#;
         let result = route_inner_message(chunk_json.as_bytes(), &sess_a);
         assert!(result.is_ok(), "FileChunk should return Ok");
         assert!(

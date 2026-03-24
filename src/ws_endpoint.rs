@@ -18,6 +18,82 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+
+// ── Active session handle for outbound sends ────────────────
+
+/// Handle to the active WS session. Allows any thread to send
+/// envelope-wrapped messages to the connected browser peer.
+///
+/// Design: the WS message loop spawns a writer task that drains
+/// `outbound_rx`. Any holder of `outbound_tx` can enqueue frames.
+/// `SessionContext` is wrapped in Arc for encryption from any thread.
+pub struct ActiveSessionHandle {
+    pub outbound_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    pub session: Arc<SessionContext>,
+}
+
+/// Global active session — set when a browser connects and HELLO completes,
+/// cleared when the session ends. Protected by std Mutex for cross-thread access.
+static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
+
+/// Send a file to the connected browser peer via the active session.
+/// Called from the IPC thread (synchronous). Returns error if no active session.
+pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
+    let guard = ACTIVE_SESSION.lock().map_err(|e| format!("lock: {e}"))?;
+    let handle = guard.as_ref().ok_or("no active session")?;
+
+    // Read file
+    let data = std::fs::read(file_path)
+        .map_err(|e| format!("read file: {e}"))?;
+    let filename = std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let file_size = data.len() as u64;
+
+    // Chunk (16KB per chunk, matching browser)
+    let chunk_size = 16 * 1024;
+    let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+    let transfer_id = format!("{:032x}", rand::random::<u128>());
+
+    eprintln!(
+        "[WS_TRANSFER] sending: {} ({} bytes, {} chunks, tid={})",
+        filename, file_size, total_chunks, transfer_id
+    );
+
+    for (i, chunk_data) in data.chunks(chunk_size).enumerate() {
+        // Encrypt chunk data individually (matches browser TransferManager behavior)
+        let encrypted = bolt_core::crypto::seal_box_payload(
+            chunk_data,
+            &handle.session.remote_public_key,
+            &handle.session.local_keypair.secret_key,
+        ).map_err(|e| format!("encrypt chunk: {e}"))?;
+
+        // Build file-chunk message
+        let msg = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: transfer_id.clone(),
+            filename: filename.clone(),
+            chunk_index: i as u32,
+            total_chunks,
+            chunk: encrypted,
+            file_size,
+            file_hash: None,
+        };
+        let inner_json = crate::dc_messages::encode_dc_message(&msg)
+            .map_err(|e| format!("encode: {e}"))?;
+
+        // Wrap in profile envelope (encrypts the full inner message)
+        let envelope = crate::envelope::encode_envelope(&inner_json, &handle.session)
+            .map_err(|e| format!("envelope: {e}"))?;
+        let text = String::from_utf8_lossy(&envelope).into_owned();
+
+        handle.outbound_tx.send(text)
+            .map_err(|_| "session closed".to_string())?;
+    }
+
+    eprintln!("[WS_TRANSFER] all {} chunks queued for {}", total_chunks, filename);
+    Ok(())
+}
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_tungstenite::accept_async;
@@ -128,7 +204,6 @@ async fn handle_connection(
     let ws_stream = accept_async(stream)
         .await
         .map_err(|e| format!("[WS_SESSION] {peer_addr} WebSocket upgrade failed: {e}"))?;
-    eprintln!("[WS_SESSION] {peer_addr} WebSocket upgraded");
 
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -205,7 +280,57 @@ async fn handle_connection(
         return Err(format!("[WS_HELLO] {peer_addr} first message is not valid JSON").into());
     };
 
-    // ── Step 4: Parse and decrypt HELLO ──────────────────────
+    // ── Step 4: Check for legacy (plaintext) HELLO ──────────
+    // Browser peers without identity send: {"type":"hello","version":1,"legacy":true,...}
+    // In this case, skip encrypted HELLO decryption and proceed with session keys only.
+    let is_legacy = serde_json::from_str::<serde_json::Value>(&hello_raw)
+        .ok()
+        .and_then(|v| v.get("legacy")?.as_bool())
+        .unwrap_or(false);
+
+    if is_legacy {
+        // Legacy HELLO — extract capabilities from plaintext, no identity exchange
+        let legacy_caps: Vec<String> = serde_json::from_str::<serde_json::Value>(&hello_raw)
+            .ok()
+            .and_then(|v| v.get("capabilities")?.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        eprintln!("[WS_HELLO] {peer_addr} legacy HELLO (no identity), caps={legacy_caps:?}");
+
+        let local_caps = daemon_capabilities(wt_enabled);
+        let negotiated = negotiate_capabilities(&local_caps, &legacy_caps);
+        eprintln!("[WS_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
+
+        // Send a legacy HELLO response so browser knows daemon acknowledged
+        let legacy_response = serde_json::json!({
+            "type": "hello",
+            "version": 1,
+            "legacy": true,
+            "capabilities": local_caps,
+        });
+        ws_sink
+            .send(Message::Text(legacy_response.to_string()))
+            .await
+            .map_err(|e| format!("[WS_HELLO] {peer_addr} failed to send legacy HELLO response: {e}"))?;
+        eprintln!("[WS_HELLO] {peer_addr} sent legacy HELLO response");
+
+        let session = SessionContext::new(
+            copy_keypair(&session_kp),
+            remote_session_pk,
+            negotiated.clone(),
+        )
+        .map_err(|e| format!("[WS_SESSION] {peer_addr} failed to create session: {e}"))?;
+
+        eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
+
+        return run_session_with_outbound(
+            ws_sink, ws_source, session, peer_addr, remote_session_pk,
+        ).await;
+    }
+
+    // ── Step 4b: Parse and decrypt HELLO (identity mode) ────
     let hello_inner = parse_hello_typed(hello_raw.as_bytes(), &remote_session_pk, &session_kp)
         .map_err(|e| {
             let code = match &e {
@@ -250,15 +375,20 @@ async fn handle_connection(
     )
     .map_err(|e| format!("[WS_SESSION] {peer_addr} failed to create session: {e}"))?;
 
+    // Compute and log SAS verification code (same algorithm as browser)
+    let sas = bolt_core::sas::compute_sas(
+        &identity.public_key,
+        &remote_identity_pk,
+        &session_kp.public_key,
+        &remote_session_pk,
+    );
+    eprintln!("[SAS] {sas}");
+
     eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
 
     // ── Step 8: Envelope message loop ────────────────────────
-    run_message_loop(
-        &mut ws_sink,
-        &mut ws_source,
-        &session,
-        peer_addr,
-        &remote_identity_pk,
+    run_session_with_outbound(
+        ws_sink, ws_source, session, peer_addr, remote_identity_pk,
     )
     .await
 }
@@ -275,8 +405,12 @@ async fn wait_for_hello(
     let msg = tokio::time::timeout(timeout, async {
         while let Some(result) = source.next().await {
             match result {
-                Ok(Message::Text(text)) => return Ok::<String, BoxErr>(text),
-                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(Message::Text(text)) => {
+                    return Ok::<String, BoxErr>(text);
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                    continue;
+                }
                 Ok(Message::Close(_)) => {
                     let err: BoxErr =
                         format!("[WS_HELLO] {peer_addr} connection closed during HELLO").into();
@@ -300,22 +434,105 @@ async fn wait_for_hello(
         Err(err)
     })
     .await
-    .map_err(|_| -> BoxErr { format!("[WS_HELLO] {peer_addr} HELLO timeout (30s)").into() })??;
+    .map_err(|_| -> BoxErr {
+        format!("[WS_HELLO] {peer_addr} HELLO timeout (30s)").into()
+    })??;
     Ok(msg)
 }
 
 /// Post-HELLO envelope message loop.
 ///
-/// Receives encrypted ProfileEnvelopeV1 frames, decrypts, routes via
-/// `route_inner_message`, and sends any reply. Runs until the peer
-/// disconnects or a protocol violation occurs.
-async fn run_message_loop(
-    ws_sink: &mut (impl SinkExt<Message, Error = tungstenite::Error> + Unpin),
+/// Set up the active session handle, spawn a writer task for outbound messages,
+/// register the global ACTIVE_SESSION, and run the read loop.
+/// Clears ACTIVE_SESSION on exit.
+async fn run_session_with_outbound(
+    mut ws_sink: impl SinkExt<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    mut ws_source: impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+    session: SessionContext,
+    peer_addr: SocketAddr,
+    remote_pk: [u8; 32],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let session = Arc::new(session);
+
+    // Register active session globally so IPC file.send can use it
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = Some(ActiveSessionHandle {
+            outbound_tx: outbound_tx.clone(),
+            session: Arc::clone(&session),
+        });
+    }
+    eprintln!("[WS_SESSION] {peer_addr} active session handle registered");
+
+    // Writer task: drains outbound channel → ws_sink
+    // Also handles replies from the read loop via a second channel.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = outbound_rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if let Err(e) = ws_sink.send(Message::Text(text)).await {
+                                eprintln!("[WS_SESSION] outbound send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    match reply {
+                        Some(text) => {
+                            if let Err(e) = ws_sink.send(Message::Text(text)).await {
+                                eprintln!("[WS_SESSION] reply send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // Read loop
+    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx).await;
+
+    // Cleanup: clear active session
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = None;
+    }
+    eprintln!("[WS_SESSION] {peer_addr} active session handle cleared");
+
+    // Stop writer task
+    drop(reply_tx);
+    let _ = writer_handle.await;
+
+    result
+}
+
+/// Read loop for active sessions. Sends replies via `reply_tx` channel
+/// instead of writing to ws_sink directly (writer task handles that).
+async fn run_read_loop(
     ws_source: &mut (impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin),
     session: &SessionContext,
     peer_addr: SocketAddr,
     _remote_identity_pk: &[u8; 32],
+    reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // File receive state: accumulate chunks per transfer_id
+    use std::collections::HashMap;
+    struct ReceiveTransfer {
+        filename: String,
+        file_size: u64,
+        total_chunks: u32,
+        chunks: HashMap<u32, Vec<u8>>,
+    }
+    let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
+
     while let Some(result) = ws_source.next().await {
         let msg = match result {
             Ok(m) => m,
@@ -332,14 +549,11 @@ async fn run_message_loop(
                     Ok(plaintext) => plaintext,
                     Err(e) => {
                         eprintln!("[WS_SESSION] {peer_addr} envelope error: {e}");
-                        // Send error and disconnect (fail-closed)
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
-                        let _ = ws_sink
-                            .send(Message::Text(
-                                String::from_utf8_lossy(&error_payload).into_owned(),
-                            ))
-                            .await;
+                        let _ = reply_tx.send(
+                            String::from_utf8_lossy(&error_payload).into_owned(),
+                        );
                         break;
                     }
                 };
@@ -348,34 +562,100 @@ async fn run_message_loop(
                 match route_inner_message(&inner, session) {
                     Ok(Some(reply_bytes)) => {
                         let reply_text = String::from_utf8_lossy(&reply_bytes).into_owned();
-                        if let Err(e) = ws_sink.send(Message::Text(reply_text)).await {
-                            eprintln!("[WS_SESSION] {peer_addr} send error: {e}");
+                        if reply_tx.send(reply_text).is_err() {
+                            eprintln!("[WS_SESSION] {peer_addr} reply channel closed");
                             break;
                         }
                     }
                     Ok(None) => {
-                        // No reply needed (pong received, file-transfer message
-                        // handled at transfer layer, etc.)
+                        // Check if this is a file-transfer message we should handle
+                        if let Ok(dc_msg) = crate::dc_messages::parse_dc_message(&inner) {
+                            match dc_msg {
+                                crate::dc_messages::DcMessage::FileChunk {
+                                    ref transfer_id,
+                                    ref filename,
+                                    chunk_index,
+                                    total_chunks,
+                                    ref chunk,
+                                    file_size,
+                                    ..
+                                } => {
+                                    // Chunk is individually encrypted — decrypt it
+                                    let data = match bolt_core::crypto::open_box_payload(
+                                        chunk,
+                                        &session.remote_public_key,
+                                        &session.local_keypair.secret_key,
+                                    ) {
+                                        Ok(plaintext) => plaintext,
+                                        Err(e) => {
+                                            eprintln!("[WS_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    let rx = active_receives
+                                        .entry(transfer_id.clone())
+                                        .or_insert_with(|| {
+                                            eprintln!(
+                                                "[WS_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
+                                                filename, file_size, total_chunks
+                                            );
+                                            ReceiveTransfer {
+                                                filename: filename.clone(),
+                                                file_size,
+                                                total_chunks,
+                                                chunks: HashMap::new(),
+                                            }
+                                        });
+                                    rx.chunks.insert(chunk_index, data);
+
+                                    // Check if all chunks received
+                                    if rx.chunks.len() as u32 >= rx.total_chunks {
+                                        // Assemble and save file
+                                        let mut file_data = Vec::with_capacity(rx.file_size as usize);
+                                        for i in 0..rx.total_chunks {
+                                            if let Some(c) = rx.chunks.get(&i) {
+                                                file_data.extend_from_slice(c);
+                                            }
+                                        }
+                                        let save_dir = std::env::var("HOME")
+                                            .unwrap_or_else(|_| "/tmp".into());
+                                        let save_path = format!("{}/Downloads/{}", save_dir, rx.filename);
+                                        match std::fs::write(&save_path, &file_data) {
+                                            Ok(()) => {
+                                                eprintln!(
+                                                    "[WS_TRANSFER] {peer_addr} saved: {} ({} bytes) → {}",
+                                                    rx.filename, file_data.len(), save_path
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[WS_TRANSFER] {peer_addr} save failed: {} — {}",
+                                                    rx.filename, e
+                                                );
+                                            }
+                                        }
+                                        active_receives.remove(transfer_id);
+                                    }
+                                }
+                                _ => {} // Other file messages (offer, finish, etc.)
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("[WS_SESSION] {peer_addr} route error: {e}");
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
-                        let _ = ws_sink
-                            .send(Message::Text(
-                                String::from_utf8_lossy(&error_payload).into_owned(),
-                            ))
-                            .await;
+                        let _ = reply_tx.send(
+                            String::from_utf8_lossy(&error_payload).into_owned(),
+                        );
                         break;
                     }
                 }
             }
-            Message::Ping(data) => {
-                // Respond to WS-level pings
-                if let Err(e) = ws_sink.send(Message::Pong(data)).await {
-                    eprintln!("[WS_SESSION] {peer_addr} pong send error: {e}");
-                    break;
-                }
+            Message::Ping(_) => {
+                // WS-level pings — reply_tx only handles text; pong needs direct sink access.
+                // The writer task handles this via a special pong message would be complex.
+                // For now, pings are acknowledged by the tungstenite layer automatically.
             }
             Message::Pong(_) => {
                 // Ignore WS-level pongs
@@ -675,6 +955,132 @@ mod tests {
             result.is_ok(),
             "Server should still accept after clean close"
         );
+
+        let (ws2, _) = result.unwrap();
+        let (mut sink2, _) = ws2.split();
+        let _ = sink2.close().await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Legacy HELLO: browser without identity sends plaintext HELLO with legacy=true.
+    /// Daemon must accept it, send legacy HELLO response, and establish session.
+    #[tokio::test]
+    async fn ws_legacy_hello_establishes_session() {
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let daemon_identity = generate_identity_keypair();
+
+        let config = WsEndpointConfig {
+            listen_addr: addr,
+            identity_keypair: copy_keypair(&daemon_identity),
+            wt_enabled: false,
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = run_ws_endpoint(config, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{port}");
+        let (ws_stream, _) = connect_async(&url).await.unwrap();
+        let (mut sink, mut source) = ws_stream.split();
+
+        let browser_session_kp = generate_ephemeral_keypair();
+
+        // Step 1: Send session-key
+        let session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&browser_session_kp.public_key),
+        });
+        sink.send(Message::Text(session_key_msg.to_string()))
+            .await
+            .unwrap();
+
+        // Step 2: Receive daemon's session-key
+        let daemon_sk_msg = source.next().await.unwrap().unwrap();
+        let daemon_sk_text = match daemon_sk_msg {
+            Message::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let daemon_sk_value: serde_json::Value = serde_json::from_str(&daemon_sk_text).unwrap();
+        assert_eq!(daemon_sk_value["type"], "session-key");
+        assert!(daemon_sk_value["publicKey"].as_str().is_some());
+
+        // Step 3: Send legacy HELLO (no identity, no encryption)
+        let legacy_hello = serde_json::json!({
+            "type": "hello",
+            "version": 1,
+            "legacy": true,
+            "capabilities": [],
+        });
+        sink.send(Message::Text(legacy_hello.to_string()))
+            .await
+            .unwrap();
+
+        // Step 4: Receive daemon's legacy HELLO response
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            source.next(),
+        )
+        .await
+        .expect("should receive legacy HELLO response within 5s")
+        .unwrap()
+        .unwrap();
+
+        let response_text = match response {
+            Message::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let response_value: serde_json::Value = serde_json::from_str(&response_text).unwrap();
+        assert_eq!(response_value["type"], "hello");
+        assert_eq!(response_value["legacy"], true);
+        assert!(response_value["capabilities"].is_array());
+
+        // Session is established — clean close
+        let _ = sink.close().await;
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// WS endpoint stays alive after a client disconnects — can accept new connections.
+    #[tokio::test]
+    async fn ws_endpoint_survives_client_disconnect() {
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let identity = generate_identity_keypair();
+
+        let config = WsEndpointConfig {
+            listen_addr: addr,
+            identity_keypair: identity,
+            wt_enabled: false,
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = run_ws_endpoint(config, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{port}");
+
+        // First client connects and drops
+        let (ws1, _) = connect_async(&url).await.unwrap();
+        let (mut sink1, _) = ws1.split();
+        let _ = sink1.close().await;
+        drop(sink1);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Second client connects — server must still be alive
+        let result = connect_async(&url).await;
+        assert!(result.is_ok(), "Server must accept new connections after client disconnect");
 
         let (ws2, _) = result.unwrap();
         let (mut sink2, _) = ws2.split();

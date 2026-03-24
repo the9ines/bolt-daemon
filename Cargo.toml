@@ -22,6 +22,7 @@ name = "bolt-ipc-client"
 path = "src/ipc_client_main.rs"
 
 [features]
+default = ["transport-ws"]
 test-support = []
 transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
 transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
@@ -35,7 +36,8 @@ datachannel = { version = "0.16", features = ["vendored"] }
 webrtc-sdp = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tungstenite = "0.24"
+tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
 rand = "0.8"
 
 # WebSocket transport (RC5 PM-RC-02) — feature-gated
@@ -65,6 +67,7 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 tempfile = "3"
 rcgen = "0.13"
+time = "0.3"
 wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 tungstenite = "0.24"
 serde_json = "1"

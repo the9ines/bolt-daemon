@@ -59,11 +59,19 @@ pub enum DcMessage {
     FileChunk {
         #[serde(rename = "transferId")]
         transfer_id: String,
+        filename: String,
         #[serde(rename = "chunkIndex")]
         chunk_index: u32,
         #[serde(rename = "totalChunks")]
         total_chunks: u32,
-        payload: String,
+        /// Encrypted chunk data (base64). Browser sends as "chunk".
+        chunk: String,
+        #[serde(rename = "fileSize")]
+        file_size: u64,
+        #[serde(rename = "fileHash")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        file_hash: Option<String>,
     },
 
     #[serde(rename = "file-finish")]
@@ -351,9 +359,12 @@ mod tests {
     fn file_chunk_serde_roundtrip() {
         let msg = DcMessage::FileChunk {
             transfer_id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
+            filename: "test.bin".to_string(),
             chunk_index: 0,
             total_chunks: 42,
-            payload: "dGVzdCBjaHVuayBkYXRh".to_string(),
+            chunk: "dGVzdCBjaHVuayBkYXRh".to_string(),
+            file_size: 688128,
+            file_hash: None,
         };
         let bytes = encode_dc_message(&msg).unwrap();
         let parsed = parse_dc_message(&bytes).unwrap();
@@ -363,7 +374,9 @@ mod tests {
         assert_eq!(json["type"], "file-chunk");
         assert_eq!(json["chunkIndex"], 0);
         assert_eq!(json["totalChunks"], 42);
-        assert_eq!(json["payload"], "dGVzdCBjaHVuayBkYXRh");
+        assert_eq!(json["chunk"], "dGVzdCBjaHVuayBkYXRh");
+        assert_eq!(json["filename"], "test.bin");
+        assert_eq!(json["fileSize"], 688128);
     }
 
     #[test]

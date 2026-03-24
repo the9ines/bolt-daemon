@@ -91,6 +91,9 @@ pub(crate) enum DaemonMode {
     Default,
     Smoke,
     Simulate,
+    /// WS-only serving mode: starts a WebSocket endpoint and stays alive.
+    /// No WebRTC/file-signal path. Used for browser↔desktop direct transport.
+    WsEndpoint,
 }
 
 #[derive(Debug, PartialEq)]
@@ -368,9 +371,10 @@ fn parse_args_from(argv: &[String]) -> Args {
                     Some("default") => DaemonMode::Default,
                     Some("smoke") => DaemonMode::Smoke,
                     Some("simulate") => DaemonMode::Simulate,
+                    Some("ws-endpoint") => DaemonMode::WsEndpoint,
                     other => {
                         eprintln!(
-                            "--mode must be 'default', 'smoke', or 'simulate', got {:?}",
+                            "--mode must be 'default', 'smoke', 'simulate', or 'ws-endpoint', got {:?}",
                             other
                         );
                         std::process::exit(1);
@@ -591,8 +595,8 @@ fn parse_args_from(argv: &[String]) -> Args {
 
     let daemon_mode = daemon_mode.unwrap_or(DaemonMode::Default);
 
-    // Simulate mode does not require --role
-    if daemon_mode != DaemonMode::Simulate && role.is_none() {
+    // Simulate and WsEndpoint modes do not require --role
+    if daemon_mode != DaemonMode::Simulate && daemon_mode != DaemonMode::WsEndpoint && role.is_none() {
         eprintln!(
             "Usage: bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]"
         );
@@ -633,9 +637,12 @@ fn parse_args_from(argv: &[String]) -> Args {
     // Legacy daemon modes available via explicit --interop-{signal,hello,dc} flags.
     // This is an intentional breaking change: bare invocation now requires
     // --signal rendezvous (+ --room, --session, --to/--expect-peer).
+    // WsEndpoint mode has its own HELLO handling — skip interop validation.
     let interop_hello_val = interop_hello.unwrap_or(web_hello::InteropHelloMode::WebHelloV1);
     let interop_signal_val = interop_signal.unwrap_or(web_signal::InteropSignal::WebV1);
-    if interop_hello_val == web_hello::InteropHelloMode::WebHelloV1 {
+    if daemon_mode != DaemonMode::WsEndpoint
+        && interop_hello_val == web_hello::InteropHelloMode::WebHelloV1
+    {
         if signal_mode != SignalMode::Rendezvous {
             eprintln!("FATAL: --interop-hello web_hello_v1 requires --signal rendezvous");
             std::process::exit(1);
@@ -1826,6 +1833,118 @@ fn main() {
             });
             run_simulate(event);
         }
+        DaemonMode::WsEndpoint => {
+            // WS-only serving mode: start WS endpoint and stay alive.
+            // No WebRTC/file-signal path. Used for browser↔desktop direct transport.
+            use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
+
+            let socket_path_str = args.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);
+            let ipc_server = match IpcServer::start(socket_path_str) {
+                Ok(s) => {
+                    eprintln!("[IPC] listening on {socket_path_str}");
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("[bolt-daemon] WARNING: IPC server failed: {e}");
+                    None
+                }
+            };
+
+            let _ipc_server = ipc_server;
+
+            let data_dir_path = args.data_dir.as_ref().map(std::path::PathBuf::from);
+
+            // File send signal: bolt-ui writes file path to data_dir/send_file.signal
+            // The WS endpoint runtime polls for this file and sends it.
+            let send_signal_path = data_dir_path
+                .as_ref()
+                .map(|dd| dd.join("send_file.signal"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-send-file.signal"));
+            let identity_path = match &data_dir_path {
+                Some(dd) => identity_store::resolve_identity_path_from_data_dir(dd),
+                None => match identity_store::resolve_identity_path() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[bolt-daemon] FATAL: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+            let identity = match identity_store::load_or_create_identity(&identity_path) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    eprintln!("[bolt-daemon] FATAL: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            #[cfg(feature = "transport-ws")]
+            let ws_addr_str = match args.ws_listen.as_ref() {
+                Some(a) => a.clone(),
+                None => {
+                    eprintln!("[bolt-daemon] FATAL: --ws-listen required in ws-endpoint mode");
+                    std::process::exit(1);
+                }
+            };
+
+            #[cfg(feature = "transport-ws")]
+            {
+                let ws_addr: std::net::SocketAddr = match ws_addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[WS_ENDPOINT] FATAL: invalid --ws-listen address '{ws_addr_str}': {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let ws_identity = bolt_core::crypto::KeyPair {
+                    public_key: identity.public_key,
+                    secret_key: identity.secret_key,
+                };
+                let ws_config = ws_endpoint::WsEndpointConfig {
+                    listen_addr: ws_addr,
+                    identity_keypair: ws_identity,
+                    wt_enabled: false,
+                };
+                eprintln!("[WS_ENDPOINT] starting on {ws_addr}");
+
+                // Run WS endpoint on the main thread — blocks until shutdown.
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                let signal_path = send_signal_path.clone();
+                rt.block_on(async {
+                    // Spawn file-send signal watcher
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if signal_path.exists() {
+                                if let Ok(path_str) = std::fs::read_to_string(&signal_path) {
+                                    let path_str = path_str.trim();
+                                    if !path_str.is_empty() {
+                                        eprintln!("[WS_TRANSFER] send signal: {path_str}");
+                                        let _ = std::fs::remove_file(&signal_path);
+                                        match ws_endpoint::send_file_to_browser(path_str) {
+                                            Ok(()) => eprintln!("[WS_TRANSFER] send complete"),
+                                            Err(e) => eprintln!("[WS_TRANSFER] send error: {e}"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx).await {
+                        eprintln!("[WS_ENDPOINT] FATAL: {e}");
+                        std::process::exit(1);
+                    }
+                });
+            }
+
+            #[cfg(not(feature = "transport-ws"))]
+            {
+                eprintln!("[bolt-daemon] FATAL: ws-endpoint mode requires transport-ws feature");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -2233,5 +2352,43 @@ mod tests {
         ]);
         let args = parse_args_from(&argv);
         assert!(!args.no_wt);
+    }
+
+    #[test]
+    fn ws_endpoint_mode_parsed() {
+        let argv = make_argv(&[
+            "--mode", "ws-endpoint",
+            "--ws-listen", "0.0.0.0:9100",
+            "--data-dir", "/tmp/test",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.daemon_mode, DaemonMode::WsEndpoint);
+        #[cfg(feature = "transport-ws")]
+        assert_eq!(args.ws_listen, Some("0.0.0.0:9100".to_string()));
+    }
+
+    #[test]
+    fn ws_endpoint_mode_does_not_require_role() {
+        // WsEndpoint mode should parse successfully without --role
+        let argv = make_argv(&[
+            "--mode", "ws-endpoint",
+            "--ws-listen", "0.0.0.0:9100",
+        ]);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.daemon_mode, DaemonMode::WsEndpoint);
+        assert!(args.role.is_none());
+    }
+
+    #[test]
+    fn ws_endpoint_mode_skips_interop_validation() {
+        // WsEndpoint mode should not fail on default interop settings
+        // (default interop_hello=WebHelloV1 normally requires --signal rendezvous)
+        let argv = make_argv(&[
+            "--mode", "ws-endpoint",
+            "--ws-listen", "0.0.0.0:9100",
+        ]);
+        // parse_args_from would exit(1) if interop validation blocked ws-endpoint mode
+        let args = parse_args_from(&argv);
+        assert_eq!(args.daemon_mode, DaemonMode::WsEndpoint);
     }
 }

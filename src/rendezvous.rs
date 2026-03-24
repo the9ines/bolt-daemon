@@ -190,12 +190,12 @@ fn recv_with_deadline(
             MaybeTlsStream::Plain(tcp) => {
                 tcp.set_read_timeout(Some(read_timeout))?;
             }
-            // SA16: fail-closed — no TLS crate compiled in; if a TLS variant is
-            // added in the future, this arm forces an explicit timeout implementation
-            // rather than silently blocking indefinitely on ws.read().
+            MaybeTlsStream::NativeTls(tls) => {
+                tls.get_ref().set_read_timeout(Some(read_timeout))?;
+            }
             #[allow(unreachable_patterns)]
             _ => {
-                return Err("read timeout not supported for this stream type — TLS timeout handler required".into());
+                return Err("read timeout not supported for this stream type".into());
             }
         }
 
@@ -667,12 +667,15 @@ pub(crate) fn run_post_hello_loop(
                         );
                     }
 
-                    let payload_b64 = bolt_core::encoding::to_base64(&chunk.data);
+                    let chunk_b64 = bolt_core::encoding::to_base64(&chunk.data);
                     let msg = crate::dc_messages::DcMessage::FileChunk {
                         transfer_id: chunk.transfer_id,
+                        filename: String::new(),
                         chunk_index: chunk.chunk_index,
                         total_chunks: chunk.total_chunks,
-                        payload: payload_b64,
+                        chunk: chunk_b64,
+                        file_size: 0,
+                        file_hash: None,
                     };
                     let json = crate::dc_messages::encode_dc_message(&msg)
                         .map_err(|e| format!("[B-XFER-1] encode chunk: {e}"))?;
@@ -849,11 +852,11 @@ pub(crate) fn run_post_hello_loop(
                     Ok(crate::dc_messages::DcMessage::FileChunk {
                         transfer_id,
                         chunk_index,
-                        payload,
+                        chunk,
                         ..
                     }) => {
-                        // Base64 decode payload before passing to transfer SM
-                        let data = match bolt_core::encoding::from_base64(&payload) {
+                        // Base64 decode chunk before passing to transfer SM
+                        let data = match bolt_core::encoding::from_base64(&chunk) {
                             Ok(d) => d,
                             Err(_) => {
                                 let te = crate::transfer::TransferError::InvalidTransition(
@@ -2738,7 +2741,10 @@ mod tests {
             transfer_id: "xfer-full".to_string(),
             chunk_index: 0,
             total_chunks: 2,
-            payload: "aGVsbG8g".to_string(),
+            chunk: "aGVsbG8g".to_string(),
+            filename: "test.bin".to_string(),
+            file_size: 11,
+            file_hash: None,
         };
         let chunk0_json = crate::dc_messages::encode_dc_message(&chunk0).unwrap();
         let chunk0_env = crate::envelope::encode_envelope(&chunk0_json, &sess_a).unwrap();
@@ -2749,7 +2755,10 @@ mod tests {
             transfer_id: "xfer-full".to_string(),
             chunk_index: 1,
             total_chunks: 2,
-            payload: "d29ybGQ=".to_string(),
+            chunk: "d29ybGQ=".to_string(),
+            filename: "test.bin".to_string(),
+            file_size: 11,
+            file_hash: None,
         };
         let chunk1_json = crate::dc_messages::encode_dc_message(&chunk1).unwrap();
         let chunk1_env = crate::envelope::encode_envelope(&chunk1_json, &sess_a).unwrap();
@@ -2807,7 +2816,10 @@ mod tests {
             transfer_id: "orphan".to_string(),
             chunk_index: 0,
             total_chunks: 1,
-            payload: "dGVzdA==".to_string(),
+            chunk: "dGVzdA==".to_string(),
+            filename: "test.bin".to_string(),
+            file_size: 4,
+            file_hash: None,
         };
         let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
         let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
@@ -2877,7 +2889,10 @@ mod tests {
             transfer_id: "xfer-b4".to_string(),
             chunk_index: 0,
             total_chunks: 1,
-            payload: payload_b64,
+            chunk: payload_b64,
+            filename: "test.bin".to_string(),
+            file_size: 0,
+            file_hash: None,
         };
         let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
         let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
@@ -2951,7 +2966,10 @@ mod tests {
             transfer_id: "xfer-bad".to_string(),
             chunk_index: 0,
             total_chunks: 1,
-            payload: payload_b64,
+            chunk: payload_b64,
+            filename: "test.bin".to_string(),
+            file_size: 0,
+            file_hash: None,
         };
         let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
         let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
@@ -3077,7 +3095,10 @@ mod tests {
             transfer_id: "xfer-ign".to_string(),
             chunk_index: 0,
             total_chunks: 1,
-            payload: payload_b64,
+            chunk: payload_b64,
+            filename: "test.bin".to_string(),
+            file_size: 0,
+            file_hash: None,
         };
         let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
         let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();
@@ -3139,7 +3160,10 @@ mod tests {
             transfer_id: "xfer-plain".to_string(),
             chunk_index: 0,
             total_chunks: 1,
-            payload: payload_b64,
+            chunk: payload_b64,
+            filename: "test.bin".to_string(),
+            file_size: 0,
+            file_hash: None,
         };
         let chunk_json = crate::dc_messages::encode_dc_message(&chunk).unwrap();
         let chunk_env = crate::envelope::encode_envelope(&chunk_json, &sess_a).unwrap();

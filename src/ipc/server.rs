@@ -118,6 +118,31 @@ pub fn check_version_compatible(app_version: &str, daemon_version: &str) -> bool
 }
 
 // ── IPC Server ──────────────────────────────────────────────
+//
+// SECURITY NOTE (DAEMON-HARDENING-1, IP-04):
+//
+// IPC authentication relies on filesystem permissions only:
+//   - Unix: socket file is chmod 0600 (owner-only)
+//   - Windows: named pipe DACL restricts to current user
+//
+// This means any process running as the same OS user can connect.
+// There is no additional credential, token, or PID verification.
+//
+// Threat model (SECURITY_MODEL.md A6): a malicious same-user process
+// can send IPC commands (e.g., file.send with arbitrary path) and
+// receive daemon events. This is equivalent to daemon compromise
+// for that user — accepted as within blast radius.
+//
+// PID-based authentication was evaluated and deferred:
+//   - Not portable (different APIs on macOS, Linux, Windows)
+//   - Marginal value: same-user access already implies filesystem access
+//     to identity keys, trust store, and received files
+//   - Would add complexity without meaningfully raising the bar
+//
+// If stronger IPC auth is needed in the future, consider:
+//   - Shared secret written to data_dir on daemon start (0600)
+//   - Client sends secret in version.handshake payload
+//   - Daemon validates before accepting commands
 
 /// Handle for the IPC server. Provides channel-based API to the daemon.
 pub struct IpcServer {

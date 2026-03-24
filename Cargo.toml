@@ -27,14 +27,19 @@ test-support = []
 transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
 transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 transport-webtransport = ["dep:wtransport", "dep:tokio", "dep:rcgen"]
+# Deprecated transitional compatibility — NOT a supported forward path.
+# Enables DaemonMode::Default and DaemonMode::Smoke WebRTC/DataChannel paths.
+# The forward architecture is WsEndpoint mode (direct WS/WT transport).
+# Will be removed entirely in a future DEWEBRTC phase.
+legacy-webrtc = ["dep:datachannel", "dep:webrtc-sdp"]
 
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr" }
 bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
-datachannel = { version = "0.16", features = ["vendored"] }
-webrtc-sdp = "0.3"
+datachannel = { version = "0.16", features = ["vendored"], optional = true }
+webrtc-sdp = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.24", features = ["native-tls"] }

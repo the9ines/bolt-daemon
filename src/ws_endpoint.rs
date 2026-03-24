@@ -1,18 +1,40 @@
-//! WebSocket server endpoint for browser-to-daemon sessions (PM-RC-02).
+//! WebSocket server endpoint for browser-to-daemon sessions.
 //!
-//! Provides a direct WebSocket transport as an alternative to WebRTC
-//! DataChannel. The wire format is identical: each WS text message is
-//! one JSON frame (HELLO exchange, then ProfileEnvelopeV1 messages).
+//! # Module Contract (MODULARITY-AUDITABILITY-1)
 //!
-//! RC5 scope: localhost/LAN only, no TLS. This is acceptable because
-//! the Bolt Protocol uses end-to-end NaCl-box encryption at the
-//! envelope layer — the transport is untrusted by design.
+//! **Owner:** bolt-daemon
+//! **Consumers:** main.rs (WsEndpoint mode dispatch)
 //!
-//! Log tokens:
+//! **Exports:**
+//! - `WsEndpointConfig` — server configuration (listen addr, identity, capabilities)
+//! - `run_ws_endpoint()` — async server entry point (bind, accept, shutdown)
+//! - `send_file_to_browser()` — outbound file transfer via global ACTIVE_SESSION
+//! - `validate_send_file_path()` — file path validation for signal-file sends
+//! - `ActiveSessionHandle` — session state for outbound sends (outbound_tx, session, btr_engine)
+//!
+//! **Global state:** `ACTIVE_SESSION: Mutex<Option<ActiveSessionHandle>>` — set when a
+//! browser connects and HELLO completes, cleared on disconnect. Used by `send_file_to_browser()`
+//! from the IPC/signal-file thread.
+//!
+//! **Invariants:**
+//! - One active session at a time (new connection replaces old)
+//! - BTR engine initialized only when `bolt.transfer-ratchet-v1` negotiated
+//! - Received filenames sanitized (TI-02)
+//! - Transfer size bounded at 2.5 GB (TI-03)
+//! - Session keys zeroized on disconnect
+//!
+//! **Split candidates for future phases:**
+//! - File send/receive logic → `ws_transfer.rs`
+//! - BTR engine lifecycle → `ws_btr.rs`
+//!
+//! **Log tokens:**
 //!   [WS_ENDPOINT]  — server lifecycle (bind, shutdown)
 //!   [WS_SESSION]   — per-connection session lifecycle
 //!   [WS_HELLO]     — HELLO handshake over WS
-//!   [WS_TRANSFER]  — file transfer events over WS
+//!   [WS_TRANSFER]  — file transfer events
+//!   [BTR]          — BTR engine lifecycle
+//!   [BTR_TRANSFER_SEND/RECV/COMPLETE] — BTR transfer events
+//!   [SAS]          — SAS verification code
 
 use std::net::SocketAddr;
 use std::sync::Arc;

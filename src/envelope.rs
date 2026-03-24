@@ -1,13 +1,25 @@
-//! Profile Envelope v1 codec for DataChannel messages (INTEROP-3).
+//! Profile Envelope v1 codec — encrypt/decrypt/route inner messages.
 //!
-//! After the encrypted HELLO exchange establishes a session, all
-//! DataChannel messages in web_dc_v1 mode are wrapped in a Profile
-//! Envelope:
+//! # Module Contract (MODULARITY-AUDITABILITY-1)
 //!
-//!   {"type":"profile-envelope","version":1,"encoding":"base64","payload":"<sealed>"}
+//! **Owner:** bolt-daemon
+//! **Consumers:** ws_endpoint.rs, wt_endpoint.rs, rendezvous.rs (legacy), tests
 //!
-//! The payload is NaCl-box encrypted (same primitives as HELLO).
-//! Fail-closed: any parse, version, or decrypt error is a protocol violation.
+//! **Exports:**
+//! - `ProfileEnvelopeV1` — wire type with optional BTR fields
+//! - `BtrEnvelopeFields` — extracted BTR envelope metadata
+//! - `encode_envelope()` / `encode_envelope_with_btr()` — seal inner JSON
+//! - `decode_envelope()` / `decode_envelope_with_btr()` — unseal + extract BTR fields
+//! - `extract_btr_fields()` — parse BTR fields from envelope
+//! - `route_inner_message()` — dispatch decrypted inner message (ping/pong/error/file)
+//! - `build_error_payload()` — construct error frames
+//!
+//! **Invariants:**
+//! - Envelope version must be 1 (ENVELOPE_INVALID on mismatch)
+//! - Envelope encoding must be "base64"
+//! - Capability negotiation required before encode/decode
+//! - Inbound error codes validated against canonical registry
+//! - Fail-closed on any parse, version, or decrypt error
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

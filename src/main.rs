@@ -1,19 +1,18 @@
-//! Bolt Daemon — Headless WebRTC DataChannel transport (Phase 3E-B).
+//! Bolt Daemon — local protocol authority for Bolt P2P file transfer.
 //!
-//! Establishes a WebRTC DataChannel via libdatachannel and exchanges a
-//! deterministic "hello" payload between two peers. No browser required.
+//! # Module Contract (MODULARITY-AUDITABILITY-1)
 //!
-//! Network scope policy:
-//!   lan     — LAN-only: ICE candidates filtered to private/link-local IPs (default)
-//!   overlay — LAN + CGNAT 100.64/10 (e.g. Tailscale)
-//!   global  — all valid IPs accepted (public, CGNAT, private)
+//! **Forward path:** `--mode ws-endpoint` (default) — direct WS/WT transport.
+//! **Legacy path:** `--mode default|smoke` (requires `--features legacy-webrtc`).
 //!
-//! Signal modes:
-//!   file        — exchange offer/answer via JSON files (default, backward compat)
-//!   rendezvous  — exchange offer/answer via bolt-rendezvous WebSocket server
+//! **Daemon modes:**
+//! - `WsEndpoint` — WS-only server for browser↔desktop direct transport (forward)
+//! - `Simulate` — demo/test mode for IPC pairing flow
+//! - `Default` — WebRTC DataChannel via libdatachannel (legacy, feature-gated)
+//! - `Smoke` — transfer test over DataChannel (legacy, feature-gated)
 //!
-//! Usage:
-//!   bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
+//! **This file owns:** CLI parsing, mode dispatch, boot diagnostics.
+//! **Delegates to:** ws_endpoint, wt_endpoint, legacy_webrtc, rendezvous, simulate.
 
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.

@@ -17,13 +17,35 @@ use bolt_core::session::SessionContext;
 // ── Wire types ──────────────────────────────────────────────
 
 /// Profile Envelope v1 outer frame.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+///
+/// BTR fields (§16.2): optional envelope-level fields present when
+/// `bolt.transfer-ratchet-v1` is negotiated and a BTR transfer is active.
+/// Omitted entirely for non-BTR sessions — serde skip_serializing_if = None.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ProfileEnvelopeV1 {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub version: u32,
     pub encoding: String,
     pub payload: String,
+
+    /// BTR chain index — present on every BTR-protected chunk.
+    /// Monotonically increasing per transfer (0, 1, 2, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub chain_index: Option<u32>,
+
+    /// BTR ratchet public key — present on the first chunk of each transfer.
+    /// Base64-encoded 32-byte X25519 public key from the sender's per-transfer keypair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub ratchet_public_key: Option<String>,
+
+    /// BTR ratchet generation — present on the first chunk of each transfer.
+    /// Monotonically increasing per session (incremented on each DH ratchet step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub ratchet_generation: Option<u32>,
 }
 
 /// DataChannel error message.
@@ -215,6 +237,44 @@ pub fn encode_envelope(
         version: 1,
         encoding: "base64".to_string(),
         payload: sealed,
+        chain_index: None,
+        ratchet_public_key: None,
+        ratchet_generation: None,
+    };
+
+    let json = serde_json::to_vec(&envelope)
+        .map_err(|e| EnvelopeError::ParseError(format!("serialize: {e}")))?;
+    Ok(json)
+}
+
+/// Encode a Profile Envelope v1 frame WITH BTR envelope fields.
+///
+/// Same encryption as `encode_envelope`, but populates optional BTR fields
+/// on the outer envelope (chain_index, ratchet_public_key, ratchet_generation).
+pub fn encode_envelope_with_btr(
+    inner_json: &[u8],
+    session: &SessionContext,
+    btr_fields: &BtrEnvelopeFields,
+) -> Result<Vec<u8>, EnvelopeError> {
+    if !session.envelope_v1_negotiated() {
+        return Err(EnvelopeError::Unnegotiated);
+    }
+
+    let sealed = bolt_core::crypto::seal_box_payload(
+        inner_json,
+        &session.remote_public_key,
+        &session.local_keypair.secret_key,
+    )
+    .map_err(|e| EnvelopeError::DecryptFail(format!("seal: {e}")))?;
+
+    let envelope = ProfileEnvelopeV1 {
+        msg_type: "profile-envelope".to_string(),
+        version: 1,
+        encoding: "base64".to_string(),
+        payload: sealed,
+        chain_index: Some(btr_fields.chain_index),
+        ratchet_public_key: btr_fields.ratchet_public_key.clone(),
+        ratchet_generation: btr_fields.ratchet_generation,
     };
 
     let json = serde_json::to_vec(&envelope)
@@ -280,6 +340,84 @@ pub fn decode_envelope(raw: &[u8], session: &SessionContext) -> Result<Vec<u8>, 
     .map_err(|e| EnvelopeError::DecryptFail(e.to_string()))?;
 
     Ok(plaintext)
+}
+
+/// Decode a Profile Envelope v1 frame AND extract BTR fields if present.
+///
+/// Same validation and decryption as `decode_envelope`, but also returns
+/// any BTR envelope-level fields (chain_index, ratchet_public_key, ratchet_generation).
+/// Returns (plaintext_inner_bytes, Option<BtrEnvelopeFields>).
+pub fn decode_envelope_with_btr(
+    raw: &[u8],
+    session: &SessionContext,
+) -> Result<(Vec<u8>, Option<BtrEnvelopeFields>), EnvelopeError> {
+    let text =
+        std::str::from_utf8(raw).map_err(|_| EnvelopeError::ParseError("not UTF-8".to_string()))?;
+
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| EnvelopeError::ParseError(e.to_string()))?;
+
+    let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    if msg_type != "profile-envelope" {
+        if session.envelope_v1_negotiated() {
+            return Err(EnvelopeError::EnvelopeRequired);
+        }
+        return Err(EnvelopeError::InvalidState(format!(
+            "expected profile-envelope, got '{msg_type}'"
+        )));
+    }
+
+    if !session.envelope_v1_negotiated() {
+        return Err(EnvelopeError::Unnegotiated);
+    }
+
+    let envelope: ProfileEnvelopeV1 =
+        serde_json::from_value(value).map_err(|e| EnvelopeError::ParseError(e.to_string()))?;
+
+    if envelope.version != 1 {
+        return Err(EnvelopeError::Invalid(format!(
+            "version {} != 1",
+            envelope.version
+        )));
+    }
+    if envelope.encoding != "base64" {
+        return Err(EnvelopeError::Invalid(format!(
+            "encoding '{}' != 'base64'",
+            envelope.encoding
+        )));
+    }
+
+    let btr_fields = extract_btr_fields(&envelope);
+
+    let plaintext = bolt_core::crypto::open_box_payload(
+        &envelope.payload,
+        &session.remote_public_key,
+        &session.local_keypair.secret_key,
+    )
+    .map_err(|e| EnvelopeError::DecryptFail(e.to_string()))?;
+
+    Ok((plaintext, btr_fields))
+}
+
+/// BTR envelope fields extracted from a ProfileEnvelopeV1.
+/// Present when the sending peer has `bolt.transfer-ratchet-v1` negotiated
+/// and a BTR transfer is active.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BtrEnvelopeFields {
+    pub chain_index: u32,
+    pub ratchet_public_key: Option<String>,
+    pub ratchet_generation: Option<u32>,
+}
+
+/// Extract BTR fields from a parsed ProfileEnvelopeV1, if present.
+/// Returns None if chain_index is absent (non-BTR envelope).
+pub fn extract_btr_fields(envelope: &ProfileEnvelopeV1) -> Option<BtrEnvelopeFields> {
+    envelope.chain_index.map(|ci| BtrEnvelopeFields {
+        chain_index: ci,
+        ratchet_public_key: envelope.ratchet_public_key.clone(),
+        ratchet_generation: envelope.ratchet_generation,
+    })
 }
 
 // ── Inner message router ────────────────────────────────────
@@ -425,16 +563,105 @@ mod tests {
             version: 1,
             encoding: "base64".to_string(),
             payload: "dGVzdA==".to_string(),
+            chain_index: None,
+            ratchet_public_key: None,
+            ratchet_generation: None,
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains(r#""type":"profile-envelope"#));
         assert!(json.contains(r#""version":1"#));
         assert!(json.contains(r#""encoding":"base64"#));
+        // BTR fields must be absent when None (skip_serializing_if)
+        assert!(!json.contains("chain_index"));
+        assert!(!json.contains("ratchet_public_key"));
+        assert!(!json.contains("ratchet_generation"));
         let decoded: ProfileEnvelopeV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.msg_type, "profile-envelope");
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.encoding, "base64");
         assert_eq!(decoded.payload, "dGVzdA==");
+        assert_eq!(decoded.chain_index, None);
+        assert_eq!(decoded.ratchet_public_key, None);
+        assert_eq!(decoded.ratchet_generation, None);
+    }
+
+    #[test]
+    fn profile_envelope_v1_btr_fields_roundtrip() {
+        let env = ProfileEnvelopeV1 {
+            msg_type: "profile-envelope".to_string(),
+            version: 1,
+            encoding: "base64".to_string(),
+            payload: "dGVzdA==".to_string(),
+            chain_index: Some(0),
+            ratchet_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            ratchet_generation: Some(1),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""chain_index":0"#));
+        assert!(json.contains(r#""ratchet_public_key":"#));
+        assert!(json.contains(r#""ratchet_generation":1"#));
+        let decoded: ProfileEnvelopeV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.chain_index, Some(0));
+        assert_eq!(decoded.ratchet_public_key, Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()));
+        assert_eq!(decoded.ratchet_generation, Some(1));
+    }
+
+    #[test]
+    fn profile_envelope_v1_btr_subsequent_chunk_no_ratchet_key() {
+        // Chunks after the first have chain_index but no ratchet_public_key or generation
+        let env = ProfileEnvelopeV1 {
+            msg_type: "profile-envelope".to_string(),
+            version: 1,
+            encoding: "base64".to_string(),
+            payload: "dGVzdA==".to_string(),
+            chain_index: Some(5),
+            ratchet_public_key: None,
+            ratchet_generation: None,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""chain_index":5"#));
+        assert!(!json.contains("ratchet_public_key"));
+        assert!(!json.contains("ratchet_generation"));
+        let decoded: ProfileEnvelopeV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.chain_index, Some(5));
+        assert_eq!(decoded.ratchet_public_key, None);
+        assert_eq!(decoded.ratchet_generation, None);
+    }
+
+    #[test]
+    fn profile_envelope_v1_btr_fields_absent_from_browser_non_btr() {
+        // Browser sends envelope without BTR fields — must deserialize correctly
+        let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA=="}"#;
+        let decoded: ProfileEnvelopeV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.chain_index, None);
+        assert_eq!(decoded.ratchet_public_key, None);
+        assert_eq!(decoded.ratchet_generation, None);
+    }
+
+    #[test]
+    fn profile_envelope_v1_btr_fields_from_browser_first_chunk() {
+        // Browser sends first BTR chunk with all fields
+        let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA==","chain_index":0,"ratchet_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ratchet_generation":1}"#;
+        let decoded: ProfileEnvelopeV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.chain_index, Some(0));
+        assert!(decoded.ratchet_public_key.is_some());
+        assert_eq!(decoded.ratchet_generation, Some(1));
+    }
+
+    #[test]
+    fn profile_envelope_v1_malformed_btr_chain_index_type() {
+        // chain_index as string instead of number — must fail to parse
+        let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA==","chain_index":"zero"}"#;
+        let result = serde_json::from_str::<ProfileEnvelopeV1>(json);
+        assert!(result.is_err(), "string chain_index must fail parse");
+    }
+
+    #[test]
+    fn profile_envelope_v1_malformed_btr_ratchet_generation_negative() {
+        // ratchet_generation as negative — must fail (u32 cannot be negative)
+        let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA==","ratchet_generation":-1}"#;
+        let result = serde_json::from_str::<ProfileEnvelopeV1>(json);
+        assert!(result.is_err(), "negative ratchet_generation must fail parse");
     }
 
     #[test]

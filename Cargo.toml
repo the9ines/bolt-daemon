@@ -30,6 +30,7 @@ transport-webtransport = ["dep:wtransport", "dep:tokio", "dep:rcgen"]
 
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
+bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr" }
 bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
 datachannel = { version = "0.16", features = ["vendored"] }
@@ -39,6 +40,7 @@ serde_json = "1"
 tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # WebSocket transport (RC5 PM-RC-02) — feature-gated
 tokio-tungstenite = { version = "0.24", optional = true }

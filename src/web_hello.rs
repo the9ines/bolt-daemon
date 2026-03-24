@@ -47,9 +47,7 @@ pub enum InteropHelloMode {
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     "bolt.profile-envelope-v1",
     "bolt.file-hash",
-    // NOTE: bolt.transfer-ratchet-v1 intentionally omitted.
-    // Daemon does not implement BTR state machine for chunk decryption.
-    // Chunks use plain seal_box_payload with session keys instead.
+    "bolt.transfer-ratchet-v1",
 ];
 
 /// Return daemon capabilities as owned Strings.

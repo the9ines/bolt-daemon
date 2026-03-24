@@ -121,10 +121,8 @@ async fn connect_and_handshake(
 }
 
 // ── AC-RC-23: BTR capability negotiation over WS ─────────
-// NOTE: bolt.transfer-ratchet-v1 is temporarily NOT advertised by the daemon
-// in direct browser↔daemon sessions. The daemon does not implement the BTR
-// state machine for chunk decryption. Chunks use plain seal_box_payload instead.
-// Follow-up stream DAEMON-BTR-1 will restore BTR support.
+// DAEMON-BTR-1 complete: daemon now implements BTR state machine for chunk
+// encrypt/decrypt. Capability truthfully advertised.
 
 #[tokio::test]
 async fn ac_rc_23_ws_hello_negotiates_btr_capability() {
@@ -147,15 +145,12 @@ async fn ac_rc_23_ws_hello_negotiates_btr_capability() {
 
     let (mut sink, _source, _kp, _pk, negotiated) = connect_and_handshake(port).await;
 
-    // Daemon MUST advertise core capabilities
+    // Daemon MUST advertise all capabilities it implements
     assert!(negotiated.contains(&"bolt.profile-envelope-v1".to_string()));
     assert!(negotiated.contains(&"bolt.file-hash".to_string()));
-
-    // BTR is intentionally NOT advertised until daemon implements BTR state machine.
-    // When DAEMON-BTR-1 is complete, flip this assertion back to assert!(contains).
     assert!(
-        !negotiated.contains(&"bolt.transfer-ratchet-v1".to_string()),
-        "BTR must NOT be advertised until daemon implements BTR chunk decryption"
+        negotiated.contains(&"bolt.transfer-ratchet-v1".to_string()),
+        "BTR capability must be in negotiated set; got: {negotiated:?}"
     );
 
     let _ = sink.close().await;

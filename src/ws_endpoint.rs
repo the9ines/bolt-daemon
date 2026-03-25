@@ -254,6 +254,12 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
 
         handle.outbound_tx.send(text)
             .map_err(|_| "session closed".to_string())?;
+
+        // Emit progress for UI consumption
+        eprintln!(
+            "[WS_TRANSFER] progress: {}/{} chunks ({})",
+            i + 1, total_chunks, filename
+        );
     }
 
     // Cleanup BTR send transfer context
@@ -955,6 +961,12 @@ async fn run_read_loop(
                                             }
                                         });
                                     rx.chunks.insert(chunk_index, data);
+
+                                    // Emit progress for UI consumption
+                                    eprintln!(
+                                        "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
+                                        rx.chunks.len(), rx.total_chunks, rx.filename
+                                    );
 
                                     // Check if all chunks received
                                     if rx.chunks.len() as u32 >= rx.total_chunks {

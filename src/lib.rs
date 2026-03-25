@@ -17,6 +17,11 @@ pub mod transfer;
 #[doc(hidden)]
 pub mod web_hello;
 
+/// Input validation boundary for WS file transfers (MODULARITY-AUDITABILITY-2).
+/// Pure functions — no global state, no async.
+#[doc(hidden)]
+pub mod ws_validation;
+
 /// WebSocket server endpoint (RC5 PM-RC-02).
 /// Feature-gated behind `transport-ws`.
 #[cfg(feature = "transport-ws")]

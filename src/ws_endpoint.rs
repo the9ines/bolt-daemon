@@ -9,8 +9,11 @@
 //! - `WsEndpointConfig` — server configuration (listen addr, identity, capabilities)
 //! - `run_ws_endpoint()` — async server entry point (bind, accept, shutdown)
 //! - `send_file_to_browser()` — outbound file transfer via global ACTIVE_SESSION
-//! - `validate_send_file_path()` — file path validation for signal-file sends
+//! - `validate_send_file_path()` — re-exported from `ws_validation`
 //! - `ActiveSessionHandle` — session state for outbound sends (outbound_tx, session, btr_engine)
+//!
+//! **Delegates to `ws_validation`:**
+//! - `sanitize_filename()`, `validate_send_file_path()`, `parse_transfer_id_bytes()`, `MAX_TRANSFER_SIZE`
 //!
 //! **Global state:** `ACTIVE_SESSION: Mutex<Option<ActiveSessionHandle>>` — set when a
 //! browser connects and HELLO completes, cleared on disconnect. Used by `send_file_to_browser()`
@@ -41,85 +44,9 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 
-/// Sanitize a received filename to prevent path traversal.
-///
-/// Extracts basename (last component after any `/` or `\`), then rejects
-/// dangerous patterns. Returns Err for filenames that cannot be safely used.
-///
-/// Rules:
-///   1. Extract basename (last path component)
-///   2. Reject empty
-///   3. Reject null bytes
-///   4. Reject `.` and `..`
-///   5. Reject hidden files (starts with `.`)
-///   6. Replace any remaining path separators (defense in depth)
-fn sanitize_filename(raw: &str) -> Result<String, String> {
-    // Reject null bytes
-    if raw.contains('\0') {
-        return Err("filename contains null byte".into());
-    }
-
-    // Extract basename: last component after / or \
-    let basename = raw
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("");
-
-    // Reject empty
-    if basename.is_empty() {
-        return Err("filename is empty after path extraction".into());
-    }
-
-    // Reject . and ..
-    if basename == "." || basename == ".." {
-        return Err(format!("filename '{}' is a directory reference", basename));
-    }
-
-    // Reject hidden files (starts with .)
-    if basename.starts_with('.') {
-        return Err(format!("filename '{}' is a hidden file", basename));
-    }
-
-    // Defense in depth: replace any remaining path separators
-    let safe = basename.replace(['/', '\\'], "_");
-
-    // Final check: ensure result is non-empty after replacement
-    if safe.is_empty() || safe == "." || safe == ".." {
-        return Err("filename sanitized to empty/dangerous value".into());
-    }
-
-    Ok(safe)
-}
-
-/// Validate a file path from a send signal before the daemon reads and sends it.
-///
-/// Requirements:
-///   - Must be an absolute path
-///   - Must point to an existing regular file (not directory, symlink target checked)
-///   - Must not be empty
-///
-/// Returns the validated path or an error description.
-pub fn validate_send_file_path(path_str: &str) -> Result<&str, String> {
-    if path_str.is_empty() {
-        return Err("empty path".into());
-    }
-
-    let path = std::path::Path::new(path_str);
-
-    if !path.is_absolute() {
-        return Err(format!("path is not absolute: {path_str}"));
-    }
-
-    if !path.exists() {
-        return Err(format!("file does not exist: {path_str}"));
-    }
-
-    if !path.is_file() {
-        return Err(format!("not a regular file: {path_str}"));
-    }
-
-    Ok(path_str)
-}
+// Validation functions extracted to ws_validation (MODULARITY-AUDITABILITY-2).
+use crate::ws_validation::{sanitize_filename, parse_transfer_id_bytes, MAX_TRANSFER_SIZE};
+pub use crate::ws_validation::validate_send_file_path;
 
 /// Compute X25519 Diffie-Hellman shared secret from session ephemeral keys.
 /// Matches the browser's `scalarMult(localSecretKey, remotePublicKey)`.
@@ -373,19 +300,6 @@ fn decrypt_chunk_btr(
         .map_err(|e| format!("BTR open_chunk({}, {}): {e}", transfer_id, btr_env.chain_index))?;
 
     Ok(plaintext)
-}
-
-/// Parse a hex-encoded transfer_id string into 16 bytes.
-fn parse_transfer_id_bytes(tid: &str) -> Result<[u8; 16], String> {
-    if tid.len() != 32 {
-        return Err(format!("transfer_id hex length {} != 32", tid.len()));
-    }
-    let mut bytes = [0u8; 16];
-    for i in 0..16 {
-        bytes[i] = u8::from_str_radix(&tid[i * 2..i * 2 + 2], 16)
-            .map_err(|e| format!("transfer_id hex parse: {e}"))?;
-    }
-    Ok(bytes)
 }
 
 /// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
@@ -829,10 +743,6 @@ async fn run_read_loop(
     _remote_identity_pk: &[u8; 32],
     reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Maximum transfer size: 2.5 GB. Reject transfers exceeding this to prevent
-    // memory exhaustion (F-MED-05, TI-03). Chunks are accumulated in memory.
-    const MAX_TRANSFER_SIZE: u64 = 2_500_000_000;
-
     // File receive state: accumulate chunks per transfer_id
     use std::collections::HashMap;
     struct ReceiveTransfer {
@@ -2153,133 +2063,5 @@ mod tests {
         assert_eq!(engine.ratchet_generation(), 0);
     }
 
-    // ── DAEMON-HARDENING-1 P2: Signal file path validation tests ──
-
-    #[test]
-    fn validate_send_path_absolute_file_accepted() {
-        // Use a file we know exists
-        let result = validate_send_file_path("/etc/hosts");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_send_path_empty_rejected() {
-        assert!(validate_send_file_path("").is_err());
-    }
-
-    #[test]
-    fn validate_send_path_relative_rejected() {
-        assert!(validate_send_file_path("relative/path.txt").is_err());
-        assert!(validate_send_file_path("file.txt").is_err());
-    }
-
-    #[test]
-    fn validate_send_path_nonexistent_rejected() {
-        assert!(validate_send_file_path("/nonexistent/path/file.txt").is_err());
-    }
-
-    #[test]
-    fn validate_send_path_directory_rejected() {
-        assert!(validate_send_file_path("/tmp").is_err());
-        assert!(validate_send_file_path("/").is_err());
-    }
-
-    // ── DAEMON-HARDENING-1 P1: Transfer size limit tests ────
-
-    #[test]
-    fn transfer_size_limit_constant() {
-        // 2.5 GB
-        assert_eq!(2_500_000_000u64, 2_500_000_000);
-    }
-
-    #[test]
-    fn transfer_size_within_limit_accepted() {
-        // Any file_size <= 2.5GB should be accepted.
-        // This is a design-level test — actual enforcement is in run_read_loop.
-        let max: u64 = 2_500_000_000;
-        assert!(1_048_576 <= max, "1MB within limit");
-        assert!(52_428_800 <= max, "50MB within limit");
-        assert!(1_000_000_000 <= max, "1GB within limit");
-        assert!(2_500_000_000 <= max, "2.5GB at limit");
-    }
-
-    #[test]
-    fn transfer_size_over_limit_rejected() {
-        let max: u64 = 2_500_000_000;
-        assert!(2_500_000_001 > max, "2.5GB+1 over limit");
-        assert!(5_000_000_000u64 > max, "5GB over limit");
-    }
-
-    // ── DAEMON-HARDENING-1 P0: Filename sanitization tests ──
-
-    #[test]
-    fn sanitize_filename_normal() {
-        assert_eq!(sanitize_filename("report.pdf").unwrap(), "report.pdf");
-        assert_eq!(sanitize_filename("my file (1).txt").unwrap(), "my file (1).txt");
-        assert_eq!(sanitize_filename("data.tar.gz").unwrap(), "data.tar.gz");
-    }
-
-    #[test]
-    fn sanitize_filename_path_traversal_rejected() {
-        // ../foo → basename "foo" (path stripped, not rejected)
-        assert_eq!(sanitize_filename("../foo").unwrap(), "foo");
-        // ../../etc/passwd → basename "passwd"
-        assert_eq!(sanitize_filename("../../etc/passwd").unwrap(), "passwd");
-        // Pure ".." → rejected
-        assert!(sanitize_filename("..").is_err());
-        // Pure "." → rejected
-        assert!(sanitize_filename(".").is_err());
-    }
-
-    #[test]
-    fn sanitize_filename_nested_paths_stripped_to_basename() {
-        assert_eq!(sanitize_filename("Documents/report.pdf").unwrap(), "report.pdf");
-        assert_eq!(sanitize_filename("a/b/c/d.txt").unwrap(), "d.txt");
-        assert_eq!(sanitize_filename("C:\\Users\\file.exe").unwrap(), "file.exe");
-        assert_eq!(sanitize_filename("/etc/shadow").unwrap(), "shadow");
-    }
-
-    #[test]
-    fn sanitize_filename_null_byte_rejected() {
-        assert!(sanitize_filename("file\0.txt").is_err());
-        assert!(sanitize_filename("\0").is_err());
-    }
-
-    #[test]
-    fn sanitize_filename_hidden_files_rejected() {
-        assert!(sanitize_filename(".bashrc").is_err());
-        assert!(sanitize_filename(".ssh").is_err());
-        assert!(sanitize_filename("path/to/.env").is_err());
-    }
-
-    #[test]
-    fn sanitize_filename_empty_rejected() {
-        assert!(sanitize_filename("").is_err());
-        assert!(sanitize_filename("/").is_err());
-        assert!(sanitize_filename("\\").is_err());
-    }
-
-    #[test]
-    fn sanitize_filename_output_confined_to_downloads() {
-        // Verify that even with creative filenames, the resolved path
-        // stays inside the Downloads directory.
-        let save_dir = "/tmp/test-downloads";
-        let filenames = vec![
-            "../escape.txt",
-            "../../etc/passwd",
-            "normal.pdf",
-            "sub/dir/file.txt",
-        ];
-        for raw in filenames {
-            let safe = sanitize_filename(raw).unwrap();
-            let full_path = format!("{}/{}", save_dir, safe);
-            let path = std::path::Path::new(&full_path);
-            let dir = std::path::Path::new(save_dir);
-            assert!(
-                path.starts_with(dir),
-                "Sanitized path {:?} must be inside {:?} (raw: {:?})",
-                full_path, save_dir, raw
-            );
-        }
-    }
+    // Validation/sanitization tests moved to ws_validation module.
 }

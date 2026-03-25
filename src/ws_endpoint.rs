@@ -48,17 +48,8 @@ use futures_util::{SinkExt, StreamExt};
 use crate::ws_validation::{sanitize_filename, parse_transfer_id_bytes, MAX_TRANSFER_SIZE};
 pub use crate::ws_validation::validate_send_file_path;
 
-/// Compute X25519 Diffie-Hellman shared secret from session ephemeral keys.
-/// Matches the browser's `scalarMult(localSecretKey, remotePublicKey)`.
-fn compute_x25519_shared_secret(
-    local_secret_key: &[u8; 32],
-    remote_public_key: &[u8; 32],
-) -> [u8; 32] {
-    use x25519_dalek::{PublicKey, StaticSecret};
-    let secret = StaticSecret::from(*local_secret_key);
-    let public = PublicKey::from(*remote_public_key);
-    *secret.diffie_hellman(&public).as_bytes()
-}
+// BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
+use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
 
 // ── Active session handle for outbound sends ────────────────
 
@@ -74,7 +65,7 @@ pub struct ActiveSessionHandle {
     // BTR engine: initialized after HELLO when bolt.transfer-ratchet-v1 is negotiated.
     // Currently None — daemon BTR implementation is staged (DAEMON-BTR-1).
     // Will be populated in Stage 2 (engine lifecycle).
-    pub btr_engine: std::sync::Mutex<Option<bolt_btr::BtrEngine>>,
+    pub btr_engine: Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
 }
 
 /// Global active session — set when a browser connects and HELLO completes,
@@ -214,101 +205,6 @@ use crate::envelope::{build_error_payload, decode_envelope, decode_envelope_with
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
-
-/// Decrypt a BTR-protected file chunk.
-///
-/// On the first chunk of a transfer (chain_index=0 + ratchet_public_key present),
-/// initializes a per-transfer BtrTransferContext via DH ratchet with the sender's
-/// ratchet public key and the daemon's session secret key.
-///
-/// Subsequent chunks use the existing transfer context to advance the chain
-/// and decrypt with the derived message key.
-///
-/// Fail-closed: returns Err on any crypto or state error.
-fn decrypt_chunk_btr(
-    transfer_id: &str,
-    chunk_b64: &str,
-    chunk_index: u32,
-    btr_env: &crate::envelope::BtrEnvelopeFields,
-    session: &SessionContext,
-    peer_addr: SocketAddr,
-    receive_contexts: &mut std::collections::HashMap<String, (bolt_btr::BtrTransferContext, u32)>,
-) -> Result<Vec<u8>, String> {
-    // Decode base64 chunk → sealed bytes
-    let sealed = bolt_core::encoding::from_base64(chunk_b64)
-        .map_err(|e| format!("BTR chunk base64 decode: {e}"))?;
-
-    // First chunk: initialize transfer receive context
-    if btr_env.chain_index == 0 && btr_env.ratchet_public_key.is_some() {
-        let ratchet_pub_b64 = btr_env.ratchet_public_key.as_ref().unwrap();
-        let ratchet_pub_bytes = bolt_core::encoding::from_base64(ratchet_pub_b64)
-            .map_err(|e| format!("BTR ratchet_public_key decode: {e}"))?;
-        if ratchet_pub_bytes.len() != 32 {
-            return Err(format!("BTR ratchet_public_key length {} != 32", ratchet_pub_bytes.len()));
-        }
-        let mut ratchet_pub = [0u8; 32];
-        ratchet_pub.copy_from_slice(&ratchet_pub_bytes);
-
-        // Parse transfer_id as 16-byte hex
-        let tid_bytes = parse_transfer_id_bytes(transfer_id)?;
-
-        // Initialize receive context via BTR engine (DH ratchet step)
-        let guard = ACTIVE_SESSION.lock().map_err(|e| format!("session lock: {e}"))?;
-        let handle = guard.as_ref().ok_or("no active session")?;
-        let mut btr_guard = handle.btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
-        let engine = btr_guard.as_mut().ok_or("BTR engine not initialized")?;
-
-        let ctx = engine
-            .begin_transfer_receive_with_key(
-                &tid_bytes,
-                &ratchet_pub,
-                &session.local_keypair.secret_key,
-            )
-            .map_err(|e| format!("BTR begin_transfer_receive: {e}"))?;
-
-        eprintln!(
-            "[BTR_TRANSFER_RECV] {peer_addr} transfer {transfer_id} initialized (generation={})",
-            engine.ratchet_generation()
-        );
-
-        let gen = engine.ratchet_generation();
-        receive_contexts.insert(transfer_id.to_string(), (ctx, gen));
-    }
-
-    // Replay guard: check (transfer_id, generation, chain_index) triple.
-    // Use stored generation from first chunk (subsequent chunks omit ratchet_generation).
-    {
-        let tid_bytes = parse_transfer_id_bytes(transfer_id)?;
-        let generation = receive_contexts.get(transfer_id)
-            .map(|(_, gen)| *gen)
-            .or(btr_env.ratchet_generation)
-            .ok_or_else(|| "BTR: cannot determine generation for replay check".to_string())?;
-        let guard = ACTIVE_SESSION.lock().map_err(|e| format!("session lock: {e}"))?;
-        let handle = guard.as_ref().ok_or("no active session")?;
-        let mut btr_guard = handle.btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
-        if let Some(ref mut engine) = *btr_guard {
-            engine.check_replay(&tid_bytes, generation, btr_env.chain_index)
-                .map_err(|e| format!("BTR replay check failed: {e}"))?;
-        }
-    }
-
-    // Get transfer context and decrypt
-    let (ctx, _gen) = receive_contexts.get_mut(transfer_id)
-        .ok_or_else(|| format!("BTR: no receive context for transfer {transfer_id} at chunk {chunk_index}"))?;
-
-    let plaintext = ctx.open_chunk(btr_env.chain_index, &sealed)
-        .map_err(|e| format!("BTR open_chunk({}, {}): {e}", transfer_id, btr_env.chain_index))?;
-
-    Ok(plaintext)
-}
-
-/// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
-fn copy_keypair(kp: &KeyPair) -> KeyPair {
-    KeyPair {
-        public_key: kp.public_key,
-        secret_key: kp.secret_key,
-    }
-}
 
 // ── Configuration ────────────────────────────────────────────
 
@@ -666,13 +562,17 @@ async fn run_session_with_outbound(
         None
     };
 
+    // Wrap BTR engine in Arc<Mutex> so both ACTIVE_SESSION (for IPC sends)
+    // and run_read_loop (for receives) hold a reference without going through the global.
+    let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
+
     // Register active session globally so IPC file.send can use it
     {
         let mut guard = ACTIVE_SESSION.lock().unwrap();
         *guard = Some(ActiveSessionHandle {
             outbound_tx: outbound_tx.clone(),
             session: Arc::clone(&session),
-            btr_engine: std::sync::Mutex::new(btr_engine),
+            btr_engine: Arc::clone(&btr_engine_arc),
         });
     }
     eprintln!("[WS_SESSION] {peer_addr} active session handle registered");
@@ -710,19 +610,18 @@ async fn run_session_with_outbound(
     });
 
     // Read loop
-    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx).await;
+    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx, &btr_engine_arc).await;
 
-    // Cleanup: clear active session and zeroize BTR state
+    // Cleanup: zeroize BTR state via local Arc (not through global)
+    if let Ok(mut btr) = btr_engine_arc.lock() {
+        if let Some(ref mut engine) = *btr {
+            engine.cleanup_disconnect();
+            eprintln!("[BTR] {peer_addr} engine zeroized on disconnect");
+        }
+    }
+    // Clear global session handle
     {
         let mut guard = ACTIVE_SESSION.lock().unwrap();
-        if let Some(ref handle) = *guard {
-            if let Ok(mut btr) = handle.btr_engine.lock() {
-                if let Some(ref mut engine) = *btr {
-                    engine.cleanup_disconnect();
-                    eprintln!("[BTR] {peer_addr} engine zeroized on disconnect");
-                }
-            }
-        }
         *guard = None;
     }
     eprintln!("[WS_SESSION] {peer_addr} active session handle cleared");
@@ -742,6 +641,7 @@ async fn run_read_loop(
     peer_addr: SocketAddr,
     _remote_identity_pk: &[u8; 32],
     reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // File receive state: accumulate chunks per transfer_id
     use std::collections::HashMap;
@@ -817,6 +717,7 @@ async fn run_read_loop(
                                             btr_env,
                                             session,
                                             peer_addr,
+                                            btr_engine,
                                             &mut btr_receive_contexts,
                                         )
                                     } else {
@@ -922,15 +823,10 @@ async fn run_read_loop(
                                         active_receives.remove(transfer_id);
                                         // Clean up BTR transfer context
                                         if btr_receive_contexts.remove(transfer_id).is_some() {
-                                            // Also notify engine to end transfer tracking
-                                            if let Ok(guard) = ACTIVE_SESSION.lock() {
-                                                if let Some(ref handle) = *guard {
-                                                    if let Ok(mut btr) = handle.btr_engine.lock() {
-                                                        if let Some(ref mut engine) = *btr {
-                                                            engine.end_transfer();
-                                                            eprintln!("[BTR_TRANSFER_COMPLETE] Receive transfer context cleaned up");
-                                                        }
-                                                    }
+                                            if let Ok(mut btr) = btr_engine.lock() {
+                                                if let Some(ref mut engine) = *btr {
+                                                    engine.end_transfer();
+                                                    eprintln!("[BTR_TRANSFER_COMPLETE] Receive transfer context cleaned up");
                                                 }
                                             }
                                         }
@@ -1618,23 +1514,8 @@ mod tests {
             ],
         ).unwrap();
 
-        // Set up ACTIVE_SESSION with BTR engine
-        {
-            let mut guard = ACTIVE_SESSION.lock().unwrap();
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            *guard = Some(ActiveSessionHandle {
-                outbound_tx: tx,
-                session: Arc::new(SessionContext::new(
-                    copy_keypair(&daemon_kp),
-                    browser_kp.public_key,
-                    vec![
-                        "bolt.profile-envelope-v1".to_string(),
-                        "bolt.transfer-ratchet-v1".to_string(),
-                    ],
-                ).unwrap()),
-                btr_engine: std::sync::Mutex::new(Some(bolt_btr::BtrEngine::new(&shared))),
-            });
-        }
+        // Create BTR engine directly — no ACTIVE_SESSION needed
+        let btr_engine = std::sync::Mutex::new(Some(bolt_btr::BtrEngine::new(&shared)));
 
         let btr_fields = crate::envelope::BtrEnvelopeFields {
             chain_index: 0,
@@ -1650,14 +1531,12 @@ mod tests {
             &btr_fields,
             &daemon_session,
             "127.0.0.1:9999".parse().unwrap(),
+            &btr_engine,
             &mut receive_contexts,
         );
 
         assert!(result.is_ok(), "decrypt_chunk_btr must succeed: {:?}", result.err());
         assert_eq!(result.unwrap(), b"hello from browser");
-
-        // Cleanup global state
-        *ACTIVE_SESSION.lock().unwrap() = None;
     }
 
     #[test]
@@ -1676,6 +1555,7 @@ mod tests {
             ratchet_generation: None,
         };
 
+        let btr_engine = std::sync::Mutex::new(None::<bolt_btr::BtrEngine>);
         let mut receive_contexts = std::collections::HashMap::new();
         let result = decrypt_chunk_btr(
             "abababababababababababababababab",
@@ -1684,6 +1564,7 @@ mod tests {
             &btr_fields,
             &session,
             "127.0.0.1:9999".parse().unwrap(),
+            &btr_engine,
             &mut receive_contexts,
         );
 

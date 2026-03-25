@@ -22,6 +22,12 @@ pub mod web_hello;
 #[doc(hidden)]
 pub mod ws_validation;
 
+/// BTR crypto authority for WS file transfers (MODULARITY-AUDITABILITY-2).
+/// DH, decrypt, replay guard. No global state — engine passed by caller.
+#[cfg(feature = "transport-ws")]
+#[doc(hidden)]
+pub mod ws_btr;
+
 /// WebSocket server endpoint (RC5 PM-RC-02).
 /// Feature-gated behind `transport-ws`.
 #[cfg(feature = "transport-ws")]

@@ -173,11 +173,15 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         handle.outbound_tx.send(text)
             .map_err(|_| "session closed".to_string())?;
 
-        // Emit progress for UI consumption
-        eprintln!(
-            "[WS_TRANSFER] progress: {}/{} chunks ({})",
-            i + 1, total_chunks, filename
-        );
+        // Emit progress for UI consumption — throttled to avoid blocking async
+        // runtime with per-chunk stderr I/O. Emit at ~5% intervals, first, and last.
+        let done = (i + 1) as u32;
+        if done == 1 || done == total_chunks || done % (total_chunks / 20).max(1) == 0 {
+            eprintln!(
+                "[WS_TRANSFER] progress: {}/{} chunks ({})",
+                done, total_chunks, filename
+            );
+        }
     }
 
     // Cleanup BTR send transfer context
@@ -773,11 +777,15 @@ async fn run_read_loop(
                                         });
                                     rx.chunks.insert(chunk_index, data);
 
-                                    // Emit progress for UI consumption
-                                    eprintln!(
-                                        "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
-                                        rx.chunks.len(), rx.total_chunks, rx.filename
-                                    );
+                                    // Emit progress for UI — throttled to ~5% intervals
+                                    let done = rx.chunks.len() as u32;
+                                    let total = rx.total_chunks;
+                                    if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                                        eprintln!(
+                                            "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
+                                            done, total, rx.filename
+                                        );
+                                    }
 
                                     // Check if all chunks received
                                     if rx.chunks.len() as u32 >= rx.total_chunks {

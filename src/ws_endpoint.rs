@@ -74,28 +74,38 @@ static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync
 
 /// Send a file to the connected browser peer via the active session.
 /// Called from the IPC thread (synchronous). Returns error if no active session.
+///
+/// Streams the file in 16KB chunks from disk — memory usage is bounded at
+/// ~16KB + envelope overhead regardless of file size (PERF-1).
 pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
+    use std::io::Read;
+
     let guard = ACTIVE_SESSION.lock().map_err(|e| format!("lock: {e}"))?;
     let handle = guard.as_ref().ok_or("no active session")?;
 
-    // Read file
-    let data = std::fs::read(file_path)
-        .map_err(|e| format!("read file: {e}"))?;
+    // Get file size from metadata (no full read)
+    let metadata = std::fs::metadata(file_path)
+        .map_err(|e| format!("metadata: {e}"))?;
+    let file_size = metadata.len();
     let filename = std::path::Path::new(file_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let file_size = data.len() as u64;
 
     // Chunk (16KB per chunk, matching browser)
-    let chunk_size = 16 * 1024;
-    let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+    let chunk_size = 16 * 1024usize;
+    let total_chunks = ((file_size as usize + chunk_size - 1) / chunk_size) as u32;
     let transfer_id = format!("{:032x}", rand::random::<u128>());
 
     eprintln!(
         "[WS_TRANSFER] sending: {} ({} bytes, {} chunks, tid={})",
         filename, file_size, total_chunks, transfer_id
     );
+
+    // Open file for streaming reads
+    let mut file = std::fs::File::open(file_path)
+        .map_err(|e| format!("open file: {e}"))?;
+    let mut chunk_buf = vec![0u8; chunk_size];
 
     // Begin BTR send transfer if engine is available
     let transfer_id_bytes = parse_transfer_id_bytes(&transfer_id)
@@ -118,7 +128,14 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     };
     drop(btr_guard);
 
-    for (i, chunk_data) in data.chunks(chunk_size).enumerate() {
+    for i in 0..total_chunks {
+        // Read next chunk from file — bounded memory
+        let bytes_read = file.read(&mut chunk_buf)
+            .map_err(|e| format!("read chunk {i}: {e}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let chunk_data = &chunk_buf[..bytes_read];
         let (encrypted, btr_env_fields) = if let Some((ref mut ctx, ref ratchet_pub, gen)) = btr_send {
             // BTR: seal with ratcheted symmetric key
             let (chain_idx, sealed) = ctx.seal_chunk(chunk_data)

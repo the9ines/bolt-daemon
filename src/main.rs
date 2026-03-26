@@ -378,14 +378,28 @@ fn main() {
                     public_key: identity.public_key,
                     secret_key: identity.secret_key,
                 };
+                // Generate ephemeral TLS cert for WebTransport (SECURE-DIRECT-1 SD1).
+                // Cert is short-lived (13 days) for browser serverCertificateHashes.
+                let wt_cert = match bolt_daemon::wt_cert::generate_ephemeral_cert() {
+                    Ok(c) => {
+                        eprintln!("[WT_CERT] hash={}", c.cert_hash_hex);
+                        Some(c)
+                    }
+                    Err(e) => {
+                        eprintln!("[WT_CERT] generation failed (WT disabled): {e}");
+                        None
+                    }
+                };
+
+                let wt_enabled = wt_cert.is_some();
                 let ws_config = ws_endpoint::WsEndpointConfig {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
-                    wt_enabled: false,
+                    wt_enabled,
                 };
                 eprintln!("[WS_ENDPOINT] starting on {ws_addr}");
 
-                // Run WS endpoint on the main thread — blocks until shutdown.
+                // Run WS + WT endpoints on the main thread — blocks until shutdown.
                 let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 let signal_path = send_signal_path.clone();
@@ -417,6 +431,31 @@ fn main() {
                             }
                         }
                     });
+
+                    // Spawn WT endpoint alongside WS if cert was generated
+                    #[cfg(feature = "transport-webtransport")]
+                    if let Some(ref cert) = wt_cert {
+                        let wt_port = ws_addr.port() + 1; // WT on adjacent port
+                        let wt_addr: std::net::SocketAddr = format!("0.0.0.0:{wt_port}")
+                            .parse().expect("valid WT addr");
+                        let wt_identity_kp = bolt_core::crypto::KeyPair {
+                            public_key: identity.public_key,
+                            secret_key: identity.secret_key,
+                        };
+                        let wt_config = wt_endpoint::WtEndpointConfig {
+                            listen_addr: wt_addr,
+                            identity_keypair: wt_identity_kp,
+                            cert_path: cert.cert_pem_path.to_string_lossy().to_string(),
+                            key_path: cert.key_pem_path.to_string_lossy().to_string(),
+                        };
+                        let wt_shutdown_rx = _shutdown_tx.subscribe();
+                        tokio::spawn(async move {
+                            if let Err(e) = wt_endpoint::run_wt_endpoint(wt_config, wt_shutdown_rx).await {
+                                eprintln!("[WT_ENDPOINT] error: {e}");
+                            }
+                        });
+                        eprintln!("[WT_ENDPOINT] starting on {wt_addr} (cert_hash={})", cert.cert_hash_hex);
+                    }
 
                     if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx).await {
                         eprintln!("[WS_ENDPOINT] FATAL: {e}");

@@ -24,9 +24,9 @@ path = "src/ipc_client_main.rs"
 [features]
 default = ["transport-ws"]
 test-support = []
-transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
+transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
 transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
-transport-webtransport = ["dep:wtransport", "dep:tokio", "dep:rcgen"]
+transport-webtransport = ["dep:wtransport", "dep:tokio"]
 
 [dependencies]
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
@@ -40,6 +40,11 @@ native-tls = "0.2"
 rand = "0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
+# Ephemeral TLS cert generation for WebTransport (SECURE-DIRECT-1)
+rcgen = "0.13"
+time = "0.3"
+tempfile = "3"
+
 # WebSocket transport (RC5 PM-RC-02) — feature-gated
 tokio-tungstenite = { version = "0.24", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
@@ -51,7 +56,7 @@ wtransport = { version = "0.7", optional = true }
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"], optional = true }
-rcgen = { version = "0.13", optional = true }
+# rcgen moved to non-optional deps (SECURE-DIRECT-1 wt_cert)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

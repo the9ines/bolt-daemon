@@ -28,6 +28,10 @@ pub mod ws_validation;
 #[doc(hidden)]
 pub mod ws_btr;
 
+/// Ephemeral TLS cert generation for WebTransport (SECURE-DIRECT-1).
+#[doc(hidden)]
+pub mod wt_cert;
+
 /// WebSocket server endpoint (RC5 PM-RC-02).
 /// Feature-gated behind `transport-ws`.
 #[cfg(feature = "transport-ws")]

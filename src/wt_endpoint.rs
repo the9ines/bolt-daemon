@@ -22,7 +22,10 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
+use std::sync::Arc;
+
 use crate::envelope::{build_error_payload, decode_envelope, route_inner_message};
+use crate::ws_endpoint::{ActiveSessionHandle, ACTIVE_SESSION};
 use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
@@ -287,17 +290,73 @@ async fn handle_incoming_session(
     );
     eprintln!("[SAS] {sas}");
 
-    eprintln!("[WT_SESSION] {peer_addr} session established, entering message loop");
+    let session = Arc::new(session);
 
-    // ── Step 9: Envelope message loop ─────────────────────────
-    run_message_loop(
-        &mut send,
+    // Register ACTIVE_SESSION so IPC file.send can use this WT session
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let btr_engine_arc = Arc::new(std::sync::Mutex::new(None::<bolt_btr::BtrEngine>));
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = Some(ActiveSessionHandle {
+            outbound_tx: outbound_tx.clone(),
+            session: Arc::clone(&session),
+            btr_engine: Arc::clone(&btr_engine_arc),
+        });
+    }
+    eprintln!("[WT_SESSION] {peer_addr} session established, ACTIVE_SESSION registered");
+
+    // Writer task: drains outbound channel (IPC file sends) → WT send stream
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = outbound_rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if let Err(e) = write_frame(&mut send, text.as_bytes()).await {
+                                eprintln!("[WT_SESSION] outbound send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    match reply {
+                        Some(data) => {
+                            if let Err(e) = write_frame(&mut send, &data).await {
+                                eprintln!("[WT_SESSION] reply send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // Read loop
+    let result = run_message_loop(
         &mut recv,
         &session,
         peer_addr,
         &remote_identity_pk,
+        &reply_tx,
     )
-    .await
+    .await;
+
+    // Cleanup: clear ACTIVE_SESSION
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = None;
+    }
+    eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION cleared");
+
+    drop(reply_tx);
+    let _ = writer_handle.await;
+
+    result
 }
 
 /// Read a frame with a 30s timeout.
@@ -319,11 +378,11 @@ async fn read_frame_with_timeout(
 /// decrypts, routes via `route_inner_message`, and sends any reply.
 /// Runs until the peer disconnects or a protocol violation occurs.
 async fn run_message_loop(
-    send: &mut wtransport::stream::SendStream,
     recv: &mut wtransport::stream::RecvStream,
     session: &SessionContext,
     peer_addr: SocketAddr,
     _remote_identity_pk: &[u8; 32],
+    reply_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::collections::HashMap;
 
@@ -354,7 +413,7 @@ async fn run_message_loop(
             Err(e) => {
                 eprintln!("[WT_SESSION] {peer_addr} envelope error: {e}");
                 let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = write_frame(send, &error_payload).await;
+                let _ = reply_tx.send(error_payload);
                 break;
             }
         };
@@ -362,8 +421,8 @@ async fn run_message_loop(
         // Route inner message
         match route_inner_message(&inner, session) {
             Ok(Some(reply_bytes)) => {
-                if let Err(e) = write_frame(send, &reply_bytes).await {
-                    eprintln!("[WT_SESSION] {peer_addr} send error: {e}");
+                if reply_tx.send(reply_bytes).is_err() {
+                    eprintln!("[WT_SESSION] {peer_addr} reply channel closed");
                     break;
                 }
             }
@@ -483,7 +542,7 @@ async fn run_message_loop(
             Err(e) => {
                 eprintln!("[WT_SESSION] {peer_addr} route error: {e}");
                 let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = write_frame(send, &error_payload).await;
+                let _ = reply_tx.send(error_payload);
                 break;
             }
         }

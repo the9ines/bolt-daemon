@@ -70,7 +70,7 @@ pub struct ActiveSessionHandle {
 
 /// Global active session — set when a browser connects and HELLO completes,
 /// cleared when the session ends. Protected by std Mutex for cross-thread access.
-static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
+pub(crate) static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
 
 /// Send a file to the connected browser peer via the active session.
 /// Called from the IPC thread (synchronous). Returns error if no active session.

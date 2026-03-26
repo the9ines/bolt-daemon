@@ -23,6 +23,7 @@ use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
 use crate::envelope::{build_error_payload, decode_envelope, route_inner_message};
+use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
@@ -277,6 +278,15 @@ async fn handle_incoming_session(
     let session = SessionContext::new(copy_keypair(&session_kp), remote_session_pk, negotiated)
         .map_err(|e| format!("[WT_SESSION] {peer_addr} failed to create session: {e}"))?;
 
+    // Compute SAS verification code (same algorithm as WS endpoint and browser)
+    let sas = bolt_core::sas::compute_sas(
+        &identity.public_key,
+        &remote_identity_pk,
+        &session_kp.public_key,
+        &remote_session_pk,
+    );
+    eprintln!("[SAS] {sas}");
+
     eprintln!("[WT_SESSION] {peer_addr} session established, entering message loop");
 
     // ── Step 9: Envelope message loop ─────────────────────────
@@ -315,6 +325,16 @@ async fn run_message_loop(
     peer_addr: SocketAddr,
     _remote_identity_pk: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashMap;
+
+    struct ReceiveTransfer {
+        filename: String,
+        file_size: u64,
+        total_chunks: u32,
+        chunks: HashMap<u32, Vec<u8>>,
+    }
+    let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
+
     loop {
         let frame = match read_frame(recv).await {
             Ok(Some(data)) => data,
@@ -333,7 +353,6 @@ async fn run_message_loop(
             Ok(plaintext) => plaintext,
             Err(e) => {
                 eprintln!("[WT_SESSION] {peer_addr} envelope error: {e}");
-                // Send error and disconnect (fail-closed)
                 let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
                 let _ = write_frame(send, &error_payload).await;
                 break;
@@ -349,7 +368,117 @@ async fn run_message_loop(
                 }
             }
             Ok(None) => {
-                // No reply needed
+                // Check for file-transfer messages (FileChunk, etc.)
+                if let Ok(dc_msg) = crate::dc_messages::parse_dc_message(&inner) {
+                    match dc_msg {
+                        crate::dc_messages::DcMessage::FileChunk {
+                            ref transfer_id,
+                            ref filename,
+                            chunk_index,
+                            total_chunks,
+                            ref chunk,
+                            file_size,
+                            ..
+                        } => {
+                            // Decrypt chunk (static NaCl box — WT path)
+                            let data = match bolt_core::crypto::open_box_payload(
+                                chunk,
+                                &session.remote_public_key,
+                                &session.local_keypair.secret_key,
+                            ) {
+                                Ok(plaintext) => plaintext,
+                                Err(e) => {
+                                    eprintln!("[WT_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
+                                    continue;
+                                }
+                            };
+
+                            // Reject oversized transfers
+                            if !active_receives.contains_key(transfer_id) && file_size > MAX_TRANSFER_SIZE {
+                                eprintln!(
+                                    "[WT_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
+                                    filename, file_size, MAX_TRANSFER_SIZE
+                                );
+                                continue;
+                            }
+
+                            let rx = active_receives
+                                .entry(transfer_id.clone())
+                                .or_insert_with(|| {
+                                    let safe_name = match sanitize_filename(filename) {
+                                        Ok(name) => name,
+                                        Err(e) => {
+                                            eprintln!("[WT_TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {filename:?})");
+                                            format!("received_{}", transfer_id)
+                                        }
+                                    };
+                                    eprintln!(
+                                        "[WT_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
+                                        safe_name, file_size, total_chunks
+                                    );
+                                    ReceiveTransfer {
+                                        filename: safe_name,
+                                        file_size,
+                                        total_chunks,
+                                        chunks: HashMap::new(),
+                                    }
+                                });
+                            rx.chunks.insert(chunk_index, data);
+
+                            // Progress (throttled)
+                            let done = rx.chunks.len() as u32;
+                            let total = rx.total_chunks;
+                            if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                                eprintln!(
+                                    "[WT_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
+                                    done, total, rx.filename
+                                );
+                            }
+
+                            // All chunks received — assemble and save
+                            if rx.chunks.len() as u32 >= rx.total_chunks {
+                                let mut file_data = Vec::with_capacity(rx.file_size as usize);
+                                for i in 0..rx.total_chunks {
+                                    if let Some(c) = rx.chunks.get(&i) {
+                                        file_data.extend_from_slice(c);
+                                    }
+                                }
+                                let save_dir = format!(
+                                    "{}/Downloads",
+                                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+                                );
+                                let save_path = format!("{}/{}", save_dir, rx.filename);
+
+                                let canonical_dir = std::path::Path::new(&save_dir);
+                                let canonical_path = std::path::Path::new(&save_path);
+                                if !canonical_path.starts_with(canonical_dir) {
+                                    eprintln!(
+                                        "[WT_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
+                                        save_path, save_dir
+                                    );
+                                } else {
+                                    let _ = std::fs::create_dir_all(&save_dir);
+                                    match std::fs::write(&save_path, &file_data) {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[WT_TRANSFER] {peer_addr} saved: {} ({} bytes) \u{2192} {}",
+                                                rx.filename, file_data.len(), save_path
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[WT_TRANSFER] {peer_addr} save failed: {} \u{2014} {}",
+                                                rx.filename, e
+                                            );
+                                        }
+                                    }
+                                }
+                                active_receives.remove(transfer_id);
+                            }
+                        }
+                        _ => {} // Other message types (FileOffer, etc.) — ignored for now
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[WT_SESSION] {peer_addr} route error: {e}");

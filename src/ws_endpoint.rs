@@ -233,10 +233,19 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         // runtime with per-chunk stderr I/O. Emit at ~5% intervals, first, and last.
         let done = (i + 1) as u32;
         if done == 1 || done == total_chunks || done % (total_chunks / 20).max(1) == 0 {
+            let bytes_done = (done as u64).min(total_chunks as u64) * chunk_size as u64;
+            let bytes_done = bytes_done.min(file_size);
+            let progress = if file_size > 0 { bytes_done as f32 / file_size as f32 } else { 1.0 };
             eprintln!(
                 "[WS_TRANSFER] progress: {}/{} chunks ({})",
                 done, total_chunks, filename
             );
+            emit_ipc_global("transfer.progress", serde_json::json!({
+                "transfer_id": transfer_id,
+                "bytes_transferred": bytes_done,
+                "total_bytes": file_size,
+                "progress": progress,
+            }));
         }
     }
 
@@ -893,10 +902,20 @@ async fn run_read_loop(
                                     let done = rx.chunks.len() as u32;
                                     let total = rx.total_chunks;
                                     if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                                        let bytes_done = if rx.file_size > 0 {
+                                            (done as u64 * rx.file_size) / total as u64
+                                        } else { 0 };
+                                        let progress = if total > 0 { done as f32 / total as f32 } else { 1.0 };
                                         eprintln!(
                                             "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                             done, total, rx.filename
                                         );
+                                        emit_ipc(ipc_tx, "transfer.progress", serde_json::json!({
+                                            "transfer_id": transfer_id,
+                                            "bytes_transferred": bytes_done,
+                                            "total_bytes": rx.file_size,
+                                            "progress": progress,
+                                        }));
                                     }
 
                                     // Check if all chunks received

@@ -68,6 +68,16 @@ fn emit_ipc(
     }
 }
 
+/// Emit a transfer event using the global IPC_TX (for send_file_to_browser context).
+fn emit_ipc_global(msg_type: &str, payload: serde_json::Value) {
+    if let Ok(guard) = IPC_TX.lock() {
+        if let Some(ref tx) = *guard {
+            let event = crate::ipc::types::IpcMessage::new_event(msg_type, payload);
+            let _ = tx.send(event);
+        }
+    }
+}
+
 // ── Active session handle for outbound sends ────────────────
 
 /// Handle to the active WS session. Allows any thread to send
@@ -88,6 +98,10 @@ pub struct ActiveSessionHandle {
 /// Global active session — set when a browser connects and HELLO completes,
 /// cleared when the session ends. Protected by std Mutex for cross-thread access.
 pub(crate) static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
+
+/// Global IPC event sender — set when WS endpoint starts with IPC wired.
+/// Used by send_file_to_browser to emit transfer events from the signal-file thread.
+static IPC_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>> = std::sync::Mutex::new(None);
 
 /// Send a file to the connected browser peer via the active session.
 /// Called from the IPC thread (synchronous). Returns error if no active session.
@@ -118,6 +132,14 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         "[WS_TRANSFER] sending: {} ({} bytes, {} chunks, tid={})",
         filename, file_size, total_chunks, transfer_id
     );
+
+    // Emit transfer.started
+    emit_ipc_global("transfer.started", serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": filename,
+        "file_size_bytes": file_size,
+        "direction": "send",
+    }));
 
     // Open file for streaming reads
     let mut file = std::fs::File::open(file_path)
@@ -229,6 +251,15 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     }
 
     eprintln!("[WS_TRANSFER] all {} chunks queued for {}", total_chunks, filename);
+
+    // Emit transfer.complete
+    emit_ipc_global("transfer.complete", serde_json::json!({
+        "transfer_id": transfer_id,
+        "file_name": filename,
+        "bytes_transferred": file_size,
+        "verified": false,
+    }));
+
     Ok(())
 }
 use tokio::net::TcpListener;
@@ -271,6 +302,11 @@ pub async fn run_ws_endpoint(
     mut shutdown_rx: watch::Receiver<bool>,
     ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Store IPC sender globally for send_file_to_browser to use
+    if let Some(ref tx) = ipc_tx {
+        *IPC_TX.lock().unwrap() = Some(tx.clone());
+    }
+
     let listener = TcpListener::bind(config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
     eprintln!("[WS_ENDPOINT] listening on {local_addr}");
@@ -669,7 +705,7 @@ async fn run_session_with_outbound(
     });
 
     // Read loop
-    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx, &btr_engine_arc).await;
+    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx, &btr_engine_arc, ipc_tx).await;
 
     // Emit session lifecycle event based on read loop result
     match &result {
@@ -715,6 +751,7 @@ async fn run_read_loop(
     _remote_identity_pk: &[u8; 32],
     reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // File receive state: accumulate chunks per transfer_id
     use std::collections::HashMap;
@@ -837,6 +874,12 @@ async fn run_read_loop(
                                                 "[WS_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
                                                 safe_name, file_size, total_chunks
                                             );
+                                            emit_ipc(ipc_tx, "transfer.started", serde_json::json!({
+                                                "transfer_id": transfer_id,
+                                                "file_name": safe_name,
+                                                "file_size_bytes": file_size,
+                                                "direction": "receive",
+                                            }));
                                             ReceiveTransfer {
                                                 filename: safe_name,
                                                 file_size,
@@ -889,12 +932,24 @@ async fn run_read_loop(
                                                     "[WS_TRANSFER] {peer_addr} saved: {} ({} bytes) → {}",
                                                     rx.filename, file_data.len(), save_path
                                                 );
+                                                emit_ipc(ipc_tx, "transfer.complete", serde_json::json!({
+                                                    "transfer_id": transfer_id,
+                                                    "file_name": rx.filename,
+                                                    "bytes_transferred": file_data.len(),
+                                                    "verified": false,
+                                                    "save_path": save_path,
+                                                }));
                                             }
                                             Err(e) => {
                                                 eprintln!(
                                                     "[WS_TRANSFER] {peer_addr} save failed: {} — {}",
                                                     rx.filename, e
                                                 );
+                                                emit_ipc(ipc_tx, "transfer.error", serde_json::json!({
+                                                    "transfer_id": transfer_id,
+                                                    "file_name": rx.filename,
+                                                    "reason": format!("{e}"),
+                                                }));
                                             }
                                         }
                                         active_receives.remove(transfer_id);

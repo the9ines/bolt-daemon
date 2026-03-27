@@ -51,6 +51,23 @@ pub use crate::ws_validation::validate_send_file_path;
 // BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
 use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
 
+// ── IPC event emission helper ─────────────────────────────────
+
+/// Send a session lifecycle event to the IPC client (native shell).
+/// No-op if IPC is not wired (ipc_tx is None).
+fn emit_ipc(
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    msg_type: &str,
+    payload: serde_json::Value,
+) {
+    if let Some(tx) = ipc_tx {
+        let event = crate::ipc::types::IpcMessage::new_event(msg_type, payload);
+        if let Err(e) = tx.send(event) {
+            eprintln!("[IPC_EMIT] failed to send {msg_type}: {e}");
+        }
+    }
+}
+
 // ── Active session handle for outbound sends ────────────────
 
 /// Handle to the active WS session. Allows any thread to send
@@ -252,6 +269,7 @@ pub struct WsEndpointConfig {
 pub async fn run_ws_endpoint(
     config: WsEndpointConfig,
     mut shutdown_rx: watch::Receiver<bool>,
+    ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -271,12 +289,13 @@ pub async fn run_ws_endpoint(
                         eprintln!("[WS_SESSION] accepted TCP from {peer_addr}");
                         let pk = Arc::clone(&identity_pk);
                         let sk = Arc::clone(&identity_sk);
+                        let ipc = ipc_tx.clone();
                         tokio::spawn(async move {
                             let identity = KeyPair {
                                 public_key: *pk,
                                 secret_key: *sk,
                             };
-                            if let Err(e) = handle_connection(stream, peer_addr, &identity, wt_enabled).await {
+                            if let Err(e) = handle_connection(stream, peer_addr, &identity, wt_enabled, ipc.as_ref()).await {
                                 eprintln!("[WS_SESSION] {peer_addr} error: {e}");
                             }
                             eprintln!("[WS_SESSION] {peer_addr} closed");
@@ -311,6 +330,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     identity: &KeyPair,
     wt_enabled: bool,
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Step 1: WebSocket upgrade ────────────────────────────
     let ws_stream = accept_async(stream)
@@ -437,8 +457,14 @@ async fn handle_connection(
 
         eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
 
+        // Emit session.connected (legacy — no SAS)
+        emit_ipc(ipc_tx, "session.connected", serde_json::json!({
+            "remote_peer_id": "(legacy)",
+            "negotiated_capabilities": negotiated,
+        }));
+
         return run_session_with_outbound(
-            ws_sink, ws_source, session, peer_addr, remote_session_pk,
+            ws_sink, ws_source, session, peer_addr, remote_session_pk, ipc_tx,
         ).await;
     }
 
@@ -496,11 +522,22 @@ async fn handle_connection(
     );
     eprintln!("[SAS] {sas}");
 
+    // Emit session.connected + session.sas to IPC
+    let remote_pk_b64 = bolt_core::encoding::to_base64(&remote_identity_pk);
+    emit_ipc(ipc_tx, "session.connected", serde_json::json!({
+        "remote_peer_id": remote_pk_b64,
+        "negotiated_capabilities": negotiated,
+    }));
+    emit_ipc(ipc_tx, "session.sas", serde_json::json!({
+        "sas": sas,
+        "remote_identity_pk_b64": remote_pk_b64,
+    }));
+
     eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
 
     // ── Step 8: Envelope message loop ────────────────────────
     run_session_with_outbound(
-        ws_sink, ws_source, session, peer_addr, remote_identity_pk,
+        ws_sink, ws_source, session, peer_addr, remote_identity_pk, ipc_tx,
     )
     .await
 }
@@ -563,6 +600,7 @@ async fn run_session_with_outbound(
     session: SessionContext,
     peer_addr: SocketAddr,
     remote_pk: [u8; 32],
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let session = Arc::new(session);
@@ -632,6 +670,20 @@ async fn run_session_with_outbound(
 
     // Read loop
     let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx, &btr_engine_arc).await;
+
+    // Emit session lifecycle event based on read loop result
+    match &result {
+        Ok(()) => {
+            emit_ipc(ipc_tx, "session.ended", serde_json::json!({
+                "reason": "connection closed",
+            }));
+        }
+        Err(e) => {
+            emit_ipc(ipc_tx, "session.error", serde_json::json!({
+                "reason": format!("{e}"),
+            }));
+        }
+    }
 
     // Cleanup: zeroize BTR state via local Arc (not through global)
     if let Ok(mut btr) = btr_engine_arc.lock() {
@@ -929,7 +981,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         // Give server a moment to bind
@@ -965,7 +1017,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1050,7 +1102,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1152,7 +1204,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1201,7 +1253,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1283,7 +1335,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

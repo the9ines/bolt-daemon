@@ -328,6 +328,7 @@ fn main() {
                 }
             };
 
+            let ipc_event_tx = ipc_server.as_ref().map(|s| s.event_tx.clone());
             let _ipc_server = ipc_server;
 
             let data_dir_path = args.data_dir.as_ref().map(std::path::PathBuf::from);
@@ -457,7 +458,7 @@ fn main() {
                         eprintln!("[WT_ENDPOINT] starting on {wt_addr} (cert_hash={})", cert.cert_hash_hex);
                     }
 
-                    if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx).await {
+                    if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx, ipc_event_tx).await {
                         eprintln!("[WS_ENDPOINT] FATAL: {e}");
                         std::process::exit(1);
                     }

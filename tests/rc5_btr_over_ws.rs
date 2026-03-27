@@ -138,7 +138,7 @@ async fn ac_rc_23_ws_hello_negotiates_btr_capability() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_handle = tokio::spawn(async move {
-        let _ = run_ws_endpoint(config, shutdown_rx).await;
+        let _ = run_ws_endpoint(config, shutdown_rx, None).await;
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

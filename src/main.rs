@@ -196,6 +196,10 @@ fn parse_args_from(argv: &[String]) -> Args {
         wt_key,
         #[cfg(feature = "transport-webtransport")]
         no_wt,
+        #[cfg(feature = "transport-quic")]
+        quic_listen: None,
+        #[cfg(feature = "transport-quic")]
+        quic_connect: None,
     }
 }
 

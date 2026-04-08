@@ -94,6 +94,10 @@ pub fn parse_ipc_line(line: &str) -> Result<Option<IpcMessage>, serde_json::Erro
         | "transfer.started"
         | "transfer.progress"
         | "transfer.complete"
+        | "transfer.paused"
+        | "transfer.resumed"
+        | "transfer.pause"
+        | "transfer.resume"
         | "file.send" => Ok(Some(msg)),
         unknown => {
             eprintln!("[IPC_UNKNOWN_TYPE] ignoring message with type: {unknown}");

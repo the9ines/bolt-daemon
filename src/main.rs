@@ -397,6 +397,22 @@ fn main() {
                 };
 
                 let wt_enabled = wt_cert.is_some();
+
+                // Write WT metadata for native shell to read (W1 plumbing).
+                if let (Some(ref cert), Some(ref dd)) = (&wt_cert, &data_dir_path) {
+                    let wt_port = ws_addr.port() + 1;
+                    let wt_info = serde_json::json!({
+                        "wt_port": wt_port,
+                        "wt_cert_hash": cert.cert_hash_hex,
+                    });
+                    let wt_info_path = dd.join("wt_info.json");
+                    if let Err(e) = std::fs::write(&wt_info_path, wt_info.to_string()) {
+                        eprintln!("[WT_INFO] failed to write {}: {e}", wt_info_path.display());
+                    } else {
+                        eprintln!("[WT_INFO] wrote {}", wt_info_path.display());
+                    }
+                }
+
                 let ws_config = ws_endpoint::WsEndpointConfig {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
@@ -433,6 +449,81 @@ fn main() {
                                         Err(e) => eprintln!("[WS_TRANSFER] send error: {e}"),
                                     }
                                 }
+                            }
+                        }
+                    });
+
+                    // Spawn connect_remote.signal watcher (NATIVE-CONNECT-1)
+                    let connect_signal_path = data_dir_path
+                        .as_ref()
+                        .map(|dd| dd.join("connect_remote.signal"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-connect-remote.signal"));
+                    let connect_pk = identity.public_key;
+                    let connect_sk = identity.secret_key;
+                    let connect_ipc_tx = ipc_event_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if connect_signal_path.exists() {
+                                if let Ok(url_str) = std::fs::read_to_string(&connect_signal_path) {
+                                    let url_str = url_str.trim().to_string();
+                                    let _ = std::fs::remove_file(&connect_signal_path);
+                                    if url_str.is_empty() {
+                                        continue;
+                                    }
+                                    eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
+                                    let id = bolt_core::crypto::KeyPair {
+                                        public_key: connect_pk,
+                                        secret_key: connect_sk,
+                                    };
+                                    let ipc = connect_ipc_tx.clone();
+                                    tokio::spawn(async move {
+                                        match ws_endpoint::connect_to_remote_ws(
+                                            &url_str, &id, wt_enabled, ipc,
+                                        ).await {
+                                            Ok(()) => eprintln!("[WS_CLIENT] session ended normally"),
+                                            Err(e) => eprintln!("[WS_CLIENT] session error: {e}"),
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
+
+                    // Spawn disconnect_session.signal watcher (NATIVE-SESSION-UX-2)
+                    let disconnect_signal_path = data_dir_path
+                        .as_ref()
+                        .map(|dd| dd.join("disconnect_session.signal"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-disconnect-session.signal"));
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            if disconnect_signal_path.exists() {
+                                let _ = std::fs::remove_file(&disconnect_signal_path);
+                                ws_endpoint::request_disconnect();
+                            }
+                        }
+                    });
+
+                    // Spawn transfer pause/resume signal watchers (DAEMON-TRANSFER-CONTROL-1)
+                    let pause_signal_path = data_dir_path
+                        .as_ref()
+                        .map(|dd| dd.join("transfer_pause.signal"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-transfer-pause.signal"));
+                    let resume_signal_path = data_dir_path
+                        .as_ref()
+                        .map(|dd| dd.join("transfer_resume.signal"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-transfer-resume.signal"));
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            if pause_signal_path.exists() {
+                                let _ = std::fs::remove_file(&pause_signal_path);
+                                ws_endpoint::request_pause();
+                            }
+                            if resume_signal_path.exists() {
+                                let _ = std::fs::remove_file(&resume_signal_path);
+                                ws_endpoint::request_resume();
                             }
                         }
                     });

@@ -319,6 +319,43 @@ Transfer finished.
 | `bytes_transferred` | integer | Total bytes transferred |
 | `verified` | boolean | Whether integrity verification passed |
 
+### `transfer.paused`
+
+Outbound transfer has been paused. Emitted when the daemon acknowledges a pause request.
+
+```json
+{}
+```
+
+No payload fields. Presence of this event confirms the transfer is paused.
+
+### `transfer.resumed`
+
+Outbound transfer has been resumed. Emitted when the daemon acknowledges a resume request.
+
+```json
+{}
+```
+
+No payload fields. Presence of this event confirms the transfer is active again.
+
+---
+
+## Signal-File Commands (consumer → daemon)
+
+In addition to IPC decisions, the daemon watches for signal files in its data directory.
+These provide a simple fire-and-forget command interface.
+
+| Signal File | Effect |
+|-------------|--------|
+| `send_file.signal` | Contains absolute file path. Triggers outbound transfer. |
+| `connect_remote.signal` | Contains remote WS URL. Triggers outbound connection. |
+| `disconnect_session.signal` | Any content. Closes the active WS session. |
+| `transfer_pause.signal` | Any content. Pauses the active outbound transfer. |
+| `transfer_resume.signal` | Any content. Resumes a paused outbound transfer. |
+
+The daemon polls for these files every 250ms and deletes them after processing.
+
 ---
 
 ## Decision/Command Types (consumer → daemon)

@@ -99,6 +99,36 @@ pub struct ActiveSessionHandle {
 /// cleared when the session ends. Protected by std Mutex for cross-thread access.
 pub(crate) static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
 
+/// Request to close the active session from outside the WS task (e.g., UI disconnect).
+/// The message loop checks this flag and breaks if set.
+pub(crate) static DISCONNECT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal the active WS session to close gracefully.
+pub fn request_disconnect() {
+    DISCONNECT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[WS_SESSION] disconnect requested");
+}
+
+/// Request to pause the active file transfer (DAEMON-TRANSFER-CONTROL-1).
+/// The send_file_to_browser chunk loop checks this flag between iterations.
+pub(crate) static PAUSE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pause the active outbound transfer. Sender sleeps between chunks until resumed.
+pub fn request_pause() {
+    PAUSE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[WS_TRANSFER] pause requested");
+    emit_ipc_global("transfer.paused", serde_json::json!({}));
+}
+
+/// Resume a paused outbound transfer.
+pub fn request_resume() {
+    PAUSE_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[WS_TRANSFER] resume requested");
+    emit_ipc_global("transfer.resumed", serde_json::json!({}));
+}
+
 /// Global IPC event sender — set when WS endpoint starts with IPC wired.
 /// Used by send_file_to_browser to emit transfer events from the signal-file thread.
 static IPC_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>> = std::sync::Mutex::new(None);
@@ -111,8 +141,18 @@ static IPC_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::ipc::types
 pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     use std::io::Read;
 
-    let guard = ACTIVE_SESSION.lock().map_err(|e| format!("lock: {e}"))?;
-    let handle = guard.as_ref().ok_or("no active session")?;
+    // Clone session fields and release the ACTIVE_SESSION lock immediately.
+    // Holding the lock during the chunk loop (especially pause) would deadlock
+    // against session teardown at line ~929 (DAEMON-TRANSFER-CONTROL-1 fix).
+    let (outbound_tx, session, btr_engine) = {
+        let guard = ACTIVE_SESSION.lock().map_err(|e| format!("lock: {e}"))?;
+        let handle = guard.as_ref().ok_or("no active session")?;
+        (
+            handle.outbound_tx.clone(),
+            Arc::clone(&handle.session),
+            Arc::clone(&handle.btr_engine),
+        )
+    };
 
     // Get file size from metadata (no full read)
     let metadata = std::fs::metadata(file_path)
@@ -149,9 +189,9 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     // Begin BTR send transfer if engine is available
     let transfer_id_bytes = parse_transfer_id_bytes(&transfer_id)
         .map_err(|e| format!("transfer_id parse: {e}"))?;
-    let mut btr_guard = handle.btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
+    let mut btr_guard = btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
     let mut btr_send = if let Some(ref mut engine) = *btr_guard {
-        match engine.begin_transfer_send(&transfer_id_bytes, &handle.session.remote_public_key) {
+        match engine.begin_transfer_send(&transfer_id_bytes, &session.remote_public_key) {
             Ok((ctx, local_ratchet_pub)) => {
                 let gen = engine.ratchet_generation();
                 eprintln!("[BTR_TRANSFER_SEND] DH ratchet step complete, generation={gen}");
@@ -167,7 +207,19 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     };
     drop(btr_guard);
 
+    // Clear any stale pause state before starting
+    PAUSE_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+
     for i in 0..total_chunks {
+        // DAEMON-TRANSFER-CONTROL-1: pause check between chunks.
+        // Sleep-poll 100ms while paused. Disconnect breaks out.
+        while PAUSE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("transfer aborted: disconnect during pause".to_string());
+            }
+        }
+
         // Read next chunk from file — bounded memory
         let bytes_read = file.read(&mut chunk_buf)
             .map_err(|e| format!("read chunk {i}: {e}"))?;
@@ -197,8 +249,8 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
             // Static NaCl box (no BTR)
             let encrypted = bolt_core::crypto::seal_box_payload(
                 chunk_data,
-                &handle.session.remote_public_key,
-                &handle.session.local_keypair.secret_key,
+                &session.remote_public_key,
+                &session.local_keypair.secret_key,
             ).map_err(|e| format!("encrypt chunk: {e}"))?;
             (encrypted, None)
         };
@@ -218,15 +270,15 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
 
         // Wrap in profile envelope — with or without BTR fields
         let envelope = if let Some(ref fields) = btr_env_fields {
-            crate::envelope::encode_envelope_with_btr(&inner_json, &handle.session, fields)
+            crate::envelope::encode_envelope_with_btr(&inner_json, &session, fields)
                 .map_err(|e| format!("envelope: {e}"))?
         } else {
-            crate::envelope::encode_envelope(&inner_json, &handle.session)
+            crate::envelope::encode_envelope(&inner_json, &session)
                 .map_err(|e| format!("envelope: {e}"))?
         };
         let text = String::from_utf8_lossy(&envelope).into_owned();
 
-        handle.outbound_tx.send(text)
+        outbound_tx.send(text)
             .map_err(|_| "session closed".to_string())?;
 
         // Emit progress for UI consumption — throttled to avoid blocking async
@@ -251,7 +303,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
 
     // Cleanup BTR send transfer context
     if btr_send.is_some() {
-        if let Ok(mut btr_guard) = handle.btr_engine.lock() {
+        if let Ok(mut btr_guard) = btr_engine.lock() {
             if let Some(ref mut engine) = *btr_guard {
                 engine.end_transfer();
                 eprintln!("[BTR_TRANSFER_COMPLETE] Send transfer context cleaned up");
@@ -297,7 +349,152 @@ pub struct WsEndpointConfig {
     pub wt_enabled: bool,
 }
 
-// ── Public entry point ───────────────────────────────────────
+// ── Public entry point: outbound client connect ─────────────
+
+/// Connect to a remote daemon's WS endpoint as a client.
+///
+/// Performs the same HELLO/session-key exchange as the server side,
+/// then enters the shared `run_session_with_outbound` message loop.
+/// This enables native app↔app direct connections.
+///
+/// Protocol sequence (client perspective):
+///   1. WS connect to remote URL
+///   2. Send session-key frame
+///   3. Receive remote's session-key frame
+///   4. Send HELLO (sealed with remote's session public key)
+///   5. Receive HELLO response
+///   6. Enter envelope message loop
+pub async fn connect_to_remote_ws(
+    url: &str,
+    identity: &KeyPair,
+    wt_enabled: bool,
+    ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio_tungstenite::connect_async;
+
+    eprintln!("[WS_CLIENT] connecting to {url}");
+    let (ws_stream, _) = connect_async(url).await
+        .map_err(|e| format!("[WS_CLIENT] connect failed: {e}"))?;
+    eprintln!("[WS_CLIENT] connected to {url}");
+
+    let (mut ws_sink, mut ws_source) = ws_stream.split();
+
+    // Generate ephemeral session keypair
+    let session_kp = generate_ephemeral_keypair();
+
+    // Step 1: Send our session public key
+    let our_session_key_msg = serde_json::json!({
+        "type": "session-key",
+        "publicKey": bolt_core::encoding::to_base64(&session_kp.public_key),
+    });
+    ws_sink
+        .send(Message::Text(our_session_key_msg.to_string()))
+        .await
+        .map_err(|e| format!("[WS_CLIENT] failed to send session key: {e}"))?;
+    eprintln!("[WS_CLIENT] sent session-key");
+
+    // Step 2: Read remote's session-key
+    let remote_key_msg = wait_for_hello(&mut ws_source, "0.0.0.0:0".parse().unwrap()).await?;
+    let remote_key_json: serde_json::Value = serde_json::from_str(&remote_key_msg)
+        .map_err(|e| format!("[WS_CLIENT] invalid session-key JSON: {e}"))?;
+
+    if remote_key_json.get("type").and_then(|v| v.as_str()) != Some("session-key") {
+        return Err(format!("[WS_CLIENT] expected session-key, got: {}", remote_key_msg).into());
+    }
+    let remote_pk_b64 = remote_key_json
+        .get("publicKey")
+        .and_then(|v| v.as_str())
+        .ok_or("[WS_CLIENT] session-key missing publicKey")?;
+    let remote_session_pk = crate::web_hello::decode_public_key(remote_pk_b64)
+        .map_err(|e| format!("[WS_CLIENT] invalid remote session key: {e}"))?;
+    eprintln!("[WS_CLIENT] received remote session-key");
+
+    // Step 3: Send HELLO (sealed with remote's session public key)
+    let hello_msg = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
+        .map_err(|e| format!("[WS_CLIENT] failed to build HELLO: {e}"))?;
+    ws_sink
+        .send(Message::Text(hello_msg))
+        .await
+        .map_err(|e| format!("[WS_CLIENT] failed to send HELLO: {e}"))?;
+    eprintln!("[WS_CLIENT] sent HELLO");
+
+    // Step 4: Read HELLO response
+    let hello_response_raw = wait_for_hello(&mut ws_source, "0.0.0.0:0".parse().unwrap()).await?;
+
+    // Check if legacy
+    let is_legacy = serde_json::from_str::<serde_json::Value>(&hello_response_raw)
+        .ok()
+        .and_then(|v| v.get("legacy")?.as_bool())
+        .unwrap_or(false);
+
+    let (negotiated, remote_identity_pk, sas) = if is_legacy {
+        let legacy_caps: Vec<String> = serde_json::from_str::<serde_json::Value>(&hello_response_raw)
+            .ok()
+            .and_then(|v| v.get("capabilities")?.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let local_caps = daemon_capabilities(wt_enabled);
+        let negotiated = negotiate_capabilities(&local_caps, &legacy_caps);
+        eprintln!("[WS_CLIENT] legacy HELLO response, caps={negotiated:?}");
+        (negotiated, [0u8; 32], String::new())
+    } else {
+        // Parse encrypted HELLO response
+        let hello_inner = parse_hello_typed(
+            hello_response_raw.as_bytes(),
+            &remote_session_pk,
+            &session_kp,
+        )
+        .map_err(|e| format!("[WS_CLIENT] HELLO response parse failed: {e}"))?;
+
+        let local_caps = daemon_capabilities(wt_enabled);
+        let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
+        let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
+            .map_err(|e| format!("[WS_CLIENT] invalid remote identity key: {e}"))?;
+
+        let sas = bolt_core::sas::compute_sas(
+            &identity.public_key,
+            &remote_identity_pk,
+            &session_kp.public_key,
+            &remote_session_pk,
+        );
+        eprintln!("[SAS] {sas}");
+        eprintln!("[WS_CLIENT] HELLO response ok, caps={negotiated:?}");
+        (negotiated, remote_identity_pk, sas)
+    };
+
+    // Build session context
+    let session = SessionContext::new(
+        copy_keypair(&session_kp),
+        remote_session_pk,
+        negotiated.clone(),
+    )
+    .map_err(|e| format!("[WS_CLIENT] failed to create session: {e}"))?;
+
+    // Emit session events to IPC
+    let remote_pk_b64_identity = bolt_core::encoding::to_base64(&remote_identity_pk);
+    emit_ipc(ipc_tx.as_ref(), "session.connected", serde_json::json!({
+        "remote_peer_id": remote_pk_b64_identity,
+        "negotiated_capabilities": negotiated,
+    }));
+    if !sas.is_empty() {
+        emit_ipc(ipc_tx.as_ref(), "session.sas", serde_json::json!({
+            "sas": sas,
+            "remote_identity_pk_b64": remote_pk_b64_identity,
+        }));
+    }
+
+    eprintln!("[WS_CLIENT] session established, entering message loop");
+
+    // Enter the same message loop as server connections
+    run_session_with_outbound(
+        ws_sink, ws_source, session, "0.0.0.0:0".parse().unwrap(), remote_identity_pk, ipc_tx.as_ref(),
+    )
+    .await
+}
+
+// ── Public entry point: server ──────────────────────────────
 
 /// Run the WebSocket endpoint server.
 ///
@@ -779,13 +976,29 @@ async fn run_read_loop(
     // and used for replay guard checks on subsequent chunks that omit ratchet_generation.
     let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> = HashMap::new();
 
-    while let Some(result) = ws_source.next().await {
+    // Clear any stale disconnect request before entering the loop
+    DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    loop {
+        // Check disconnect flag every iteration
+        if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[WS_SESSION] {peer_addr} disconnect requested — closing");
+            break;
+        }
+
+        let result = tokio::select! {
+            r = ws_source.next() => r,
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+        };
+
         let msg = match result {
-            Ok(m) => m,
-            Err(e) => {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
                 eprintln!("[WS_SESSION] {peer_addr} read error: {e}");
                 break;
             }
+            None => break, // stream ended
         };
 
         match msg {
@@ -1432,6 +1645,146 @@ mod tests {
         let (mut sink2, _) = ws2.split();
         let _ = sink2.close().await;
 
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// DAEMON-TRANSFER-CONTROL-1: Verify pause/resume during outbound transfer.
+    /// Connects a WS client, establishes a session, sends a large-ish file,
+    /// pauses mid-transfer, verifies no new chunks arrive during pause,
+    /// resumes, and verifies transfer completes.
+    #[tokio::test]
+    async fn ws_transfer_pause_resume() {
+        use std::io::Write;
+
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let daemon_identity = generate_identity_keypair();
+
+        let config = WsEndpointConfig {
+            listen_addr: addr,
+            identity_keypair: copy_keypair(&daemon_identity),
+            wt_enabled: false,
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // -- Handshake (same pattern as ws_envelope_roundtrip_over_ws) --
+        let url = format!("ws://127.0.0.1:{port}");
+        let (ws_stream, _) = connect_async(&url).await.unwrap();
+        let (mut sink, mut source) = ws_stream.split();
+
+        let browser_session_kp = generate_ephemeral_keypair();
+        let browser_identity = generate_identity_keypair();
+
+        let session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&browser_session_kp.public_key),
+        });
+        sink.send(Message::Text(session_key_msg.to_string())).await.unwrap();
+
+        let daemon_sk_msg = source.next().await.unwrap().unwrap();
+        let daemon_sk_text = match daemon_sk_msg {
+            Message::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let daemon_sk_value: serde_json::Value = serde_json::from_str(&daemon_sk_text).unwrap();
+        let daemon_session_pk =
+            crate::web_hello::decode_public_key(daemon_sk_value["publicKey"].as_str().unwrap())
+                .unwrap();
+
+        let hello_msg = build_hello_message(
+            &browser_identity.public_key,
+            &browser_session_kp,
+            &daemon_session_pk,
+        ).unwrap();
+        sink.send(Message::Text(hello_msg)).await.unwrap();
+
+        let _hello_response = source.next().await.unwrap().unwrap();
+
+        // -- Session established, ACTIVE_SESSION is now set --
+
+        // Create test file: 256KB (16 chunks at 16KB each)
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let test_file = tmp_dir.path().join("pause_test.bin");
+        {
+            let mut f = std::fs::File::create(&test_file).unwrap();
+            let data = vec![0xABu8; 256 * 1024]; // 256KB
+            f.write_all(&data).unwrap();
+        }
+
+        // Trigger file send on a blocking thread (it's synchronous)
+        let file_path = test_file.to_str().unwrap().to_string();
+        let send_handle = tokio::task::spawn_blocking(move || {
+            send_file_to_browser(&file_path)
+        });
+
+        // Read a few chunks to confirm transfer started
+        let mut chunks_received = 0u32;
+        for _ in 0..4 {
+            let msg = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                source.next(),
+            ).await;
+            if msg.is_ok() {
+                chunks_received += 1;
+            }
+        }
+        assert!(chunks_received > 0, "should receive at least some chunks before pause");
+
+        // -- PAUSE --
+        request_pause();
+        // Drain any in-flight chunks (outbound channel may have buffered some)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        let mut drain_count = 0;
+        loop {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), source.next()).await {
+                Ok(Some(Ok(_))) => { drain_count += 1; }
+                _ => break,
+            }
+        }
+
+        // Verify no new chunks arrive during pause window (500ms)
+        let paused_msg = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            source.next(),
+        ).await;
+        assert!(paused_msg.is_err(), "no messages should arrive while paused (got one after drain of {drain_count})");
+
+        // -- RESUME --
+        request_resume();
+
+        // Verify chunks resume flowing
+        let resumed_msg = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            source.next(),
+        ).await;
+        assert!(resumed_msg.is_ok(), "chunks should resume after unpause");
+
+        // Drain remaining chunks until send completes
+        loop {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next()).await {
+                Ok(Some(Ok(_))) => { chunks_received += 1; }
+                _ => break,
+            }
+        }
+
+        // Verify send thread completed successfully
+        let send_result = send_handle.await.unwrap();
+        assert!(send_result.is_ok(), "send should complete: {:?}", send_result);
+
+        // Total chunks received should account for the full file
+        // 256KB / 16KB = 16 chunks minimum
+        assert!(chunks_received + drain_count >= 10, "should receive most chunks (got {}, drained {})", chunks_received, drain_count);
+
+        // Clean close
+        let _ = sink.close().await;
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
     }

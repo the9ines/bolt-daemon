@@ -39,234 +39,72 @@ Requires: Rust 1.70+.
 ## CLI Reference
 
 ```
-bolt-daemon --role offerer|answerer [options]
+bolt-daemon [options]
 
-Common flags:
-  --role <offerer|answerer>       Required. Peer role.
-  --network-scope <lan|overlay|global>  ICE filter policy (default: lan)
-  --phase-timeout-secs <int>      Timeout per phase in seconds (default: 30)
+Mode:
+  --mode <ws-endpoint|simulate>      Runtime mode (default: ws-endpoint)
 
-File mode flags:
-  --offer <path|->                Offer signal path (default: /tmp/bolt-spike/offer.json)
-  --answer <path|->               Answer signal path (default: /tmp/bolt-spike/answer.json)
+WsEndpoint mode:
+  --ws-listen <addr>                 WS listen address (REQUIRED, e.g. 127.0.0.1:9557)
+  --socket-path <path>               IPC Unix socket path (default: /tmp/bolt-daemon.sock)
+  --data-dir <path>                  Data dir for identity key, trust store, and signal files
+  --pairing-policy <ask|allow|deny>  Pairing approval policy (default: ask)
+  --phase-timeout-secs <int>         Per-phase timeout in seconds (default: 30)
 
-Rendezvous mode flags:
-  --signal <file|rendezvous>      Signal mode (default: file)
-  --rendezvous-url <url>          WebSocket URL (default: ws://127.0.0.1:3001)
-  --room <string>                 Room discriminator (REQUIRED for rendezvous)
-  --session <string>              Session discriminator (REQUIRED for rendezvous)
-  --to <peer_code>                Target peer (REQUIRED for offerer + rendezvous)
-  --expect-peer <peer_code>       Expected peer (REQUIRED for answerer + rendezvous)
-  --peer-id <string>              Own peer code (optional, auto-generated)
+WebTransport (requires --features transport-webtransport):
+  --no-wt                            Force-disable WT even if feature is compiled in
+
+Simulate mode:
+  --simulate-event <type>            pairing-request | incoming-transfer (REQUIRED)
 ```
 
-## Run — File Mode (headless-to-headless)
+Legacy flags (`--role`, `--signal`, `--offer`, `--answer`, `--interop-*`) exit 1.
+These belonged to the pre-DEWEBRTC-2 WebRTC architecture.
 
-Open two terminals:
+## Running
+
+### WsEndpoint Mode (default)
 
 ```bash
-# Terminal 1 (offerer):
-rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike
-cargo run -- --role offerer
-
-# Terminal 2 (answerer — start after offerer writes offer.json):
-cargo run -- --role answerer
+cargo run -- --mode ws-endpoint --ws-listen 127.0.0.1:9557
 ```
 
-Default signal paths: `/tmp/bolt-spike/offer.json`, `/tmp/bolt-spike/answer.json`.
+The daemon:
+1. Starts a WebSocket server on the specified address
+2. Generates an ephemeral TLS certificate and starts a WebTransport endpoint
+   on the adjacent port (9558) if the `transport-webtransport` feature is enabled
+3. Writes WT metadata (`wt_info.json`) to `--data-dir` for the native shell to read
+4. Starts an IPC server on `/tmp/bolt-daemon.sock` for native shell communication
+5. Waits for browser or native app connections
 
-Custom paths:
+When a browser connects, the session lifecycle is:
+- NaCl-box encrypted HELLO handshake with capability negotiation
+- Profile Envelope v1 framing for all post-HELLO messages
+- BTR (Bolt Transfer Ratchet) encrypted file transfers when negotiated
+
+### Signal Files
+
+The native shell (e.g. Tauri app) communicates with the daemon via signal files
+in the `--data-dir` directory. The daemon polls for these at 250–500ms intervals.
+
+| Signal File | Purpose |
+|-------------|---------|
+| `send_file.signal` | Write a file path → daemon sends it to the connected browser |
+| `connect_remote.signal` | Write a WS URL → daemon connects outbound to a remote peer |
+| `disconnect_session.signal` | Touch → daemon disconnects the active session |
+| `transfer_pause.signal` | Touch → pause the active transfer |
+| `transfer_resume.signal` | Touch → resume a paused transfer |
+
+### Simulate Mode
+
+IPC-only mode for testing the pairing/transfer event flow without a real connection:
 
 ```bash
-cargo run -- --role offerer --offer /tmp/my-offer.json --answer /tmp/my-answer.json
-cargo run -- --role answerer --offer /tmp/my-offer.json --answer /tmp/my-answer.json
+cargo run -- --mode simulate --simulate-event pairing-request
 ```
 
-Use `-` for stdin/stdout (copy-paste mode):
-
-```bash
-cargo run -- --role offerer --offer - --answer -
-```
-
-## Run — Rendezvous Mode
-
-Requires a running bolt-rendezvous server.
-
-```bash
-# Terminal 0: start rendezvous server
-cd ~/Desktop/the9ines.com/bolt-ecosystem/bolt-rendezvous
-cargo run
-
-# Terminal 1 (offerer):
-cargo run -- --role offerer --signal rendezvous --room test1 \
-  --session s1 --peer-id alice --to bob
-
-# Terminal 2 (answerer):
-cargo run -- --role answerer --signal rendezvous --room test1 \
-  --session s1 --peer-id bob --expect-peer alice
-```
-
-For two-machine tests with manual setup time:
-
-```bash
-cargo run -- --role offerer --signal rendezvous --room test1 \
-  --session s1 --peer-id alice --to bob --phase-timeout-secs 300
-```
-
-### Rendezvous Hello/Ack Handshake
-
-Before the offer/answer exchange, rendezvous mode performs a hello/ack handshake:
-
-1. Offerer sends `msg_type="hello"` with peer identities, network scope, and session
-2. Answerer validates hello fields (peer IDs, scope match, payload version)
-3. Answerer replies `msg_type="ack"`
-4. Offerer validates ack, then proceeds with offer
-
-Any mismatch (wrong peer, scope mismatch, version mismatch) exits 1 immediately.
-
-All rendezvous payloads carry `payload_version: 1` and a `session` discriminator.
-Signals with a non-matching session are silently ignored (different test run).
-Signals with an unknown `payload_version` cause exit 1 (fail-closed).
-
-### Rendezvous Fail-Closed Rules
-
-Rendezvous mode is **opt-in only**. There is no fallback to file mode.
-
-- `--signal rendezvous` without `--room` → exit 1
-- `--signal rendezvous` without `--session` → exit 1
-- `--signal rendezvous --role offerer` without `--to` → exit 1
-- `--signal rendezvous --role answerer` without `--expect-peer` → exit 1
-- Rendezvous server unreachable → exit 1 (no silent behavior change)
-- `payload_version` mismatch → exit 1
-- Hello peer identity or scope mismatch → exit 1
-
-### Expected Output
-
-Both peers print `SUCCESS` and exit 0. Non-LAN candidates are explicitly rejected
-(in LAN mode):
-
-```
-[bolt-daemon] role=Offerer signal=File scope=Lan timeout=30s
-[pc] ICE candidate accepted (Lan): candidate:1 1 UDP ... 192.168.4.210 ...
-[pc] ICE candidate REJECTED (Lan): candidate:4 1 UDP ... 100.74.48.28 ...
-[offerer] SUCCESS — received matching payload
-[bolt-daemon] exit 0
-```
-
-## Network Scope Policy
-
-Controls which ICE candidates are accepted at the `on_candidate` callback
-and on inbound remote candidate application.
-
-### LAN mode (`--network-scope lan`, default)
-
-| Range | Type |
-|-------|------|
-| `10.0.0.0/8` | RFC 1918 private |
-| `172.16.0.0/12` | RFC 1918 private |
-| `192.168.0.0/16` | RFC 1918 private |
-| `169.254.0.0/16` | IPv4 link-local |
-| `127.0.0.0/8` | Loopback |
-| `fe80::/10` | IPv6 link-local |
-| `fc00::/7` | IPv6 unique local |
-| `::1` | IPv6 loopback |
-
-Rejected: public IPs, CGNAT (`100.64.0.0/10`), mDNS (`.local`), any non-IP address.
-
-### Overlay mode (`--network-scope overlay`)
-
-Everything LAN accepts, plus:
-
-| Range | Type |
-|-------|------|
-| `100.64.0.0/10` | CGNAT (Tailscale, other overlay networks) |
-
-Rejected: public IPs, mDNS (`.local`), any non-IP address.
-
-Use this for LocalBolt over Tailscale:
-```bash
-cargo run -- --role offerer --network-scope overlay
-```
-
-### Global mode (`--network-scope global`)
-
-Accepts all valid IP addresses (private + public + CGNAT).
-
-Still rejected: mDNS (`.local`), malformed candidates, empty IPs.
-
-No STUN or TURN servers are configured by default.
-
-## Local E2E Test (Rendezvous)
-
-An automated script runs bolt-rendezvous + two bolt-daemon peers locally:
-
-```bash
-bash scripts/e2e_rendezvous_local.sh
-```
-
-Requires `bolt-rendezvous` at `../bolt-rendezvous` (sibling repo). Builds both,
-starts the rendezvous server, runs offerer + answerer with hello/ack handshake,
-and reports PASS/FAIL. Logs are preserved on failure for debugging.
-
-## Browser Interop
-
-A minimal static HTML page is provided for testing daemon-to-browser DataChannel
-connectivity without a signaling server.
-
-### Setup
-
-1. Serve the interop page (any static server):
-   ```bash
-   cd interop/browser
-   python3 -m http.server 8080
-   ```
-   Open `http://localhost:8080` in a browser.
-
-2. The page defaults to **Browser as Answerer** mode (daemon creates the offer).
-
-### Test: daemon offerer, browser answerer
-
-1. Start the daemon as offerer:
-   ```bash
-   rm -rf /tmp/bolt-spike && mkdir -p /tmp/bolt-spike
-   cargo run -- --role offerer
-   ```
-2. Copy the contents of `/tmp/bolt-spike/offer.json` and paste into the
-   "Paste Offer" textarea in the browser page.
-3. Click **Apply Offer & Create Answer**.
-4. Copy the answer JSON from the "Answer" textarea and write it to
-   `/tmp/bolt-spike/answer.json`:
-   ```bash
-   pbpaste > /tmp/bolt-spike/answer.json
-   ```
-5. The daemon reads the answer, connects, sends `bolt-hello-v1`.
-6. The browser auto-echoes the payload. Both sides log success.
-
-### Test: browser offerer, daemon answerer
-
-1. Select "Browser is Offerer" in the page. Click **Create Offer**.
-2. Copy the offer JSON and write it to `/tmp/bolt-spike/offer.json`:
-   ```bash
-   pbpaste > /tmp/bolt-spike/offer.json
-   ```
-3. Start the daemon:
-   ```bash
-   cargo run -- --role answerer
-   ```
-4. Copy `/tmp/bolt-spike/answer.json` and paste into the "Paste Answer"
-   textarea in the browser. Click **Apply Answer**.
-5. Connection establishes, payload exchange succeeds.
-
-### Signaling format
-
-Both the daemon and the browser page use the same JSON format:
-
-```json
-{
-  "description": { "sdp_type": "offer|answer", "sdp": "v=0\r\n..." },
-  "candidates": [ { "candidate": "candidate:...", "mid": "0" } ]
-}
-```
+Emits a simulated IPC event and waits up to 30s for a decision from a connected
+UI client. Exits 0 on decision received, 1 on timeout (fail-closed deny).
 
 ## Test
 
@@ -274,7 +112,17 @@ Both the daemon and the browser page use the same JSON format:
 cargo test
 ```
 
-58 unit tests: 33 ICE filter (LAN + Overlay + Global scope), 7 transport/signaling, 18 rendezvous protocol.
+See `docs/STATE.md` for current test breakdown (lib, integration, IPC, session,
+relay, cross-impl E2E).
+
+### Test Harness Note
+
+The cross-impl E2E harness (`tests/ts-harness/`) uses `node-datachannel` for
+browser-fidelity testing. This is **test-only** — no WebRTC code runs in the
+daemon at runtime.
+
+Legacy E2E scripts in `scripts/` (e.g. `e2e_rendezvous_local.sh`) exercise
+pre-DEWEBRTC-2 code paths and require `--features legacy-webrtc`.
 
 ## Lint
 
@@ -289,20 +137,36 @@ Both must be clean (0 warnings).
 
 ```
 bolt-daemon/
-├── Cargo.toml           # bolt-core, bolt-btr, tungstenite, tokio, serde
-├── Cargo.lock           # pinned (committed for reproducible builds)
+├── Cargo.toml              # bolt-core, bolt-btr, tungstenite, tokio, serde
+├── Cargo.lock              # pinned (committed for reproducible builds)
 ├── src/
-│   ├── main.rs          # CLI + handlers + signaling + E2E flow + file mode
-│   ├── ice_filter.rs    # NetworkScope policy + candidate filter + 33 tests
-│   └── rendezvous.rs    # WebSocket signaling via bolt-rendezvous + 15 tests
-├── scripts/
-│   └── e2e_rendezvous_local.sh  # Local E2E regression harness
-├── interop/
-│   └── browser/
-│       └── index.html   # Browser interop test page
-├── docs/
-│   └── E2E_LAN_TEST.md  # Two-machine LAN test procedure + troubleshooting
-└── README.md
+│   ├── main.rs             # CLI, mode dispatch, boot diagnostics
+│   ├── lib.rs              # Module exports for integration-test access
+│   ├── ws_endpoint.rs      # WS server, session lifecycle, file transfer
+│   ├── wt_endpoint.rs      # WebTransport/HTTP3 server (feature-gated)
+│   ├── wt_cert.rs          # Ephemeral TLS cert generation for WT
+│   ├── ws_btr.rs           # BTR key derivation + chunk encrypt/decrypt
+│   ├── ws_validation.rs    # Send-path validation (size, path traversal)
+│   ├── web_hello.rs        # NaCl-box encrypted HELLO handshake
+│   ├── envelope.rs         # Profile Envelope v1 codec, router, error framing
+│   ├── dc_messages.rs      # Inner message types (ping, pong, file ops)
+│   ├── session.rs          # SessionContext: HELLO outcome persistence
+│   ├── identity_store.rs   # Ed25519 identity keypair persistence
+│   ├── transfer.rs         # Transfer state types
+│   ├── ice_filter.rs       # NetworkScope policy (retained, not active in WS/WT)
+│   ├── ipc/                # IPC server, transport, trust store, event types
+│   ├── relay.rs            # Relay protocol
+│   ├── relay_main.rs       # bolt-relay binary entry point
+│   ├── ipc_client_main.rs  # bolt-ipc-client dev harness
+│   └── quic_transport.rs   # QUIC transport (feature-gated)
+├── tests/
+│   ├── ts-harness/         # Node.js cross-impl E2E (node-datachannel, test-only)
+│   ├── e2e-browser/        # Browser E2E tests
+│   ├── vectors/            # Golden test vectors
+│   └── *.rs                # Integration tests (BTR, QUIC, WS, identity, etc.)
+├── scripts/                # E2E regression scripts (some legacy, pre-DEWEBRTC-2)
+├── interop/browser/        # Legacy WebRTC interop page (pre-DEWEBRTC-2, not runtime)
+└── docs/                   # Contracts, changelog, state, test procedures
 ```
 
 Key dependencies:
@@ -317,7 +181,7 @@ Key dependencies:
 
 Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
 
-Current: `daemon-v0.0.9-rendezvous-hello-retry`
+Current: `daemon-v0.2.49-dewebrtc2-docs-reconcile`
 
 ## License
 

@@ -4,9 +4,9 @@
 
 | Field | Value |
 |-------|-------|
-| Tag (main) | `daemon-v0.2.46-nstream-operational-proof` |
+| Tag (main) | `daemon-v0.2.50-dewebrtc2-readme-complete` |
 | Branch | `main` |
-| Phase | N-STREAM-TIMEOUT: Post-HELLO deadline decoupled, operational proof DONE |
+| Phase | DEWEBRTC-2-DOCS: Documentation reconciliation COMPLETE |
 
 ## Test Status
 
@@ -35,6 +35,20 @@
 | EN3e | DONE | Session + transfer IPC events, `daemon-v0.2.43-en3e-ipc-session-events` |
 | EN3f | DONE | Transfer lifecycle IPC events, `daemon-v0.2.44-en3f-transfer-ipc-events` |
 | N-STREAM-TIMEOUT | DONE | Post-HELLO deadline decoupled from signaling phase; heartbeat-driven sessions. Live two-device proof: 253s stable, 3 reconnect cycles. `daemon-v0.2.45-nstream-timeout-hardening` (`ed74bae`), `daemon-v0.2.46-nstream-operational-proof` (`fcf7a85`) |
+| DEWEBRTC-2-DOCS | DONE | Post-DEWEBRTC-2 docs/metadata reconciliation (2 passes). `daemon-v0.2.49-dewebrtc2-docs-reconcile` (`e092dcc`): metadata + top-level identity. `daemon-v0.2.50-dewebrtc2-readme-complete` (`c5b7ea8`): operational README rewrite. No runtime code modified. |
+
+## Runtime Architecture
+
+**Zero WebRTC.** All WebRTC/DataChannel runtime code removed (DEWEBRTC-2, `f730501`).
+
+| Transport | Status | Feature Flag | Default |
+|-----------|--------|-------------|---------|
+| WebSocket (WS) | Active | `transport-ws` | Yes (default feature) |
+| WebTransport (WT/HTTP3) | Active | `transport-webtransport` | Optional |
+| QUIC | Reference | `transport-quic` | Optional |
+
+The `datachannel` and `webrtc-sdp` crates are no longer dependencies.
+`tests/ts-harness/` retains `node-datachannel` for cross-impl E2E testing only.
 
 ## Release Artifacts
 

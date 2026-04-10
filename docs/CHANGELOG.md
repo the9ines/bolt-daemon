@@ -2,6 +2,33 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## DEWEBRTC-2-DOCS — Documentation Reconciliation (daemon-v0.2.49, daemon-v0.2.50) — 2026-04-10
+
+Complete documentation reconciliation following DEWEBRTC-2 removal of all
+WebRTC runtime code. Two-pass approach: metadata first, then operational README.
+
+### Pass 1: Metadata + Top-Level (daemon-v0.2.49)
+- README.md: "Headless WebRTC transport" → current WS/WT/QUIC architecture overview
+- Cargo.toml: package description updated
+- docs/STATE.md: Default mode description, dependency table (datachannel/webrtc-sdp → bolt-btr/tokio-tungstenite/wtransport)
+- docs/CHANGELOG.md: shipped binary description
+- src/main.rs: removed orphaned "Re-export legacy WebRTC types" comment
+
+### Pass 2: Operational README (daemon-v0.2.50)
+- CLI Reference: WebRTC-era --role/--signal/--offer/--answer → current --mode/--ws-listen/--data-dir flags
+- Removed stale sections: File Mode, Rendezvous Mode, Network Scope Policy, Browser Interop, Expected Output
+- Added: WsEndpoint running guide, signal files table, simulate mode, test harness note
+- Architecture tree: updated to 20+ current source files
+- Tag convention: updated current tag
+
+### Runtime Architecture Statement
+Zero WebRTC runtime. WS default, WT optional, QUIC optional.
+No runtime code was modified in either commit.
+
+### Tags
+- `daemon-v0.2.49-dewebrtc2-docs-reconcile` (`e092dcc`) — metadata + top-level
+- `daemon-v0.2.50-dewebrtc2-readme-complete` (`c5b7ea8`) — operational README
+
 ## N-STREAM-TIMEOUT — Post-HELLO Deadline Decoupling (daemon-v0.2.45, daemon-v0.2.46) — 2026-03-16
 
 Decoupled the post-HELLO session loop deadline from the signaling-phase timeout.

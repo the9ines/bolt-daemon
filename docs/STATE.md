@@ -69,7 +69,7 @@ Release workflow (`.github/workflows/release.yml`) triggers on `daemon-v*` tag p
 
 | Mode | Status | Notes |
 |------|--------|-------|
-| Default | Stable | WebRTC transport with file or rendezvous signaling |
+| Default (WsEndpoint) | Stable | WS server for browser↔desktop direct transport |
 | Smoke | Stable | Deterministic payload transfer + SHA-256 verification |
 | Simulate | NEW | IPC-only mode for testing event/decision round-trip |
 
@@ -196,8 +196,9 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| datachannel | 0.16.0 | WebRTC DataChannel (vendored libdatachannel) |
-| webrtc-sdp | 0.3 | SDP parsing |
+| bolt-btr | path | Bolt Transfer Ratchet (per-transfer DH ratchet) |
+| tokio-tungstenite | 0.24 | Async WebSocket (WS endpoint, feature-gated) |
+| wtransport | 0.7 | WebTransport/HTTP3 (optional, feature-gated) |
 | tungstenite | 0.24 | Sync WebSocket client (rendezvous signaling) |
 | bolt-core | path | Canonical hash, encoding, crypto primitives |
 | bolt-transfer-core | path | Transport-agnostic transfer state machine |

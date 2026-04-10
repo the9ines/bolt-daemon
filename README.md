@@ -1,39 +1,29 @@
 # Bolt Daemon
 
-Headless WebRTC transport for the Bolt Protocol.
+Local protocol authority for Bolt P2P file transfer.
 
-## Current State: Phase 3G (rendezvous session + handshake)
+## Architecture Overview
 
-Minimal Rust daemon that establishes a WebRTC DataChannel via
-[libdatachannel](https://github.com/paullouisageneau/libdatachannel)
-(headless, no browser) and exchanges a deterministic payload between two peers.
+Headless Rust daemon providing browser↔desktop direct transport. Default
+transport is WebSocket (WS) with optional WebTransport (WT/HTTP3) and QUIC
+transports behind feature flags.
 
-Two signaling modes:
-- **File** (default) — exchange offer/answer via JSON files on disk
-- **Rendezvous** — exchange offer/answer via bolt-rendezvous WebSocket server
+Two runtime modes:
+- **WsEndpoint** (default) — WS server for browser↔desktop direct transport, optional WT alongside
+- **Simulate** — IPC-only mode for testing pairing/transfer event round-trip
 
-Three network scope policies:
-- **LAN** (default) — ICE candidates filtered to private/link-local IPs (LocalBolt)
-- **Overlay** — LAN + CGNAT 100.64.0.0/10 (LocalBolt over Tailscale)
-- **Global** — all valid IPs accepted including public and CGNAT (ByteBolt)
+Key capabilities:
+- NaCl-box encrypted HELLO handshake with capability negotiation
+- Profile Envelope v1 framing with Bolt Transfer Ratchet (BTR) encryption
+- IPC channel (Unix socket / Windows named pipe) for native shell integration
+- Identity persistence (TOFU) and pairing approval (trust store)
+- Rendezvous signaling via bolt-rendezvous WebSocket server
 
-### What This Proves
-
-- libdatachannel compiles and links on macOS arm64 and x86_64 via the `datachannel` Rust crate
-- WebRTC DataChannel establishes between two local headless peers
-- WebRTC DataChannel establishes between two physical machines on the same LAN
-- Ordered, reliable message delivery works (aligns with `TRANSPORT_CONTRACT.md` §1)
-- LAN-only ICE policy enforced at candidate level (`TRANSPORT_CONTRACT.md` §5)
-- Browser-to-daemon DataChannel interop via file-based signaling
-- Rendezvous signaling via bolt-rendezvous WebSocket server (no manual `scp`)
-- Rendezvous hello/ack handshake validates peer identity, session, scope before offer
-- Network scope policy cleanly separates LAN (LocalBolt) from Global (ByteBolt)
-
-### What This Does NOT Do
-
-- No Bolt protocol encryption (NaCl box is in bolt-core-sdk, not here)
-- No identity persistence or TOFU
-- No TURN integration yet
+> **Zero WebRTC runtime.** All WebRTC/DataChannel code was removed in
+> DEWEBRTC-2 (`f730501`). The `datachannel` and `webrtc-sdp` crates are no
+> longer dependencies. The cross-impl E2E test harness (`tests/ts-harness/`)
+> retains `node-datachannel` intentionally for browser-fidelity testing —
+> this is the only WebRTC surface in the repo.
 
 ## Reproducible Builds
 
@@ -44,8 +34,7 @@ versions must be pinned for reproducible builds across machines and CI.
 cargo build
 ```
 
-First build compiles libdatachannel + OpenSSL from source (~1 min).
-Requires: Rust 1.70+, CMake, Xcode Command Line Tools (macOS).
+Requires: Rust 1.70+.
 
 ## CLI Reference
 
@@ -300,7 +289,7 @@ Both must be clean (0 warnings).
 
 ```
 bolt-daemon/
-├── Cargo.toml           # datachannel (vendored), webrtc-sdp, serde, tungstenite
+├── Cargo.toml           # bolt-core, bolt-btr, tungstenite, tokio, serde
 ├── Cargo.lock           # pinned (committed for reproducible builds)
 ├── src/
 │   ├── main.rs          # CLI + handlers + signaling + E2E flow + file mode
@@ -317,10 +306,12 @@ bolt-daemon/
 ```
 
 Key dependencies:
-- [`datachannel`](https://crates.io/crates/datachannel) v0.16.0 — Rust bindings for libdatachannel
-- `vendored` feature — compiles libdatachannel + OpenSSL from source (no system deps)
-- [`webrtc-sdp`](https://crates.io/crates/webrtc-sdp) v0.3 — SDP parsing for signaling exchange
+- [`bolt-core`](../bolt-core-sdk/rust/bolt-core) — canonical hash, encoding, crypto primitives
+- [`bolt-btr`](../bolt-core-sdk/rust/bolt-btr) — Bolt Transfer Ratchet (per-transfer DH ratchet + ChaCha20-Poly1305)
+- [`bolt-transfer-core`](../bolt-core-sdk/rust/bolt-transfer-core) — transport-agnostic transfer state machine
 - [`tungstenite`](https://crates.io/crates/tungstenite) v0.24 — sync WebSocket client for rendezvous signaling
+- [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) v0.24 — async WebSocket (WS endpoint)
+- [`wtransport`](https://crates.io/crates/wtransport) v0.7 — WebTransport/HTTP3 (optional, feature-gated)
 
 ## Tag Convention
 

@@ -2,7 +2,7 @@
 name = "bolt-daemon"
 version = "0.0.1"
 edition = "2021"
-description = "Headless WebRTC transport spike for the Bolt Protocol"
+description = "Headless transport daemon for the Bolt Protocol (WS/WT/QUIC)"
 license = "MIT"
 
 [lib]

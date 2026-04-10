@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) use ice_filter::NetworkScope;
 
-// Re-export legacy WebRTC types when feature is enabled.
 const DEFAULT_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── CLI ─────────────────────────────────────────────────────

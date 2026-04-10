@@ -64,7 +64,7 @@ platform archives with checksums for 5 targets, published to GitHub Releases.
 - `src/identity_store.rs` — Windows path separator fix in `resolve_path_uses_home` test
 
 ### Shipped Binaries (per archive)
-- `bolt-daemon` — headless WebRTC transport daemon
+- `bolt-daemon` — headless transport daemon
 - `bolt-relay` — self-hosted relay server
 - `bolt-ipc-client` excluded (dev harness, not user-facing)
 

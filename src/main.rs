@@ -530,6 +530,8 @@ fn main() {
                             if disconnect_signal_path.exists() {
                                 let _ = std::fs::remove_file(&disconnect_signal_path);
                                 ws_endpoint::request_disconnect();
+                                #[cfg(feature = "transport-webtransport")]
+                                wt_endpoint::request_disconnect();
                             }
                         }
                     });

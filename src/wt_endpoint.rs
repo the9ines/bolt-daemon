@@ -39,6 +39,19 @@ fn copy_keypair(kp: &KeyPair) -> KeyPair {
     }
 }
 
+// ── Disconnect flag (mirrors ws_endpoint pattern) ───────────
+
+/// Request to close the active WT session from outside the WT task (e.g., UI disconnect).
+/// The message loop checks this flag and breaks if set.
+pub(crate) static DISCONNECT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal the active WT session to close gracefully.
+pub fn request_disconnect() {
+    DISCONNECT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[WT_SESSION] disconnect requested");
+}
+
 // ── Configuration ────────────────────────────────────────────
 
 /// Configuration for the WebTransport endpoint.
@@ -346,6 +359,20 @@ async fn handle_incoming_session(
     )
     .await;
 
+    // Emit session lifecycle IPC event (mirrors WS endpoint pattern)
+    match &result {
+        Ok(()) => {
+            crate::ws_endpoint::emit_ipc_global("session.ended", serde_json::json!({
+                "reason": "connection closed",
+            }));
+        }
+        Err(e) => {
+            crate::ws_endpoint::emit_ipc_global("session.error", serde_json::json!({
+                "reason": format!("{e}"),
+            }));
+        }
+    }
+
     // Cleanup: clear ACTIVE_SESSION
     {
         let mut guard = ACTIVE_SESSION.lock().unwrap();
@@ -394,8 +421,23 @@ async fn run_message_loop(
     }
     let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
 
+    // Clear any stale disconnect request before entering the loop
+    DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+
     loop {
-        let frame = match read_frame(recv).await {
+        // Check disconnect flag every iteration (mirrors WS read loop pattern)
+        if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[WT_SESSION] {peer_addr} disconnect requested — closing");
+            break;
+        }
+
+        let frame_result = tokio::select! {
+            r = read_frame(recv) => r,
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+        };
+
+        let frame = match frame_result {
             Ok(Some(data)) => data,
             Ok(None) => {
                 eprintln!("[WT_SESSION] {peer_addr} stream closed cleanly");

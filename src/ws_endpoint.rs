@@ -68,8 +68,8 @@ fn emit_ipc(
     }
 }
 
-/// Emit a transfer event using the global IPC_TX (for send_file_to_browser context).
-fn emit_ipc_global(msg_type: &str, payload: serde_json::Value) {
+/// Emit an IPC event using the global IPC_TX (for cross-endpoint use).
+pub(crate) fn emit_ipc_global(msg_type: &str, payload: serde_json::Value) {
     if let Ok(guard) = IPC_TX.lock() {
         if let Some(ref tx) = *guard {
             let event = crate::ipc::types::IpcMessage::new_event(msg_type, payload);

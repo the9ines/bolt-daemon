@@ -29,6 +29,7 @@ transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 transport-webtransport = ["dep:wtransport", "dep:tokio"]
 
 [dependencies]
+libc = "0.2"
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr" }
 bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }

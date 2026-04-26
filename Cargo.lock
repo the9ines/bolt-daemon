@@ -118,6 +118,7 @@ dependencies = [
  "bolt-rendezvous-protocol",
  "bolt-transfer-core",
  "futures-util",
+ "libc",
  "native-tls",
  "quinn",
  "rand 0.8.5",

@@ -317,6 +317,36 @@ fn main() {
         DaemonMode::WsEndpoint => {
             // WS-only serving mode: start WS endpoint and stay alive.
             // No WebRTC/file-signal path. Used for browser↔desktop direct transport.
+
+            // Parent-death watchdog: when the native app exits (for any reason),
+            // this daemon becomes an orphan reparented to launchd (ppid=1).
+            // Detect this and exit cleanly. Required because SwiftUI does not
+            // reliably fire any termination hooks.
+            let initial_ppid = unsafe { libc::getppid() };
+            let data_dir_for_watchdog = args.data_dir.clone();
+            if initial_ppid > 1 {
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let ppid = unsafe { libc::getppid() };
+                        if ppid != initial_ppid {
+                            // Write to file first (stderr pipe may be broken)
+                            if let Some(ref dd) = data_dir_for_watchdog {
+                                let _ = std::fs::write(
+                                    format!("{dd}/watchdog_exit.log"),
+                                    format!("parent {} died (ppid now {}), exiting\n", initial_ppid, ppid),
+                                );
+                            }
+                            // Use libc::_exit to bypass all cleanup — avoids
+                            // potential deadlocks in atexit/drop when the tokio
+                            // runtime or broken stderr pipe block std::process::exit.
+                            unsafe { libc::_exit(0); }
+                        }
+                    }
+                });
+                eprintln!("[bolt-daemon] parent-death watchdog active (ppid={})", initial_ppid);
+            }
+
             use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
 
             let socket_path_str = args.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);

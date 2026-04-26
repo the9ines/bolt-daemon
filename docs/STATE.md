@@ -36,6 +36,7 @@
 | EN3f | DONE | Transfer lifecycle IPC events, `daemon-v0.2.44-en3f-transfer-ipc-events` |
 | N-STREAM-TIMEOUT | DONE | Post-HELLO deadline decoupled from signaling phase; heartbeat-driven sessions. Live two-device proof: 253s stable, 3 reconnect cycles. `daemon-v0.2.45-nstream-timeout-hardening` (`ed74bae`), `daemon-v0.2.46-nstream-operational-proof` (`fcf7a85`) |
 | DEWEBRTC-2-DOCS | DONE | Post-DEWEBRTC-2 docs/metadata reconciliation (2 passes). `daemon-v0.2.49-dewebrtc2-docs-reconcile` (`e092dcc`): metadata + top-level identity. `daemon-v0.2.50-dewebrtc2-readme-complete` (`c5b7ea8`): operational README rewrite. No runtime code modified. |
+| LOCALBOLT-NATIVE-QUIT-TEARDOWN-1 | DONE | Daemon-side ppid watchdog exits WsEndpoint when parent app dies. `libc::_exit(0)` avoids tokio atexit deadlock. Validated: daemon gone within 2s of Cmd+Q, zero orphans. `bffbc02`. |
 
 ## Runtime Architecture
 

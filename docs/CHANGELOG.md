@@ -2,6 +2,43 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## LOCALBOLT-NATIVE-QUIT-TEARDOWN-1 — Parent-Death Watchdog (`bffbc02`) — 2026-04-26
+
+When the native LocalBolt.app quits (Cmd+Q), normal termination hooks
+(`deinit`, `willTerminateNotification`, `applicationWillTerminate`, `atexit`)
+do not run — behavior consistent with `_exit`-style termination in the SwiftUI
+lifecycle. The bundled bolt-daemon child process survived as an orphan
+reparented to launchd (ppid=1).
+
+### Fixed
+- `src/main.rs` — ppid watchdog thread in `DaemonMode::WsEndpoint`: polls
+  `libc::getppid()` every 1s, exits via `libc::_exit(0)` when parent dies.
+  `_exit` is required because `std::process::exit` deadlocks on tokio atexit
+  handlers when the stderr pipe to the dead parent is broken.
+- Diagnostic log written to `{data_dir}/watchdog_exit.log` before exit.
+
+### Added
+- `Cargo.toml` — `libc = "0.2"` dependency for `getppid()` and `_exit()`.
+
+### Rejected Approaches
+- `NSApplication.willTerminateNotification` — does not fire in SwiftUI lifecycle apps.
+- `NSApplicationDelegateAdaptor.applicationWillTerminate` — does not fire.
+- `atexit()` — not called; consistent with `_exit`-style termination bypassing `exit()` handlers.
+- FFI shell watchdog (spawn `/bin/sh` monitor) — could not be validated reliably when launched via Launch Services.
+
+### Validation (Mac Studio)
+- App PID gone after Cmd+Q
+- Daemon PID gone within 2s (watchdog log confirms detection)
+- Browser detects disconnect, resets to device discovery
+- Zero orphan bolt-daemon processes
+
+### Scope Note
+WT disconnect changes (`wt_endpoint::request_disconnect`, IPC lifecycle events)
+are separate work, unstaged/uncommitted, and not part of this fix.
+
+### Commit
+- `bffbc02` — `fix(daemon): exit ws endpoint when parent app dies`
+
 ## DEWEBRTC-2-DOCS — Documentation Reconciliation (daemon-v0.2.49, daemon-v0.2.50) — 2026-04-10
 
 Complete documentation reconciliation following DEWEBRTC-2 removal of all

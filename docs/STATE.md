@@ -222,6 +222,20 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | rand | 0.8 | Peer ID generation |
 | windows-sys | 0.59 (cfg(windows)) | Win32 named pipe, security descriptor APIs |
 
+## Native↔Native Transport (NATIVE-CONNECT-1)
+
+| Path | Status | Implementation |
+|------|--------|----------------|
+| WS client mode | Production (current) | `connect_to_remote_ws()` via `connect_remote.signal` |
+| QUIC (RC3) | Reference (strategic target) | `quic_transport.rs`, not wired into WsEndpoint mode |
+
+WS client mode is the active app↔app path. Initiator daemon connects as
+WS client to acceptor daemon's WS server. Discovery via rendezvous
+signaling (`wsUrl` in `connection_accepted` payload). Full Bolt security
+stack: session-key exchange, HELLO, ProfileEnvelopeV1, BTR when negotiated.
+
+QUIC graduation tracked by APP-TO-APP-QUIC-MIGRATION-1 (bolt-ecosystem ROADMAP.md).
+
 ## Architecture
 
 ```

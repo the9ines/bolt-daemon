@@ -32,6 +32,7 @@ const SEND_CHUNK_SIZE: usize = 65_536;
 async fn ac_rc_13_quic_smoke_1mib_transfer() {
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let listener_handle = tokio::spawn(async move {
         let mut stream = listener.accept().await.unwrap();
@@ -60,7 +61,7 @@ async fn ac_rc_13_quic_smoke_1mib_transfer() {
         (received, received_hash)
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
     let payload = generate_payload(1_048_576);
     let expected_hash = sha256_hex(&payload);
@@ -91,6 +92,7 @@ async fn ac_rc_13_quic_smoke_1mib_transfer() {
 async fn ac_rc_13_quic_small_payload_transfer() {
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let listener_handle = tokio::spawn(async move {
         let mut stream = listener.accept().await.unwrap();
@@ -102,7 +104,7 @@ async fn ac_rc_13_quic_small_payload_transfer() {
         msg
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
     let payload = generate_payload(42);
     let expected_hash = sha256_hex(&payload);
@@ -123,6 +125,7 @@ async fn ac_rc_13_quic_small_payload_transfer() {
 async fn ac_rc_13_quic_multiple_transfers() {
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let sizes = vec![1024, 65536, 1_048_576];
     let sizes_clone = sizes.clone();
@@ -151,7 +154,7 @@ async fn ac_rc_13_quic_multiple_transfers() {
         results
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
     for size in &sizes {
         let payload = generate_payload(*size);
@@ -182,6 +185,7 @@ async fn ac_rc_13_quic_multiple_transfers() {
 async fn ac_rc_15_quic_throughput_baseline() {
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let payload_size: usize = 1_048_576;
     let repeats = 3;
@@ -207,7 +211,7 @@ async fn ac_rc_15_quic_throughput_baseline() {
         let _ = stream.recv_message().await; // wait for dialer finish
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
     let mut throughputs = Vec::new();
 

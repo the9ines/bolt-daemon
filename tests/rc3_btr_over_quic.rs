@@ -40,6 +40,7 @@ async fn ac_rc_14_btr_sealed_chunk_over_quic() {
     // Transport sealed chunk over QUIC
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let listener_handle = tokio::spawn(async move {
         let mut stream = listener.accept().await.unwrap();
@@ -53,7 +54,7 @@ async fn ac_rc_14_btr_sealed_chunk_over_quic() {
         )
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
     stream
         .send_message(&chain_index.to_be_bytes())
         .await
@@ -94,6 +95,7 @@ async fn ac_rc_14_btr_multi_chunk_transfer_over_quic() {
     // Transport over QUIC
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
     let count = sealed_chunks.len();
 
     let listener_handle = tokio::spawn(async move {
@@ -109,7 +111,7 @@ async fn ac_rc_14_btr_multi_chunk_transfer_over_quic() {
         received
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
     for (idx, sealed) in &sealed_chunks {
         stream.send_message(&idx.to_be_bytes()).await.unwrap();
         stream.send_message(sealed).await.unwrap();
@@ -142,6 +144,7 @@ async fn ac_rc_14_btr_tampered_chunk_detected_over_quic() {
     // Transport tampered chunk over QUIC
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
 
     let listener_handle = tokio::spawn(async move {
         let mut stream = listener.accept().await.unwrap();
@@ -151,7 +154,7 @@ async fn ac_rc_14_btr_tampered_chunk_detected_over_quic() {
         received
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
     stream.send_message(&sealed).await.unwrap();
     stream.finish().await.ok();
 
@@ -187,6 +190,7 @@ async fn ac_rc_14_quic_framing_preserves_sealed_bytes() {
     // Transport over QUIC
     let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr();
+    let cert_hash = listener.cert_hash_hex().to_string();
     let count = sealed_pairs.len();
 
     let sealed_clone: Vec<(u32, Vec<u8>)> = sealed_pairs
@@ -207,7 +211,7 @@ async fn ac_rc_14_quic_framing_preserves_sealed_bytes() {
         received
     });
 
-    let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+    let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
     for (idx, sealed) in &sealed_clone {
         stream.send_message(&idx.to_be_bytes()).await.unwrap();
         stream.send_message(sealed).await.unwrap();

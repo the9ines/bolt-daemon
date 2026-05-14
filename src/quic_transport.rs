@@ -9,13 +9,14 @@
 //! **REFERENCE MODE ONLY — NOT FOR PRODUCTION.**
 //!
 //! - Self-signed certificates generated per-session via `rcgen`.
-//! - Client skips server certificate verification.
-//! - QUIC TLS provides transport encryption only.
-//! - No Bolt identity-key binding to TLS certificates.
+//! - Q1 dialer path verifies the listener certificate with SHA-256 cert-hash
+//!   pinning. This is an internal, non-production milestone.
+//! - QUIC TLS provides transport encryption and one-way pinned server auth.
+//! - No mutual cert pinning or Bolt identity-key binding to TLS certificates.
 //! - Bolt envelope (NaCl-box) and BTR remain the security authority.
 //!
 //! Production deployment MUST replace this with proper certificate
-//! management and identity binding (post-RC3 scope).
+//! management and mutual cert-hash pinning (post-Q1 scope).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -177,18 +178,24 @@ impl QuicFramedStream {
     }
 }
 
-// ── RC3 TLS configuration ───────────────────────────────────
+// ── RC3/Q1 TLS configuration ────────────────────────────────
 //
-// WARNING: Self-signed certificates with no verification.
-// This is explicitly scoped to RC3 reference mode.
-// QUIC TLS provides transport encryption; Bolt envelope/BTR is security authority.
+// Q1 is still internal/non-production: it pins the listener certificate hash
+// on the dialer side only. Production promotion remains blocked until mutual
+// cert-hash pinning and signaling integration land in Q2.
 
 /// Generate a self-signed certificate for the RC3 reference path.
 ///
 /// # RC3 REFERENCE MODE ONLY
 /// Not for production. No identity binding.
-fn generate_self_signed_cert(
-) -> Result<(Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>), QuicTransportError> {
+fn generate_self_signed_cert() -> Result<
+    (
+        Vec<CertificateDer<'static>>,
+        PrivatePkcs8KeyDer<'static>,
+        String,
+    ),
+    QuicTransportError,
+> {
     let cert_params = rcgen::CertificateParams::new(vec!["bolt-rc3-reference".to_string()])
         .map_err(|e| QuicTransportError::Tls(format!("cert params: {e}")))?;
     let key_pair =
@@ -197,17 +204,19 @@ fn generate_self_signed_cert(
         .self_signed(&key_pair)
         .map_err(|e| QuicTransportError::Tls(format!("self-sign: {e}")))?;
 
-    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let cert_der_bytes = cert.der().to_vec();
+    let cert_hash_hex = bolt_core::hash::sha256_hex(&cert_der_bytes);
+    let cert_der = CertificateDer::from(cert_der_bytes);
     let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
-    Ok((vec![cert_der], key_der))
+    Ok((vec![cert_der], key_der, cert_hash_hex))
 }
 
 /// Build quinn ServerConfig with self-signed cert.
 ///
 /// # RC3 REFERENCE MODE ONLY
-fn build_server_config() -> Result<ServerConfig, QuicTransportError> {
-    let (certs, key) = generate_self_signed_cert()?;
+fn build_server_config() -> Result<(ServerConfig, String), QuicTransportError> {
+    let (certs, key, cert_hash_hex) = generate_self_signed_cert()?;
 
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -220,20 +229,20 @@ fn build_server_config() -> Result<ServerConfig, QuicTransportError> {
             .map_err(|e| QuicTransportError::Tls(format!("quinn server config: {e}")))?,
     ));
 
-    Ok(server_config)
+    Ok((server_config, cert_hash_hex))
 }
 
-/// Build quinn ClientConfig that skips server certificate verification.
+/// Build quinn ClientConfig that pins the peer certificate hash.
 ///
-/// # RC3 REFERENCE MODE ONLY
+/// # Q1 INTERNAL MILESTONE ONLY
 ///
-/// **WARNING: INSECURE.** This skips all certificate verification.
-/// QUIC TLS provides transport encryption only in RC3.
-/// Bolt envelope (NaCl-box) and BTR remain the security authority.
-fn build_client_config() -> Result<ClientConfig, QuicTransportError> {
+/// This removes the RC3 accept-any verifier from the dialer path, but it is
+/// still one-way pinning only. Production app↔app QUIC remains blocked until
+/// Q2 adds mutual pinning and signaling integration.
+fn build_client_config(expected_cert_hash_hex: &str) -> Result<ClientConfig, QuicTransportError> {
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Rc3SkipVerification))
+        .with_custom_certificate_verifier(CertHashPinVerifier::new(expected_cert_hash_hex)?)
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
 
@@ -245,57 +254,96 @@ fn build_client_config() -> Result<ClientConfig, QuicTransportError> {
     Ok(client_config)
 }
 
-/// RC3 certificate verifier that accepts any server certificate.
+/// Q1 certificate verifier that pins the listener certificate SHA-256 hash.
 ///
-/// **WARNING: INSECURE — RC3 REFERENCE MODE ONLY.**
-/// Production MUST replace this with proper certificate validation.
+/// This verifies that the presented DER certificate matches the expected hash
+/// and delegates TLS handshake signature verification to rustls' ring provider.
+/// It does not provide mutual daemon↔daemon auth; Q2 must add that before QUIC
+/// can become a production app↔app path.
 #[derive(Debug)]
-struct Rc3SkipVerification;
+struct CertHashPinVerifier {
+    expected_hash: [u8; 32],
+    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for Rc3SkipVerification {
+impl CertHashPinVerifier {
+    fn new(expected_cert_hash_hex: &str) -> Result<Arc<Self>, QuicTransportError> {
+        Ok(Arc::new(Self {
+            expected_hash: parse_sha256_hex(expected_cert_hash_hex)?,
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }))
+    }
+}
+
+fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], QuicTransportError> {
+    if hex.len() != 64 {
+        return Err(QuicTransportError::Tls(format!(
+            "invalid cert hash length: expected 64 hex chars, got {}",
+            hex.len()
+        )));
+    }
+
+    let mut out = [0u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|e| QuicTransportError::Tls(format!("invalid cert hash utf8: {e}")))?;
+        out[idx] = u8::from_str_radix(pair, 16)
+            .map_err(|e| QuicTransportError::Tls(format!("invalid cert hash hex: {e}")))?;
+    }
+    Ok(out)
+}
+
+impl rustls::client::danger::ServerCertVerifier for CertHashPinVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // RC3: Accept all certs. Bolt envelope is security authority.
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let received_hash = bolt_core::hash::sha256(end_entity.as_ref());
+        if received_hash.as_slice() == self.expected_hash {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "QUIC certificate hash mismatch".to_string(),
+            ))
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        // Support common schemes for self-signed certs
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -308,12 +356,14 @@ impl rustls::client::danger::ServerCertVerifier for Rc3SkipVerification {
 pub struct QuicListener {
     endpoint: Endpoint,
     local_addr: SocketAddr,
+    cert_hash_hex: String,
 }
 
 impl std::fmt::Debug for QuicListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicListener")
             .field("local_addr", &self.local_addr)
+            .field("cert_hash_hex", &self.cert_hash_hex)
             .finish()
     }
 }
@@ -321,7 +371,7 @@ impl std::fmt::Debug for QuicListener {
 impl QuicListener {
     /// Bind a QUIC listener on the given address.
     pub fn bind(addr: SocketAddr) -> Result<Self, QuicTransportError> {
-        let server_config = build_server_config()?;
+        let (server_config, cert_hash_hex) = build_server_config()?;
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| QuicTransportError::Connection(format!("bind {addr}: {e}")))?;
         let local_addr = endpoint
@@ -332,12 +382,22 @@ impl QuicListener {
         Ok(Self {
             endpoint,
             local_addr,
+            cert_hash_hex,
         })
     }
 
     /// The local address the listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// SHA-256 hash of the listener certificate DER, hex encoded.
+    ///
+    /// Q1 exposes this for internal pinning tests and future signaling/IPC
+    /// plumbing. Production promotion remains blocked until Q2 adds mutual
+    /// exchange and verification.
+    pub fn cert_hash_hex(&self) -> &str {
+        &self.cert_hash_hex
     }
 
     /// Accept a single incoming connection and open a bidirectional stream.
@@ -390,8 +450,9 @@ impl QuicDialer {
     /// Connect to a remote QUIC endpoint and open a bidirectional stream.
     pub async fn connect(
         remote: SocketAddr,
+        expected_cert_hash_hex: &str,
     ) -> Result<(Endpoint, QuicFramedStream), QuicTransportError> {
-        let client_config = build_client_config()?;
+        let client_config = build_client_config(expected_cert_hash_hex)?;
 
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| QuicTransportError::Connection(format!("client endpoint: {e}")))?;
@@ -473,21 +534,40 @@ mod tests {
     fn self_signed_cert_generation() {
         let result = generate_self_signed_cert();
         assert!(result.is_ok(), "cert generation failed: {result:?}");
-        let (certs, _key) = result.unwrap();
+        let (certs, _key, cert_hash_hex) = result.unwrap();
         assert_eq!(certs.len(), 1);
         assert!(!certs[0].is_empty());
+        assert_eq!(cert_hash_hex.len(), 64);
+        assert!(cert_hash_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            cert_hash_hex,
+            bolt_core::hash::sha256_hex(certs[0].as_ref())
+        );
     }
 
     #[test]
     fn server_config_builds() {
         let result = build_server_config();
         assert!(result.is_ok(), "server config failed: {result:?}");
+        let (_config, cert_hash_hex) = result.unwrap();
+        assert_eq!(cert_hash_hex.len(), 64);
     }
 
     #[test]
     fn client_config_builds() {
-        let result = build_client_config();
+        let result =
+            build_client_config("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         assert!(result.is_ok(), "client config failed: {result:?}");
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_cert_hash() {
+        let short = build_client_config("abcd");
+        assert!(short.is_err(), "short cert hash must be rejected");
+
+        let non_hex =
+            build_client_config("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
+        assert!(non_hex.is_err(), "non-hex cert hash must be rejected");
     }
 
     #[tokio::test]
@@ -496,6 +576,7 @@ mod tests {
         assert!(listener.is_ok(), "bind failed: {listener:?}");
         let listener = listener.unwrap();
         assert_ne!(listener.local_addr().port(), 0);
+        assert_eq!(listener.cert_hash_hex().len(), 64);
         listener.close();
     }
 
@@ -504,6 +585,7 @@ mod tests {
         // Listener on ephemeral port
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr();
+        let cert_hash = listener.cert_hash_hex().to_string();
 
         // Spawn listener to accept one connection
         let listener_handle = tokio::spawn(async move {
@@ -525,7 +607,7 @@ mod tests {
         });
 
         // Dialer connects
-        let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+        let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
         // Send a message
         stream.send_message(b"hello from dialer").await.unwrap();
@@ -548,6 +630,7 @@ mod tests {
     async fn framing_preserves_message_boundaries() {
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr();
+        let cert_hash = listener.cert_hash_hex().to_string();
 
         let listener_handle = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
@@ -560,7 +643,7 @@ mod tests {
             messages
         });
 
-        let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+        let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
         // Send 5 messages of varying sizes
         let payloads: Vec<Vec<u8>> = vec![
@@ -592,6 +675,7 @@ mod tests {
         // Transfer 1 MiB in 64 KiB chunks (matches smoke mode defaults)
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr();
+        let cert_hash = listener.cert_hash_hex().to_string();
 
         let total_bytes: usize = 1_048_576;
         let chunk_size: usize = 65_536;
@@ -615,7 +699,7 @@ mod tests {
             received
         });
 
-        let (endpoint, mut stream) = QuicDialer::connect(addr).await.unwrap();
+        let (endpoint, mut stream) = QuicDialer::connect(addr, &cert_hash).await.unwrap();
 
         // Generate deterministic payload
         let payload: Vec<u8> = (0..total_bytes).map(|i| (i % 256) as u8).collect();
@@ -635,6 +719,24 @@ mod tests {
 
         assert_eq!(received.len(), total_bytes);
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn quic_dialer_rejects_cert_hash_mismatch() {
+        let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let mut wrong_hash = listener.cert_hash_hex().to_string();
+        let replacement = if wrong_hash.starts_with('0') {
+            '1'
+        } else {
+            '0'
+        };
+        wrong_hash.replace_range(0..1, &replacement.to_string());
+
+        let result = QuicDialer::connect(addr, &wrong_hash).await;
+
+        listener.close();
+        assert!(result.is_err(), "mismatched cert hash must fail closed");
     }
 
     #[test]

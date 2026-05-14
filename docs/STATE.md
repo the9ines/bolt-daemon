@@ -227,12 +227,18 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | Path | Status | Implementation |
 |------|--------|----------------|
 | WS client mode | Production (current) | `connect_to_remote_ws()` via `connect_remote.signal` |
-| QUIC (RC3) | Reference (strategic target) | `quic_transport.rs`, not wired into WsEndpoint mode |
+| QUIC (Q1) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning implemented; not wired into WsEndpoint mode |
 
 WS client mode is the active app↔app path. Initiator daemon connects as
 WS client to acceptor daemon's WS server. Discovery via rendezvous
 signaling (`wsUrl` in `connection_accepted` payload). Full Bolt security
 stack: session-key exchange, HELLO, ProfileEnvelopeV1, BTR when negotiated.
+
+QUIC Q1 removed the dialer-side accept-any verifier from the internal RC3 path:
+the dialer now pins the listener certificate SHA-256 hash and fails closed on
+mismatch. This is not production app-to-app QUIC. Production promotion remains
+blocked until APP-TO-APP-QUIC-MIGRATION-1 Q2 adds signaling integration and
+mutual daemon-to-daemon cert-hash pinning.
 
 QUIC graduation tracked by APP-TO-APP-QUIC-MIGRATION-1 (bolt-ecosystem ROADMAP.md).
 

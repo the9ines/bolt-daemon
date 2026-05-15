@@ -17,6 +17,10 @@ pub mod transfer;
 #[doc(hidden)]
 pub mod web_hello;
 
+/// Native shell connect signal parser (NATIVE-CONNECT-1 / Q2D).
+#[doc(hidden)]
+pub mod connect_signal;
+
 /// Input validation boundary for WS file transfers (MODULARITY-AUDITABILITY-2).
 /// Pure functions — no global state, no async.
 #[doc(hidden)]

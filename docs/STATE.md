@@ -227,7 +227,7 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | Path | Status | Implementation |
 |------|--------|----------------|
 | WS client mode | Production (current) | `connect_to_remote_ws()` via `connect_remote.signal` |
-| QUIC (Q1/Q2C) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning and mutual cert-hash primitives implemented; `transport-quic` WsEndpoint builds write `quic_info.json`; not wired into production app-to-app routing |
+| QUIC (Q1/Q2D1) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning and mutual cert-hash primitives implemented; `transport-quic` WsEndpoint builds write `quic_info.json`; structured `connect_remote.signal` parsing accepts QUIC metadata but still falls back to WS |
 
 WS client mode is the active app↔app path. Initiator daemon connects as
 WS client to acceptor daemon's WS server. Discovery via rendezvous
@@ -246,6 +246,12 @@ hash. Tests cover success, missing client cert fail-closed, and wrong client
 cert fail-closed. This is not production app-to-app QUIC. Production promotion
 remains blocked until APP-TO-APP-QUIC-MIGRATION-1 Q2 wires those primitives to
 rendezvous/localbolt-app metadata and production routing.
+
+Q2D1 added structured `connect_remote.signal` parsing. The daemon accepts the
+legacy plain `ws://...` signal and the forward JSON shape with `wsUrl`,
+`quicAddr`, and `quicCertHash`. When QUIC metadata is present, the daemon logs
+that the QUIC app-session bridge is not wired yet and uses the WS fallback.
+QUIC-only connect signals are rejected until Q2 routing lands.
 
 QUIC graduation tracked by APP-TO-APP-QUIC-MIGRATION-1 (bolt-ecosystem ROADMAP.md).
 

@@ -15,7 +15,8 @@
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
 pub(crate) use bolt_daemon::{
-    dc_messages, envelope, identity_store, ipc, session, transfer, web_hello, HELLO_PAYLOAD,
+    connect_signal, dc_messages, envelope, identity_store, ipc, session, transfer, web_hello,
+    HELLO_PAYLOAD,
 };
 
 mod ice_filter;
@@ -543,12 +544,29 @@ fn main() {
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             if connect_signal_path.exists() {
-                                if let Ok(url_str) = std::fs::read_to_string(&connect_signal_path) {
-                                    let url_str = url_str.trim().to_string();
+                                if let Ok(raw_signal) = std::fs::read_to_string(&connect_signal_path) {
                                     let _ = std::fs::remove_file(&connect_signal_path);
-                                    if url_str.is_empty() {
-                                        continue;
+                                    let connect_signal =
+                                        match connect_signal::ConnectRemoteSignal::from_raw(&raw_signal) {
+                                            Ok(signal) => signal,
+                                            Err(e) => {
+                                                eprintln!("[CONNECT_REMOTE] rejected signal: {e}");
+                                                continue;
+                                            }
+                                        };
+                                    #[cfg(feature = "transport-quic")]
+                                    if connect_signal.quic_metadata_complete() {
+                                        eprintln!(
+                                            "[QUIC_CLIENT] metadata present for {}; app session routing not wired yet, falling back to WS",
+                                            connect_signal.quic_addr.as_deref().unwrap_or("<unknown>")
+                                        );
                                     }
+                                    let Some(url_str) = connect_signal.ws_url.clone() else {
+                                        eprintln!(
+                                            "[CONNECT_REMOTE] no wsUrl fallback present; QUIC-only connect signals are not routable until Q2 routing lands"
+                                        );
+                                        continue;
+                                    };
                                     eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
                                     let id = bolt_core::crypto::KeyPair {
                                         public_key: connect_pk,

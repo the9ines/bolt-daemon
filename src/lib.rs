@@ -79,6 +79,12 @@ pub mod wt_endpoint;
 #[doc(hidden)]
 pub mod quic_transport;
 
+/// QUIC endpoint metadata for native shell discovery plumbing.
+/// Feature-gated behind `transport-quic`.
+#[cfg(feature = "transport-quic")]
+#[doc(hidden)]
+pub mod quic_endpoint_info;
+
 /// Test-only re-exports for integration tests.
 ///
 /// Gated behind `--features test-support` so release builds carry no

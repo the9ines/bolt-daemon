@@ -442,6 +442,45 @@ fn main() {
                     }
                 }
 
+                #[cfg(feature = "transport-quic")]
+                let quic_listener = {
+                    match bolt_daemon::quic_endpoint_info::ws_endpoint_quic_port(ws_addr.port()) {
+                        Some(quic_port) => {
+                            let quic_addr = std::net::SocketAddr::new(ws_addr.ip(), quic_port);
+                            match quic_transport::QuicListener::bind(quic_addr) {
+                                Ok(listener) => {
+                                    if let Some(ref dd) = data_dir_path {
+                                        let info = bolt_daemon::quic_endpoint_info::QuicEndpointInfo {
+                                            quic_port: listener.local_addr().port(),
+                                            quic_cert_hash: listener.cert_hash_hex().to_string(),
+                                        };
+                                        match bolt_daemon::quic_endpoint_info::write_quic_info(dd, &info) {
+                                            Ok(path) => eprintln!("[QUIC_INFO] wrote {}", path.display()),
+                                            Err(e) => eprintln!("[QUIC_INFO] failed to write metadata: {e}"),
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[QUIC_INFO] Q2 metadata listener active on {}; routing remains WS until Q2 mutual pinning lands",
+                                        listener.local_addr()
+                                    );
+                                    Some(listener)
+                                }
+                                Err(e) => {
+                                    eprintln!("[QUIC_INFO] listener unavailable on {quic_addr}; WS current path remains active: {e}");
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "[QUIC_INFO] cannot derive QUIC port from WS port {}; WS current path remains active",
+                                ws_addr.port()
+                            );
+                            None
+                        }
+                    }
+                };
+
                 let ws_config = ws_endpoint::WsEndpointConfig {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
@@ -454,6 +493,16 @@ fn main() {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 let signal_path = send_signal_path.clone();
                 rt.block_on(async {
+                    #[cfg(feature = "transport-quic")]
+                    if let Some(quic_listener) = quic_listener {
+                        tokio::spawn(async move {
+                            let _quic_listener = quic_listener;
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                            }
+                        });
+                    }
+
                     // Spawn file-send signal watcher
                     tokio::spawn(async move {
                         loop {
@@ -601,4 +650,3 @@ fn main() {
 }
 
 // ── Tests ───────────────────────────────────────────────────
-

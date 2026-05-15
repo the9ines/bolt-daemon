@@ -349,7 +349,7 @@ These provide a simple fire-and-forget command interface.
 | Signal File | Effect |
 |-------------|--------|
 | `send_file.signal` | Contains absolute file path. Triggers outbound transfer. |
-| `connect_remote.signal` | Contains remote WS URL. Triggers outbound connection. |
+| `connect_remote.signal` | Contains legacy remote WS URL or structured JSON with `wsUrl` plus optional `quicAddr` / `quicCertHash`. Triggers outbound connection. WS remains current fallback until QUIC app-session routing lands. |
 | `disconnect_session.signal` | Any content. Closes the active WS session. |
 | `transfer_pause.signal` | Any content. Pauses the active outbound transfer. |
 | `transfer_resume.signal` | Any content. Resumes a paused outbound transfer. |

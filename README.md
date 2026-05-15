@@ -84,13 +84,13 @@ When a browser connects, the session lifecycle is:
 
 ### Signal Files
 
-The native shell (e.g. Tauri app) communicates with the daemon via signal files
+The native shell communicates with the daemon via signal files
 in the `--data-dir` directory. The daemon polls for these at 250–500ms intervals.
 
 | Signal File | Purpose |
 |-------------|---------|
 | `send_file.signal` | Write a file path → daemon sends it to the connected browser |
-| `connect_remote.signal` | Write a WS URL → daemon connects outbound to a remote peer |
+| `connect_remote.signal` | Write legacy WS URL or structured JSON (`wsUrl`, optional `quicAddr` / `quicCertHash`) → daemon connects outbound; WS remains current fallback until QUIC app-session routing lands |
 | `disconnect_session.signal` | Touch → daemon disconnects the active session |
 | `transfer_pause.signal` | Touch → pause the active transfer |
 | `transfer_resume.signal` | Touch → resume a paused transfer |
@@ -151,6 +151,7 @@ bolt-daemon/
 │   ├── envelope.rs         # Profile Envelope v1 codec, router, error framing
 │   ├── dc_messages.rs      # Inner message types (ping, pong, file ops)
 │   ├── session.rs          # SessionContext: HELLO outcome persistence
+│   ├── connect_signal.rs   # Native connect signal parser (legacy WS + Q2D JSON)
 │   ├── identity_store.rs   # Ed25519 identity keypair persistence
 │   ├── transfer.rs         # Transfer state types
 │   ├── ice_filter.rs       # NetworkScope policy (retained, not active in WS/WT)

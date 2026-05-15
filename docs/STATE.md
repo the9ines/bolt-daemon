@@ -227,7 +227,7 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 | Path | Status | Implementation |
 |------|--------|----------------|
 | WS client mode | Production (current) | `connect_to_remote_ws()` via `connect_remote.signal` |
-| QUIC (Q1/Q2A) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning implemented; `transport-quic` WsEndpoint builds write `quic_info.json`; not wired into rendezvous/native app routing |
+| QUIC (Q1/Q2C) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning and mutual cert-hash primitives implemented; `transport-quic` WsEndpoint builds write `quic_info.json`; not wired into production app-to-app routing |
 
 WS client mode is the active app↔app path. Initiator daemon connects as
 WS client to acceptor daemon's WS server. Discovery via rendezvous
@@ -239,10 +239,13 @@ the dialer now pins the listener certificate SHA-256 hash and fails closed on
 mismatch. Q2A added daemon-side metadata plumbing: in `transport-quic`
 WsEndpoint builds, the daemon binds a QUIC listener and writes
 `quic_info.json` containing `quic_port` and `quic_cert_hash` for future
-native-shell consumption. This is not production app-to-app QUIC. Production
-promotion remains blocked until APP-TO-APP-QUIC-MIGRATION-1 Q2 completes
-rendezvous/localbolt-app signaling integration and mutual daemon-to-daemon
-cert-hash pinning.
+native-shell consumption. Q2C added internal mutual cert-hash pinning
+primitives: a listener can require a dialer client certificate hash, and a
+dialer can present its own certificate while pinning the listener certificate
+hash. Tests cover success, missing client cert fail-closed, and wrong client
+cert fail-closed. This is not production app-to-app QUIC. Production promotion
+remains blocked until APP-TO-APP-QUIC-MIGRATION-1 Q2 wires those primitives to
+rendezvous/localbolt-app metadata and production routing.
 
 QUIC graduation tracked by APP-TO-APP-QUIC-MIGRATION-1 (bolt-ecosystem ROADMAP.md).
 

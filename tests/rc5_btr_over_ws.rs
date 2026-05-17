@@ -134,6 +134,7 @@ async fn ac_rc_23_ws_hello_negotiates_btr_capability() {
         listen_addr: addr,
         identity_keypair: copy_keypair(&daemon_identity),
         wt_enabled: false,
+        trust_config: None,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

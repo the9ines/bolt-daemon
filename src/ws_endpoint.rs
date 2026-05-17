@@ -40,6 +40,7 @@
 //!   [SAS]          — SAS verification code
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -50,6 +51,8 @@ pub use crate::ws_validation::validate_send_file_path;
 
 // BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
 use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
+use crate::ipc::trust::{enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult, TrustStore};
+use crate::ipc::types::Decision;
 
 // ── IPC event emission helper ─────────────────────────────────
 
@@ -64,6 +67,56 @@ fn emit_ipc(
         let event = crate::ipc::types::IpcMessage::new_event(msg_type, payload);
         if let Err(e) = tx.send(event) {
             eprintln!("[IPC_EMIT] failed to send {msg_type}: {e}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionTrustRole {
+    Offerer,
+    Answerer,
+}
+
+fn enforce_session_trust(
+    trust_config: Option<&SessionTrustConfig>,
+    role: SessionTrustRole,
+    transport: &str,
+    peer_addr: SocketAddr,
+    remote_identity_pk: &[u8; 32],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let identity_hex = identity_key_to_hex(remote_identity_pk);
+    let Some(config) = trust_config else {
+        return Ok(identity_hex);
+    };
+
+    let stage_a_decision = match role {
+        SessionTrustRole::Offerer => None,
+        SessionTrustRole::Answerer => match config.pairing_policy {
+            PairingPolicy::Allow => Some(Decision::AllowOnce),
+            PairingPolicy::Deny => {
+                eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=deny identity={identity_hex}");
+                return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} policy denied identity {identity_hex}").into());
+            }
+            PairingPolicy::Ask => {
+                let store = TrustStore::load(&config.trust_path);
+                if store.get(&identity_hex).is_some() {
+                    None
+                } else {
+                    eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask has no Stage A decision for identity={identity_hex}");
+                    return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} missing Stage A approval for identity {identity_hex}").into());
+                }
+            }
+        },
+    };
+
+    match enforce_stage_b(&config.trust_path, &identity_hex, stage_a_decision) {
+        StageBResult::Allow => {
+            eprintln!("[PAIRING_ALLOWED] {transport} {peer_addr} identity={identity_hex}");
+            Ok(identity_hex)
+        }
+        StageBResult::Deny => {
+            eprintln!("[PAIRING_DENIED] {transport} {peer_addr} identity={identity_hex}");
+            Err(format!("[PAIRING_DENIED] {transport} {peer_addr} trust denied identity {identity_hex}").into())
         }
     }
 }
@@ -347,6 +400,15 @@ pub struct WsEndpointConfig {
     /// Whether WebTransport is enabled on this daemon (WTI4).
     /// Controls capability advertisement in HELLO.
     pub wt_enabled: bool,
+    /// Identity trust enforcement used by native app sessions.
+    pub trust_config: Option<SessionTrustConfig>,
+}
+
+/// Shared identity trust configuration for WS and QUIC app sessions.
+#[derive(Clone, Debug)]
+pub struct SessionTrustConfig {
+    pub trust_path: PathBuf,
+    pub pairing_policy: PairingPolicy,
 }
 
 // ── Public entry point: outbound client connect ─────────────
@@ -369,6 +431,7 @@ pub async fn connect_to_remote_ws(
     identity: &KeyPair,
     wt_enabled: bool,
     ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    trust_config: Option<SessionTrustConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_tungstenite::connect_async;
 
@@ -452,6 +515,13 @@ pub async fn connect_to_remote_ws(
         let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
         let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
             .map_err(|e| format!("[WS_CLIENT] invalid remote identity key: {e}"))?;
+        enforce_session_trust(
+            trust_config.as_ref(),
+            SessionTrustRole::Offerer,
+            "WS_CLIENT",
+            "0.0.0.0:0".parse().unwrap(),
+            &remote_identity_pk,
+        )?;
 
         let sas = bolt_core::sas::compute_sas(
             &identity.public_key,
@@ -509,6 +579,7 @@ pub async fn connect_to_remote_quic(
     identity: &KeyPair,
     wt_enabled: bool,
     ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    trust_config: Option<SessionTrustConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("[QUIC_CLIENT] connecting to {remote}");
     let (endpoint, stream) = crate::quic_transport::QuicDialer::connect_with_client_cert(
@@ -567,6 +638,13 @@ pub async fn connect_to_remote_quic(
     let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[QUIC_CLIENT] invalid remote identity key: {e}"))?;
+    enforce_session_trust(
+        trust_config.as_ref(),
+        SessionTrustRole::Offerer,
+        "QUIC_CLIENT",
+        remote,
+        &remote_identity_pk,
+    )?;
 
     let sas = bolt_core::sas::compute_sas(
         &identity.public_key,
@@ -615,6 +693,7 @@ pub async fn handle_quic_framed_stream(
     identity: &KeyPair,
     wt_enabled: bool,
     ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    trust_config: Option<SessionTrustConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut sender, mut receiver) = stream.into_split();
     let session_kp = generate_ephemeral_keypair();
@@ -667,6 +746,16 @@ pub async fn handle_quic_framed_stream(
     let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
     eprintln!("[QUIC_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
 
+    let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
+        .map_err(|e| format!("[QUIC_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
+    enforce_session_trust(
+        trust_config.as_ref(),
+        SessionTrustRole::Answerer,
+        "QUIC_SESSION",
+        peer_addr,
+        &remote_identity_pk,
+    )?;
+
     let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
         .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
     sender
@@ -674,9 +763,6 @@ pub async fn handle_quic_framed_stream(
         .await
         .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to send HELLO response: {e}"))?;
     eprintln!("[QUIC_HELLO] {peer_addr} sent HELLO response");
-
-    let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
-        .map_err(|e| format!("[QUIC_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
 
     let session = SessionContext::new(
         copy_keypair(&session_kp),
@@ -743,6 +829,7 @@ pub async fn run_ws_endpoint(
     let identity_pk = Arc::new(config.identity_keypair.public_key);
     let identity_sk = Arc::new(config.identity_keypair.secret_key);
     let wt_enabled = config.wt_enabled;
+    let trust_config = config.trust_config;
 
     loop {
         tokio::select! {
@@ -753,12 +840,13 @@ pub async fn run_ws_endpoint(
                         let pk = Arc::clone(&identity_pk);
                         let sk = Arc::clone(&identity_sk);
                         let ipc = ipc_tx.clone();
+                        let trust = trust_config.clone();
                         tokio::spawn(async move {
                             let identity = KeyPair {
                                 public_key: *pk,
                                 secret_key: *sk,
                             };
-                            if let Err(e) = handle_connection(stream, peer_addr, &identity, wt_enabled, ipc.as_ref()).await {
+                            if let Err(e) = handle_connection(stream, peer_addr, &identity, wt_enabled, ipc.as_ref(), trust.as_ref()).await {
                                 eprintln!("[WS_SESSION] {peer_addr} error: {e}");
                             }
                             eprintln!("[WS_SESSION] {peer_addr} closed");
@@ -794,6 +882,7 @@ async fn handle_connection(
     identity: &KeyPair,
     wt_enabled: bool,
     ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    trust_config: Option<&SessionTrustConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Step 1: WebSocket upgrade ────────────────────────────
     let ws_stream = accept_async(stream)
@@ -968,6 +1057,13 @@ async fn handle_connection(
     // ── Step 7: Build session context ────────────────────────
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[WS_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
+    enforce_session_trust(
+        trust_config,
+        SessionTrustRole::Answerer,
+        "WS_SESSION",
+        peer_addr,
+        &remote_identity_pk,
+    )?;
 
     let session = SessionContext::new(
         copy_keypair(&session_kp),
@@ -1842,6 +1938,78 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    #[test]
+    fn session_trust_answerer_ask_without_pin_fails_closed() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust = SessionTrustConfig {
+            trust_path: tmp_dir.path().join("trust.json"),
+            pairing_policy: PairingPolicy::Ask,
+        };
+        let identity = generate_identity_keypair();
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        );
+
+        assert!(result.is_err(), "ask without Stage A approval must deny");
+    }
+
+    #[test]
+    fn session_trust_answerer_ask_allows_existing_pin() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let mut store = TrustStore::new();
+        assert!(store.set(&identity_hex, Decision::AllowAlways));
+        store.save(&trust_path).unwrap();
+
+        let trust = SessionTrustConfig {
+            trust_path,
+            pairing_policy: PairingPolicy::Ask,
+        };
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Answerer,
+            "QUIC_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        );
+
+        assert_eq!(result.unwrap(), identity_hex);
+    }
+
+    #[test]
+    fn session_trust_offer_rejects_existing_deny_pin() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let mut store = TrustStore::new();
+        assert!(store.set(&identity_hex, Decision::DenyAlways));
+        store.save(&trust_path).unwrap();
+
+        let trust = SessionTrustConfig {
+            trust_path,
+            pairing_policy: PairingPolicy::Allow,
+        };
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Offerer,
+            "QUIC_CLIENT",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        );
+
+        assert!(result.is_err(), "persistent deny pin must block offerer");
+    }
+
     #[tokio::test]
     async fn ws_endpoint_starts_and_accepts_connection() {
         let port = free_port().await;
@@ -1852,6 +2020,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1888,6 +2057,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1973,6 +2143,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2092,6 +2263,7 @@ mod tests {
                 &server_identity,
                 false,
                 None,
+                None,
             )
             .await;
             listener.close();
@@ -2176,6 +2348,107 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quic_session_adapter_rejects_denied_identity_pin() {
+        let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
+        let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
+        pin_set
+            .allow_hash_hex(client_cert.cert_hash_hex())
+            .unwrap();
+
+        let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
+            "127.0.0.1:0".parse().unwrap(),
+            pin_set,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let server_cert_hash = listener.cert_hash_hex().to_string();
+        let server_identity = generate_identity_keypair();
+        let client_identity = generate_identity_keypair();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let client_identity_hex = identity_key_to_hex(&client_identity.public_key);
+        let mut store = TrustStore::new();
+        assert!(store.set(&client_identity_hex, Decision::DenyAlways));
+        store.save(&trust_path).unwrap();
+        let trust_config = SessionTrustConfig {
+            trust_path,
+            pairing_policy: PairingPolicy::Allow,
+        };
+
+        let server_handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let result = handle_quic_framed_stream(
+                stream,
+                "127.0.0.1:0".parse().unwrap(),
+                &server_identity,
+                false,
+                None,
+                Some(trust_config),
+            )
+            .await;
+            listener.close();
+            result
+        });
+
+        let (endpoint, stream) = crate::quic_transport::QuicDialer::connect_with_client_cert(
+            addr,
+            &server_cert_hash,
+            client_cert,
+        )
+        .await
+        .unwrap();
+        let (mut sender, mut receiver) = stream.into_split();
+
+        let client_session_kp = generate_ephemeral_keypair();
+        let client_session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        sender
+            .send_message(client_session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        let server_session_key_text =
+            quic_wait_for_text(&mut receiver, addr, "server session-key")
+                .await
+                .unwrap();
+        let server_session_key_json: serde_json::Value =
+            serde_json::from_str(&server_session_key_text).unwrap();
+        let server_session_pk = crate::web_hello::decode_public_key(
+            server_session_key_json["publicKey"].as_str().unwrap(),
+        )
+        .unwrap();
+
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        sender.send_message(hello_msg.as_bytes()).await.unwrap();
+
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            quic_wait_for_text(&mut receiver, addr, "HELLO response"),
+        )
+        .await;
+        assert!(
+            response.is_err() || response.unwrap().is_err(),
+            "denied identity must not receive HELLO response"
+        );
+
+        endpoint.close(0u32.into(), b"done");
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "server must fail closed on denied identity");
+    }
+
     #[tokio::test]
     async fn ws_connection_close_is_clean() {
         let port = free_port().await;
@@ -2186,6 +2459,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2235,6 +2509,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2317,6 +2592,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2365,6 +2641,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

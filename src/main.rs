@@ -366,6 +366,14 @@ fn main() {
             let _ipc_server = ipc_server;
 
             let data_dir_path = args.data_dir.as_ref().map(std::path::PathBuf::from);
+            let trust_path = data_dir_path
+                .as_ref()
+                .map(|dd| ipc::trust::trust_path_from_data_dir(dd))
+                .unwrap_or_else(ipc::trust::default_trust_path);
+            let session_trust_config = ws_endpoint::SessionTrustConfig {
+                trust_path,
+                pairing_policy: args.pairing_policy,
+            };
 
             // File send signal: bolt-ui writes file path to data_dir/send_file.signal
             // The WS endpoint runtime polls for this file and sends it.
@@ -450,6 +458,7 @@ fn main() {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
                     wt_enabled,
+                    trust_config: Some(session_trust_config.clone()),
                 };
                 eprintln!("[WS_ENDPOINT] starting on {ws_addr}");
 
@@ -465,6 +474,8 @@ fn main() {
                 let quic_ipc_tx = ipc_event_tx.clone();
                 #[cfg(feature = "transport-quic")]
                 let quic_allowlist_pins = quic_client_cert_pins.clone();
+                #[cfg(feature = "transport-quic")]
+                let quic_trust_config = session_trust_config.clone();
                 rt.block_on(async {
                     #[cfg(feature = "transport-quic")]
                     let mut quic_connect_cert = None;
@@ -501,6 +512,7 @@ fn main() {
                                                         secret_key: quic_identity_sk,
                                                     };
                                                     let ipc = quic_ipc_tx.clone();
+                                                    let trust = quic_trust_config.clone();
                                                     tokio::spawn(async move {
                                                         if let Err(e) = ws_endpoint::handle_quic_framed_stream(
                                                             stream,
@@ -508,6 +520,7 @@ fn main() {
                                                             &identity,
                                                             wt_enabled,
                                                             ipc.as_ref(),
+                                                            Some(trust),
                                                         ).await {
                                                             eprintln!("[QUIC_SESSION] error: {e}");
                                                         }
@@ -599,6 +612,7 @@ fn main() {
                     let connect_pk = identity.public_key;
                     let connect_sk = identity.secret_key;
                     let connect_ipc_tx = ipc_event_tx.clone();
+                    let connect_trust_config = session_trust_config.clone();
                     #[cfg(feature = "transport-quic")]
                     let connect_quic_cert = quic_connect_cert.clone();
                     tokio::spawn(async move {
@@ -620,6 +634,7 @@ fn main() {
                                         secret_key: connect_sk,
                                     };
                                     let ipc = connect_ipc_tx.clone();
+                                    let trust = connect_trust_config.clone();
                                     #[cfg(feature = "transport-quic")]
                                     let quic_cert = connect_quic_cert.clone();
                                     tokio::spawn(async move {
@@ -640,6 +655,7 @@ fn main() {
                                                             &id,
                                                             wt_enabled,
                                                             ipc.clone(),
+                                                            Some(trust.clone()),
                                                         ).await {
                                                             Ok(()) => {
                                                                 eprintln!("[QUIC_CLIENT] session ended normally");
@@ -665,7 +681,7 @@ fn main() {
                                         };
                                         eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
                                         match ws_endpoint::connect_to_remote_ws(
-                                            &url_str, &id, wt_enabled, ipc,
+                                            &url_str, &id, wt_enabled, ipc, Some(trust),
                                         ).await {
                                             Ok(()) => eprintln!("[WS_CLIENT] session ended normally"),
                                             Err(e) => eprintln!("[WS_CLIENT] session error: {e}"),

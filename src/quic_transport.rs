@@ -23,8 +23,9 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 // ── Constants ───────────────────────────────────────────────
@@ -35,6 +36,10 @@ const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 /// QUIC application-level protocol identifier for RC3 reference path.
 const ALPN_RC3: &[u8] = b"bolt-rc3";
+
+/// Keepalive prevents normal user think time from making active app sessions idle out.
+const APP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const APP_SESSION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default QUIC listen port.
 pub const DEFAULT_QUIC_PORT: u16 = 4433;
@@ -388,10 +393,11 @@ fn build_server_config_with_client_pin(
         .map_err(|e| QuicTransportError::Tls(format!("server config: {e}")))?;
     server_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| QuicTransportError::Tls(format!("quinn server config: {e}")))?,
     ));
+    server_config.transport_config(app_session_transport_config()?);
 
     Ok((server_config, cert))
 }
@@ -407,10 +413,11 @@ fn build_server_config_with_dynamic_client_pins(
         .map_err(|e| QuicTransportError::Tls(format!("server config: {e}")))?;
     server_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| QuicTransportError::Tls(format!("quinn server config: {e}")))?,
     ));
+    server_config.transport_config(app_session_transport_config()?);
 
     Ok((server_config, cert))
 }
@@ -441,12 +448,23 @@ fn build_client_config_with_optional_client_cert(
     };
     client_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .map_err(|e| QuicTransportError::Tls(format!("quinn client config: {e}")))?,
     ));
+    client_config.transport_config(app_session_transport_config()?);
 
     Ok(client_config)
+}
+
+fn app_session_transport_config() -> Result<Arc<TransportConfig>, QuicTransportError> {
+    let mut transport = TransportConfig::default();
+    let idle_timeout = APP_SESSION_IDLE_TIMEOUT
+        .try_into()
+        .map_err(|e| QuicTransportError::Tls(format!("idle timeout: {e}")))?;
+    transport.max_idle_timeout(Some(idle_timeout));
+    transport.keep_alive_interval(Some(APP_SESSION_KEEP_ALIVE_INTERVAL));
+    Ok(Arc::new(transport))
 }
 
 /// Q1 certificate verifier that pins the listener certificate SHA-256 hash.

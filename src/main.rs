@@ -445,50 +445,6 @@ fn main() {
 
                 #[cfg(feature = "transport-quic")]
                 let quic_client_cert_pins = quic_transport::QuicClientCertPinSet::new();
-                #[cfg(feature = "transport-quic")]
-                let mut quic_peer_certificate = None;
-                #[cfg(feature = "transport-quic")]
-                let quic_listener = {
-                    match bolt_daemon::quic_endpoint_info::ws_endpoint_quic_port(ws_addr.port()) {
-                        Some(quic_port) => {
-                            let quic_addr = std::net::SocketAddr::new(ws_addr.ip(), quic_port);
-                            match quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
-                                quic_addr,
-                                quic_client_cert_pins.clone(),
-                            ) {
-                                Ok(listener) => {
-                                    quic_peer_certificate = Some(listener.peer_certificate());
-                                    if let Some(ref dd) = data_dir_path {
-                                        let info = bolt_daemon::quic_endpoint_info::QuicEndpointInfo {
-                                            quic_port: listener.local_addr().port(),
-                                            quic_cert_hash: listener.cert_hash_hex().to_string(),
-                                        };
-                                        match bolt_daemon::quic_endpoint_info::write_quic_info(dd, &info) {
-                                            Ok(path) => eprintln!("[QUIC_INFO] wrote {}", path.display()),
-                                            Err(e) => eprintln!("[QUIC_INFO] failed to write metadata: {e}"),
-                                        }
-                                    }
-                                    eprintln!(
-                                        "[QUIC_INFO] Q2 mutual-pin listener active on {}; routing remains WS until app session routing lands",
-                                        listener.local_addr()
-                                    );
-                                    Some(listener)
-                                }
-                                Err(e) => {
-                                    eprintln!("[QUIC_INFO] listener unavailable on {quic_addr}; WS current path remains active: {e}");
-                                    None
-                                }
-                            }
-                        }
-                        None => {
-                            eprintln!(
-                                "[QUIC_INFO] cannot derive QUIC port from WS port {}; WS current path remains active",
-                                ws_addr.port()
-                            );
-                            None
-                        }
-                    }
-                };
 
                 let ws_config = ws_endpoint::WsEndpointConfig {
                     listen_addr: ws_addr,
@@ -509,39 +465,73 @@ fn main() {
                 let quic_ipc_tx = ipc_event_tx.clone();
                 #[cfg(feature = "transport-quic")]
                 let quic_allowlist_pins = quic_client_cert_pins.clone();
-                #[cfg(feature = "transport-quic")]
-                let quic_connect_cert = quic_peer_certificate.clone();
                 rt.block_on(async {
                     #[cfg(feature = "transport-quic")]
-                    if let Some(quic_listener) = quic_listener {
-                        tokio::spawn(async move {
-                            loop {
-                                match quic_listener.accept().await {
-                                    Ok(stream) => {
-                                        let identity = bolt_core::crypto::KeyPair {
-                                            public_key: quic_identity_pk,
-                                            secret_key: quic_identity_sk,
+                    let mut quic_connect_cert = None;
+                    #[cfg(feature = "transport-quic")]
+                    match bolt_daemon::quic_endpoint_info::ws_endpoint_quic_port(ws_addr.port()) {
+                        Some(quic_port) => {
+                            let quic_addr = std::net::SocketAddr::new(ws_addr.ip(), quic_port);
+                            match quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
+                                quic_addr,
+                                quic_client_cert_pins.clone(),
+                            ) {
+                                Ok(quic_listener) => {
+                                    quic_connect_cert = Some(quic_listener.peer_certificate());
+                                    if let Some(ref dd) = data_dir_path {
+                                        let info = bolt_daemon::quic_endpoint_info::QuicEndpointInfo {
+                                            quic_port: quic_listener.local_addr().port(),
+                                            quic_cert_hash: quic_listener.cert_hash_hex().to_string(),
                                         };
-                                        let ipc = quic_ipc_tx.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = ws_endpoint::handle_quic_framed_stream(
-                                                stream,
-                                                "0.0.0.0:0".parse().unwrap(),
-                                                &identity,
-                                                wt_enabled,
-                                                ipc.as_ref(),
-                                            ).await {
-                                                eprintln!("[QUIC_SESSION] error: {e}");
+                                        match bolt_daemon::quic_endpoint_info::write_quic_info(dd, &info) {
+                                            Ok(path) => eprintln!("[QUIC_INFO] wrote {}", path.display()),
+                                            Err(e) => eprintln!("[QUIC_INFO] failed to write metadata: {e}"),
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[QUIC_INFO] Q2 mutual-pin listener active on {}; complete structured native signals can route to QUIC, WS fallback remains active",
+                                        quic_listener.local_addr()
+                                    );
+                                    tokio::spawn(async move {
+                                        loop {
+                                            match quic_listener.accept().await {
+                                                Ok(stream) => {
+                                                    let identity = bolt_core::crypto::KeyPair {
+                                                        public_key: quic_identity_pk,
+                                                        secret_key: quic_identity_sk,
+                                                    };
+                                                    let ipc = quic_ipc_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(e) = ws_endpoint::handle_quic_framed_stream(
+                                                            stream,
+                                                            "0.0.0.0:0".parse().unwrap(),
+                                                            &identity,
+                                                            wt_enabled,
+                                                            ipc.as_ref(),
+                                                        ).await {
+                                                            eprintln!("[QUIC_SESSION] error: {e}");
+                                                        }
+                                                    });
+                                                }
+                                                Err(quic_transport::QuicTransportError::Closed) => break,
+                                                Err(e) => {
+                                                    eprintln!("[QUIC_SESSION] accept error: {e}");
+                                                }
                                             }
-                                        });
-                                    }
-                                    Err(quic_transport::QuicTransportError::Closed) => break,
-                                    Err(e) => {
-                                        eprintln!("[QUIC_SESSION] accept error: {e}");
-                                    }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("[QUIC_INFO] listener unavailable on {quic_addr}; WS current path remains active: {e}");
                                 }
                             }
-                        });
+                        }
+                        None => {
+                            eprintln!(
+                                "[QUIC_INFO] cannot derive QUIC port from WS port {}; WS current path remains active",
+                                ws_addr.port()
+                            );
+                        }
                     }
 
                     #[cfg(feature = "transport-quic")]

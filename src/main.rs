@@ -448,7 +448,11 @@ fn main() {
                     match bolt_daemon::quic_endpoint_info::ws_endpoint_quic_port(ws_addr.port()) {
                         Some(quic_port) => {
                             let quic_addr = std::net::SocketAddr::new(ws_addr.ip(), quic_port);
-                            match quic_transport::QuicListener::bind(quic_addr) {
+                            let client_cert_pins = quic_transport::QuicClientCertPinSet::new();
+                            match quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
+                                quic_addr,
+                                client_cert_pins,
+                            ) {
                                 Ok(listener) => {
                                     if let Some(ref dd) = data_dir_path {
                                         let info = bolt_daemon::quic_endpoint_info::QuicEndpointInfo {
@@ -461,7 +465,7 @@ fn main() {
                                         }
                                     }
                                     eprintln!(
-                                        "[QUIC_INFO] Q2 metadata listener active on {}; routing remains WS until Q2 mutual pinning lands",
+                                        "[QUIC_INFO] Q2 mutual-pin listener active on {}; routing remains WS until app session routing lands",
                                         listener.local_addr()
                                     );
                                     Some(listener)

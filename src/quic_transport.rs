@@ -11,15 +11,18 @@
 //! - Self-signed certificates generated per-session via `rcgen`.
 //! - Q1 dialer path verifies the listener certificate with SHA-256 cert-hash
 //!   pinning. This is an internal, non-production milestone.
-//! - QUIC TLS provides transport encryption and one-way pinned server auth.
-//! - No mutual cert pinning or Bolt identity-key binding to TLS certificates.
+//! - Q2 primitives support mutual cert-hash pinning, including a dynamic
+//!   server-side client-cert allowlist for signaling-supplied peer hashes.
+//! - QUIC TLS provides transport encryption and cert-hash transport auth.
+//! - No Bolt identity-key binding to TLS certificates.
 //! - Bolt envelope (NaCl-box) and BTR remain the security authority.
 //!
-//! Production deployment MUST replace this with proper certificate
-//! management and mutual cert-hash pinning (post-Q1 scope).
+//! Production routing remains blocked until signaling-supplied peer hashes feed
+//! the dynamic allowlist and QUIC streams run the app session lifecycle.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -178,17 +181,27 @@ impl QuicFramedStream {
     }
 }
 
-// ── RC3/Q1 TLS configuration ────────────────────────────────
+// ── RC3/Q-stream TLS configuration ──────────────────────────
 //
-// Q1 is still internal/non-production: it pins the listener certificate hash
-// on the dialer side only. Production promotion remains blocked until mutual
-// cert-hash pinning and signaling integration land in Q2.
+// QUIC remains non-production until signaling supplies peer hashes and QUIC
+// streams run the app session lifecycle. The primitives below provide one-way
+// and mutual cert-hash pinning without binding TLS certs to Bolt identity keys.
 
 /// Self-signed QUIC certificate material for RC3/Q2 test and wiring paths.
 pub struct QuicPeerCertificate {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     cert_hash_hex: String,
+}
+
+impl Clone for QuicPeerCertificate {
+    fn clone(&self) -> Self {
+        Self {
+            certs: self.certs.clone(),
+            key: self.key.clone_key(),
+            cert_hash_hex: self.cert_hash_hex.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for QuicPeerCertificate {
@@ -241,7 +254,7 @@ fn generate_self_signed_cert() -> Result<QuicPeerCertificate, QuicTransportError
 /// Build quinn ServerConfig with self-signed cert.
 ///
 /// # RC3 REFERENCE MODE ONLY
-fn build_server_config() -> Result<(ServerConfig, String), QuicTransportError> {
+fn build_server_config() -> Result<(ServerConfig, QuicPeerCertificate), QuicTransportError> {
     build_server_config_with_client_pin(None)
 }
 
@@ -251,9 +264,8 @@ fn build_server_config() -> Result<(ServerConfig, String), QuicTransportError> {
 /// server requests a client certificate and verifies its DER SHA-256 hash.
 fn build_server_config_with_client_pin(
     expected_client_cert_hash_hex: Option<&str>,
-) -> Result<(ServerConfig, String), QuicTransportError> {
+) -> Result<(ServerConfig, QuicPeerCertificate), QuicTransportError> {
     let cert = generate_self_signed_cert()?;
-    let cert_hash_hex = cert.cert_hash_hex.clone();
 
     let server_builder = rustls::ServerConfig::builder();
     let server_builder = match expected_client_cert_hash_hex {
@@ -264,7 +276,7 @@ fn build_server_config_with_client_pin(
     };
 
     let mut server_crypto = server_builder
-        .with_single_cert(cert.certs, cert.key)
+        .with_single_cert(cert.certs.clone(), cert.key.clone_key())
         .map_err(|e| QuicTransportError::Tls(format!("server config: {e}")))?;
     server_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
 
@@ -273,7 +285,26 @@ fn build_server_config_with_client_pin(
             .map_err(|e| QuicTransportError::Tls(format!("quinn server config: {e}")))?,
     ));
 
-    Ok((server_config, cert_hash_hex))
+    Ok((server_config, cert))
+}
+
+fn build_server_config_with_dynamic_client_pins(
+    client_cert_pins: QuicClientCertPinSet,
+) -> Result<(ServerConfig, QuicPeerCertificate), QuicTransportError> {
+    let cert = generate_self_signed_cert()?;
+
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(DynamicCertHashPinClientVerifier::new(client_cert_pins))
+        .with_single_cert(cert.certs.clone(), cert.key.clone_key())
+        .map_err(|e| QuicTransportError::Tls(format!("server config: {e}")))?;
+    server_crypto.alpn_protocols = vec![ALPN_RC3.to_vec()];
+
+    let server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+            .map_err(|e| QuicTransportError::Tls(format!("quinn server config: {e}")))?,
+    ));
+
+    Ok((server_config, cert))
 }
 
 /// Build quinn ClientConfig that pins the peer certificate hash.
@@ -487,6 +518,119 @@ impl rustls::server::danger::ClientCertVerifier for CertHashPinClientVerifier {
     }
 }
 
+/// Thread-safe set of accepted QUIC client certificate hashes.
+///
+/// Production routing needs the listener to start before a specific peer is
+/// selected, then learn allowed peer hashes from signaling. This pin set is the
+/// server-side primitive for that flow.
+#[derive(Debug, Clone, Default)]
+pub struct QuicClientCertPinSet {
+    allowed_hashes: Arc<RwLock<HashSet<[u8; 32]>>>,
+}
+
+impl QuicClientCertPinSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_hash_hex(&self, cert_hash_hex: &str) -> Result<(), QuicTransportError> {
+        let hash = parse_sha256_hex(cert_hash_hex)?;
+        let mut allowed = self
+            .allowed_hashes
+            .write()
+            .map_err(|e| QuicTransportError::Tls(format!("client cert pin lock poisoned: {e}")))?;
+        allowed.insert(hash);
+        Ok(())
+    }
+
+    pub fn contains_der_cert(&self, cert: &CertificateDer<'_>) -> Result<bool, rustls::Error> {
+        let received_hash = bolt_core::hash::sha256(cert.as_ref());
+        let allowed = self
+            .allowed_hashes
+            .read()
+            .map_err(|e| rustls::Error::General(format!("client cert pin lock poisoned: {e}")))?;
+        Ok(allowed.contains(received_hash.as_slice()))
+    }
+}
+
+#[derive(Debug)]
+struct DynamicCertHashPinClientVerifier {
+    pin_set: QuicClientCertPinSet,
+    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl DynamicCertHashPinClientVerifier {
+    fn new(pin_set: QuicClientCertPinSet) -> Arc<Self> {
+        Arc::new(Self {
+            pin_set,
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+        })
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for DynamicCertHashPinClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if self.pin_set.contains_der_cert(end_entity)? {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "QUIC client certificate hash not allowed".to_string(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 // ── Listener (answerer side) ────────────────────────────────
 
 /// QUIC listener for the daemon answerer.
@@ -496,14 +640,14 @@ impl rustls::server::danger::ClientCertVerifier for CertHashPinClientVerifier {
 pub struct QuicListener {
     endpoint: Endpoint,
     local_addr: SocketAddr,
-    cert_hash_hex: String,
+    cert: QuicPeerCertificate,
 }
 
 impl std::fmt::Debug for QuicListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicListener")
             .field("local_addr", &self.local_addr)
-            .field("cert_hash_hex", &self.cert_hash_hex)
+            .field("cert_hash_hex", &self.cert.cert_hash_hex)
             .finish()
     }
 }
@@ -511,8 +655,8 @@ impl std::fmt::Debug for QuicListener {
 impl QuicListener {
     /// Bind a QUIC listener on the given address.
     pub fn bind(addr: SocketAddr) -> Result<Self, QuicTransportError> {
-        let (server_config, cert_hash_hex) = build_server_config()?;
-        Self::bind_with_config(addr, server_config, cert_hash_hex)
+        let (server_config, cert) = build_server_config()?;
+        Self::bind_with_config(addr, server_config, cert)
     }
 
     /// Bind a QUIC listener requiring the dialer to present the expected
@@ -524,15 +668,28 @@ impl QuicListener {
         addr: SocketAddr,
         expected_client_cert_hash_hex: &str,
     ) -> Result<Self, QuicTransportError> {
-        let (server_config, cert_hash_hex) =
+        let (server_config, cert) =
             build_server_config_with_client_pin(Some(expected_client_cert_hash_hex))?;
-        Self::bind_with_config(addr, server_config, cert_hash_hex)
+        Self::bind_with_config(addr, server_config, cert)
+    }
+
+    /// Bind a QUIC listener that requires client cert hashes to be present in a
+    /// dynamic allowlist.
+    ///
+    /// This is the production-shape Q2 primitive: the daemon can start its
+    /// listener in fail-closed mode, then add peer hashes learned via signaling.
+    pub fn bind_with_dynamic_client_cert_pins(
+        addr: SocketAddr,
+        client_cert_pins: QuicClientCertPinSet,
+    ) -> Result<Self, QuicTransportError> {
+        let (server_config, cert) = build_server_config_with_dynamic_client_pins(client_cert_pins)?;
+        Self::bind_with_config(addr, server_config, cert)
     }
 
     fn bind_with_config(
         addr: SocketAddr,
         server_config: ServerConfig,
-        cert_hash_hex: String,
+        cert: QuicPeerCertificate,
     ) -> Result<Self, QuicTransportError> {
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| QuicTransportError::Connection(format!("bind {addr}: {e}")))?;
@@ -544,7 +701,7 @@ impl QuicListener {
         Ok(Self {
             endpoint,
             local_addr,
-            cert_hash_hex,
+            cert,
         })
     }
 
@@ -555,11 +712,19 @@ impl QuicListener {
 
     /// SHA-256 hash of the listener certificate DER, hex encoded.
     ///
-    /// Q1 exposes this for internal pinning tests and future signaling/IPC
-    /// plumbing. Production promotion remains blocked until Q2 adds mutual
-    /// exchange and verification.
+    /// Exposes the listener cert hash for signaling/IPC plumbing. Production
+    /// promotion remains blocked until peer hashes feed the dynamic allowlist
+    /// and app session routing uses QUIC.
     pub fn cert_hash_hex(&self) -> &str {
-        &self.cert_hash_hex
+        self.cert.cert_hash_hex()
+    }
+
+    /// Cloneable certificate material used by this daemon's QUIC endpoint.
+    ///
+    /// The same cert can be used for server identity and client-auth
+    /// presentation when dialing a peer that requires mutual pinning.
+    pub fn peer_certificate(&self) -> QuicPeerCertificate {
+        self.cert.clone()
     }
 
     /// Accept a single incoming connection and open a bidirectional stream.
@@ -732,8 +897,8 @@ mod tests {
     fn server_config_builds() {
         let result = build_server_config();
         assert!(result.is_ok(), "server config failed: {result:?}");
-        let (_config, cert_hash_hex) = result.unwrap();
-        assert_eq!(cert_hash_hex.len(), 64);
+        let (_config, cert) = result.unwrap();
+        assert_eq!(cert.cert_hash_hex().len(), 64);
     }
 
     #[test]
@@ -1023,6 +1188,73 @@ mod tests {
             let recv = stream.recv_message().await;
             endpoint.close(0u32.into(), b"done");
             assert!(recv.is_err(), "wrong client cert hash must fail closed");
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), listener_handle).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_client_cert_pin_set_accepts_allowed_client_cert() {
+        let pin_set = QuicClientCertPinSet::new();
+        let client_cert = QuicPeerCertificate::generate_reference().unwrap();
+        pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
+
+        let listener = QuicListener::bind_with_dynamic_client_cert_pins(
+            "127.0.0.1:0".parse().unwrap(),
+            pin_set,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let server_hash = listener.cert_hash_hex().to_string();
+
+        let listener_handle = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let msg = stream.recv_message().await.unwrap();
+            assert_eq!(msg, b"dynamic mutual hello");
+            stream.send_message(b"dynamic mutual ok").await.unwrap();
+            let done = stream.recv_message().await.unwrap();
+            assert!(done.is_empty());
+            stream.finish().await.ok();
+            listener.close();
+        });
+
+        let (endpoint, mut stream) =
+            QuicDialer::connect_with_client_cert(addr, &server_hash, client_cert)
+                .await
+                .unwrap();
+        stream.send_message(b"dynamic mutual hello").await.unwrap();
+        let reply = stream.recv_message().await.unwrap();
+        assert_eq!(reply, b"dynamic mutual ok");
+        stream.send_message(&[]).await.unwrap();
+        stream.finish().await.ok();
+        listener_handle.await.unwrap();
+        endpoint.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn dynamic_client_cert_pin_set_rejects_unlisted_client_cert() {
+        let pin_set = QuicClientCertPinSet::new();
+        let client_cert = QuicPeerCertificate::generate_reference().unwrap();
+
+        let listener = QuicListener::bind_with_dynamic_client_cert_pins(
+            "127.0.0.1:0".parse().unwrap(),
+            pin_set,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let server_hash = listener.cert_hash_hex().to_string();
+
+        let listener_handle = tokio::spawn(async move {
+            let result = listener.accept().await;
+            listener.close();
+            result
+        });
+
+        let result = QuicDialer::connect_with_client_cert(addr, &server_hash, client_cert).await;
+        if let Ok((endpoint, mut stream)) = result {
+            let _ = stream.send_message(b"must fail").await;
+            let recv = stream.recv_message().await;
+            endpoint.close(0u32.into(), b"done");
+            assert!(recv.is_err(), "unlisted client cert must fail closed");
         }
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), listener_handle).await;
     }

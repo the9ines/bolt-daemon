@@ -444,16 +444,20 @@ fn main() {
                 }
 
                 #[cfg(feature = "transport-quic")]
+                let quic_client_cert_pins = quic_transport::QuicClientCertPinSet::new();
+                #[cfg(feature = "transport-quic")]
+                let mut quic_peer_certificate = None;
+                #[cfg(feature = "transport-quic")]
                 let quic_listener = {
                     match bolt_daemon::quic_endpoint_info::ws_endpoint_quic_port(ws_addr.port()) {
                         Some(quic_port) => {
                             let quic_addr = std::net::SocketAddr::new(ws_addr.ip(), quic_port);
-                            let client_cert_pins = quic_transport::QuicClientCertPinSet::new();
                             match quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
                                 quic_addr,
-                                client_cert_pins,
+                                quic_client_cert_pins.clone(),
                             ) {
                                 Ok(listener) => {
+                                    quic_peer_certificate = Some(listener.peer_certificate());
                                     if let Some(ref dd) = data_dir_path {
                                         let info = bolt_daemon::quic_endpoint_info::QuicEndpointInfo {
                                             quic_port: listener.local_addr().port(),
@@ -503,6 +507,10 @@ fn main() {
                 let quic_identity_sk = identity.secret_key;
                 #[cfg(feature = "transport-quic")]
                 let quic_ipc_tx = ipc_event_tx.clone();
+                #[cfg(feature = "transport-quic")]
+                let quic_allowlist_pins = quic_client_cert_pins.clone();
+                #[cfg(feature = "transport-quic")]
+                let quic_connect_cert = quic_peer_certificate.clone();
                 rt.block_on(async {
                     #[cfg(feature = "transport-quic")]
                     if let Some(quic_listener) = quic_listener {
@@ -530,6 +538,35 @@ fn main() {
                                     Err(quic_transport::QuicTransportError::Closed) => break,
                                     Err(e) => {
                                         eprintln!("[QUIC_SESSION] accept error: {e}");
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    #[cfg(feature = "transport-quic")]
+                    {
+                        let allow_signal_path = data_dir_path
+                            .as_ref()
+                            .map(|dd| dd.join("allow_quic_peer.signal"))
+                            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/bolt-allow-quic-peer.signal"));
+                        let pins = quic_allowlist_pins.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                                if allow_signal_path.exists() {
+                                    if let Ok(raw_hashes) = std::fs::read_to_string(&allow_signal_path) {
+                                        let _ = std::fs::remove_file(&allow_signal_path);
+                                        for hash in raw_hashes.lines().map(str::trim).filter(|h| !h.is_empty()) {
+                                            match pins.allow_hash_hex(hash) {
+                                                Ok(()) => {
+                                                    eprintln!("[QUIC_PIN] allowed peer client cert hash from signaling");
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[QUIC_PIN] rejected peer client cert hash: {e}");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -572,6 +609,8 @@ fn main() {
                     let connect_pk = identity.public_key;
                     let connect_sk = identity.secret_key;
                     let connect_ipc_tx = ipc_event_tx.clone();
+                    #[cfg(feature = "transport-quic")]
+                    let connect_quic_cert = quic_connect_cert.clone();
                     tokio::spawn(async move {
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -586,26 +625,55 @@ fn main() {
                                                 continue;
                                             }
                                         };
-                                    #[cfg(feature = "transport-quic")]
-                                    if connect_signal.quic_metadata_complete() {
-                                        eprintln!(
-                                            "[QUIC_CLIENT] metadata present for {}; app session routing not wired yet, falling back to WS",
-                                            connect_signal.quic_addr.as_deref().unwrap_or("<unknown>")
-                                        );
-                                    }
-                                    let Some(url_str) = connect_signal.ws_url.clone() else {
-                                        eprintln!(
-                                            "[CONNECT_REMOTE] no wsUrl fallback present; QUIC-only connect signals are not routable until Q2 routing lands"
-                                        );
-                                        continue;
-                                    };
-                                    eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
                                     let id = bolt_core::crypto::KeyPair {
                                         public_key: connect_pk,
                                         secret_key: connect_sk,
                                     };
                                     let ipc = connect_ipc_tx.clone();
+                                    #[cfg(feature = "transport-quic")]
+                                    let quic_cert = connect_quic_cert.clone();
                                     tokio::spawn(async move {
+                                        #[cfg(feature = "transport-quic")]
+                                        if connect_signal.quic_metadata_complete() {
+                                            if let (Some(quic_addr), Some(quic_hash), Some(client_cert)) = (
+                                                connect_signal.quic_addr.as_deref(),
+                                                connect_signal.quic_cert_hash.as_deref(),
+                                                quic_cert,
+                                            ) {
+                                                match quic_addr.parse::<std::net::SocketAddr>() {
+                                                    Ok(addr) => {
+                                                        eprintln!("[QUIC_CLIENT] connect_remote signal: {addr}");
+                                                        match ws_endpoint::connect_to_remote_quic(
+                                                            addr,
+                                                            quic_hash,
+                                                            client_cert,
+                                                            &id,
+                                                            wt_enabled,
+                                                            ipc.clone(),
+                                                        ).await {
+                                                            Ok(()) => {
+                                                                eprintln!("[QUIC_CLIENT] session ended normally");
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[QUIC_CLIENT] session error: {e}; falling back to WS if available");
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[QUIC_CLIENT] invalid quicAddr '{quic_addr}': {e}; falling back to WS if available");
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        let Some(url_str) = connect_signal.ws_url.clone() else {
+                                            eprintln!(
+                                                "[CONNECT_REMOTE] no wsUrl fallback present; QUIC connect unavailable"
+                                            );
+                                            return;
+                                        };
+                                        eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
                                         match ws_endpoint::connect_to_remote_ws(
                                             &url_str, &id, wt_enabled, ipc,
                                         ).await {

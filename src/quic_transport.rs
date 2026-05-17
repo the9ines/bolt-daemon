@@ -90,6 +90,18 @@ pub struct QuicFramedStream {
     buffered: usize,
 }
 
+/// Send half of a length-prefixed QUIC application stream.
+pub struct QuicMessageSender {
+    send: SendStream,
+    buffered: usize,
+}
+
+/// Receive half of a length-prefixed QUIC application stream.
+pub struct QuicMessageReceiver {
+    recv: RecvStream,
+    open: bool,
+}
+
 impl QuicFramedStream {
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
         Self {
@@ -178,6 +190,102 @@ impl QuicFramedStream {
     /// Approximate buffered bytes (for TransportQuery compatibility).
     pub fn buffered_bytes(&self) -> usize {
         self.buffered
+    }
+
+    /// Split the framed stream into independent send and receive halves.
+    ///
+    /// The app-session adapter uses this so outbound IPC/file-transfer frames
+    /// can be written by a task while the session read loop continues receiving
+    /// peer envelopes.
+    pub fn into_split(self) -> (QuicMessageSender, QuicMessageReceiver) {
+        (
+            QuicMessageSender {
+                send: self.send,
+                buffered: self.buffered,
+            },
+            QuicMessageReceiver {
+                recv: self.recv,
+                open: self.open,
+            },
+        )
+    }
+}
+
+impl QuicMessageSender {
+    /// Send a length-prefixed message.
+    pub async fn send_message(&mut self, payload: &[u8]) -> Result<(), QuicTransportError> {
+        let len = payload.len() as u32;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(QuicTransportError::MessageTooLarge(len));
+        }
+
+        self.buffered += 4 + payload.len();
+
+        self.send
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| QuicTransportError::Stream(format!("write length: {e}")))?;
+        self.send
+            .write_all(payload)
+            .await
+            .map_err(|e| QuicTransportError::Stream(format!("write payload: {e}")))?;
+
+        self.buffered -= 4 + payload.len();
+        Ok(())
+    }
+
+    /// Gracefully close the send side.
+    pub async fn finish(&mut self) -> Result<(), QuicTransportError> {
+        self.send
+            .finish()
+            .map_err(|e| QuicTransportError::Stream(format!("finish: {e}")))?;
+        Ok(())
+    }
+
+    /// Approximate buffered bytes (for TransportQuery compatibility).
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffered
+    }
+}
+
+impl QuicMessageReceiver {
+    /// Receive a length-prefixed message.
+    pub async fn recv_message(&mut self) -> Result<Vec<u8>, QuicTransportError> {
+        let mut len_buf = [0u8; 4];
+        match self.recv.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(quinn::ReadExactError::FinishedEarly(_)) => {
+                self.open = false;
+                return Err(QuicTransportError::Closed);
+            }
+            Err(e) => {
+                return Err(QuicTransportError::Stream(format!("read length: {e}")));
+            }
+        }
+
+        let len = u32::from_be_bytes(len_buf);
+        if len > MAX_MESSAGE_SIZE {
+            return Err(QuicTransportError::MessageTooLarge(len));
+        }
+
+        let mut payload = vec![0u8; len as usize];
+        match self.recv.read_exact(&mut payload).await {
+            Ok(()) => {}
+            Err(quinn::ReadExactError::FinishedEarly(_)) => {
+                self.open = false;
+                return Err(QuicTransportError::Closed);
+            }
+            Err(e) => {
+                return Err(QuicTransportError::Stream(format!("read payload: {e}")));
+            }
+        }
+
+        Ok(payload)
+    }
+
+    /// Whether the receive side is still open.
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 }
 

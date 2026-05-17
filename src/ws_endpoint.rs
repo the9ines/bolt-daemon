@@ -331,7 +331,7 @@ use tungstenite::Message;
 use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
-use crate::envelope::{build_error_payload, decode_envelope, decode_envelope_with_btr, encode_envelope_with_btr, route_inner_message};
+use crate::envelope::{build_error_payload, decode_envelope_with_btr, route_inner_message};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
@@ -490,6 +490,227 @@ pub async fn connect_to_remote_ws(
     // Enter the same message loop as server connections
     run_session_with_outbound(
         ws_sink, ws_source, session, "0.0.0.0:0".parse().unwrap(), remote_identity_pk, ipc_tx.as_ref(),
+    )
+    .await
+}
+
+// ── QUIC app-session adapter (opt-in, not default routing) ──
+
+/// Connect to a remote daemon's QUIC endpoint and run the app session protocol.
+///
+/// This is intentionally not wired as the default native connect path yet.
+/// Callers must provide signaling-supplied server cert hash and this daemon's
+/// client-auth certificate material so QUIC remains fail-closed.
+#[cfg(feature = "transport-quic")]
+pub async fn connect_to_remote_quic(
+    remote: SocketAddr,
+    expected_server_cert_hash_hex: &str,
+    client_cert: crate::quic_transport::QuicPeerCertificate,
+    identity: &KeyPair,
+    wt_enabled: bool,
+    ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("[QUIC_CLIENT] connecting to {remote}");
+    let (endpoint, stream) = crate::quic_transport::QuicDialer::connect_with_client_cert(
+        remote,
+        expected_server_cert_hash_hex,
+        client_cert,
+    )
+    .await
+    .map_err(|e| format!("[QUIC_CLIENT] connect failed: {e}"))?;
+    eprintln!("[QUIC_CLIENT] connected to {remote}");
+
+    let (mut sender, mut receiver) = stream.into_split();
+    let session_kp = generate_ephemeral_keypair();
+
+    let our_session_key_msg = serde_json::json!({
+        "type": "session-key",
+        "publicKey": bolt_core::encoding::to_base64(&session_kp.public_key),
+    });
+    sender
+        .send_message(our_session_key_msg.to_string().as_bytes())
+        .await
+        .map_err(|e| format!("[QUIC_CLIENT] failed to send session key: {e}"))?;
+    eprintln!("[QUIC_CLIENT] sent session-key");
+
+    let remote_key_msg = quic_wait_for_text(&mut receiver, remote, "session-key").await?;
+    let remote_key_json: serde_json::Value = serde_json::from_str(&remote_key_msg)
+        .map_err(|e| format!("[QUIC_CLIENT] invalid session-key JSON: {e}"))?;
+    if remote_key_json.get("type").and_then(|v| v.as_str()) != Some("session-key") {
+        return Err(format!("[QUIC_CLIENT] expected session-key, got: {remote_key_msg}").into());
+    }
+    let remote_pk_b64 = remote_key_json
+        .get("publicKey")
+        .and_then(|v| v.as_str())
+        .ok_or("[QUIC_CLIENT] session-key missing publicKey")?;
+    let remote_session_pk = crate::web_hello::decode_public_key(remote_pk_b64)
+        .map_err(|e| format!("[QUIC_CLIENT] invalid remote session key: {e}"))?;
+    eprintln!("[QUIC_CLIENT] received remote session-key");
+
+    let hello_msg = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
+        .map_err(|e| format!("[QUIC_CLIENT] failed to build HELLO: {e}"))?;
+    sender
+        .send_message(hello_msg.as_bytes())
+        .await
+        .map_err(|e| format!("[QUIC_CLIENT] failed to send HELLO: {e}"))?;
+    eprintln!("[QUIC_CLIENT] sent HELLO");
+
+    let hello_response_raw = quic_wait_for_text(&mut receiver, remote, "HELLO response").await?;
+    let hello_inner = parse_hello_typed(
+        hello_response_raw.as_bytes(),
+        &remote_session_pk,
+        &session_kp,
+    )
+    .map_err(|e| format!("[QUIC_CLIENT] HELLO response parse failed: {e}"))?;
+
+    let local_caps = daemon_capabilities(wt_enabled);
+    let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
+    let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
+        .map_err(|e| format!("[QUIC_CLIENT] invalid remote identity key: {e}"))?;
+
+    let sas = bolt_core::sas::compute_sas(
+        &identity.public_key,
+        &remote_identity_pk,
+        &session_kp.public_key,
+        &remote_session_pk,
+    );
+    eprintln!("[SAS] {sas}");
+    eprintln!("[QUIC_CLIENT] HELLO response ok, caps={negotiated:?}");
+
+    let session = SessionContext::new(
+        copy_keypair(&session_kp),
+        remote_session_pk,
+        negotiated.clone(),
+    )
+    .map_err(|e| format!("[QUIC_CLIENT] failed to create session: {e}"))?;
+
+    let remote_pk_b64_identity = bolt_core::encoding::to_base64(&remote_identity_pk);
+    emit_ipc(ipc_tx.as_ref(), "session.connected", serde_json::json!({
+        "remote_peer_id": remote_pk_b64_identity,
+        "negotiated_capabilities": negotiated,
+    }));
+    emit_ipc(ipc_tx.as_ref(), "session.sas", serde_json::json!({
+        "sas": sas,
+        "remote_identity_pk_b64": remote_pk_b64_identity,
+    }));
+
+    let result = run_quic_session_with_outbound(
+        sender,
+        receiver,
+        session,
+        remote,
+        remote_identity_pk,
+        ipc_tx.as_ref(),
+    )
+    .await;
+    endpoint.close(0u32.into(), b"done");
+    result
+}
+
+/// Run an accepted QUIC stream through the same HELLO/envelope lifecycle as WS.
+#[cfg(feature = "transport-quic")]
+pub async fn handle_quic_framed_stream(
+    stream: crate::quic_transport::QuicFramedStream,
+    peer_addr: SocketAddr,
+    identity: &KeyPair,
+    wt_enabled: bool,
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut sender, mut receiver) = stream.into_split();
+    let session_kp = generate_ephemeral_keypair();
+
+    let our_session_key_msg = serde_json::json!({
+        "type": "session-key",
+        "publicKey": bolt_core::encoding::to_base64(&session_kp.public_key),
+    });
+    sender
+        .send_message(our_session_key_msg.to_string().as_bytes())
+        .await
+        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to send session key: {e}"))?;
+    eprintln!("[QUIC_HELLO] {peer_addr} sent session-key");
+
+    let first_frame = quic_wait_for_text(&mut receiver, peer_addr, "session-key").await?;
+    let value: serde_json::Value = serde_json::from_str(&first_frame)
+        .map_err(|_| format!("[QUIC_HELLO] {peer_addr} first frame is not valid JSON"))?;
+    if value.get("type").and_then(|v| v.as_str()) != Some("session-key") {
+        return Err(format!("[QUIC_HELLO] {peer_addr} expected session-key frame before HELLO").into());
+    }
+    let remote_pk_b64 = value
+        .get("publicKey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("[QUIC_HELLO] {peer_addr} session-key missing publicKey"))?;
+    let remote_session_pk = crate::web_hello::decode_public_key(remote_pk_b64)
+        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} invalid session key: {e}"))?;
+    eprintln!("[QUIC_HELLO] {peer_addr} received session-key");
+
+    let hello_raw = quic_wait_for_text(&mut receiver, peer_addr, "HELLO").await?;
+    let hello_inner = parse_hello_typed(hello_raw.as_bytes(), &remote_session_pk, &session_kp)
+        .map_err(|e| {
+            let code = match &e {
+                HelloError::ParseError(_) => "HELLO_PARSE_ERROR",
+                HelloError::DecryptFail(_) => "HELLO_DECRYPT_FAIL",
+                HelloError::SchemaError(_) => "HELLO_SCHEMA_ERROR",
+                HelloError::DowngradeAttempt => "PROTOCOL_VIOLATION",
+                HelloError::KeyMismatch(_) => "KEY_MISMATCH",
+                HelloError::DuplicateHello => "DUPLICATE_HELLO",
+            };
+            eprintln!("[QUIC_HELLO] {peer_addr} HELLO failed: {e} (code={code})");
+            format!("[QUIC_HELLO] {peer_addr} HELLO validation failed: {e}")
+        })?;
+
+    eprintln!(
+        "[QUIC_HELLO] {peer_addr} HELLO ok: identity={}, caps={:?}",
+        hello_inner.identity_public_key, hello_inner.capabilities,
+    );
+
+    let local_caps = daemon_capabilities(wt_enabled);
+    let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
+    eprintln!("[QUIC_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
+
+    let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
+        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
+    sender
+        .send_message(hello_response.as_bytes())
+        .await
+        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to send HELLO response: {e}"))?;
+    eprintln!("[QUIC_HELLO] {peer_addr} sent HELLO response");
+
+    let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
+        .map_err(|e| format!("[QUIC_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
+
+    let session = SessionContext::new(
+        copy_keypair(&session_kp),
+        remote_session_pk,
+        negotiated.clone(),
+    )
+    .map_err(|e| format!("[QUIC_SESSION] {peer_addr} failed to create session: {e}"))?;
+
+    let sas = bolt_core::sas::compute_sas(
+        &identity.public_key,
+        &remote_identity_pk,
+        &session_kp.public_key,
+        &remote_session_pk,
+    );
+    eprintln!("[SAS] {sas}");
+
+    let remote_pk_b64 = bolt_core::encoding::to_base64(&remote_identity_pk);
+    emit_ipc(ipc_tx, "session.connected", serde_json::json!({
+        "remote_peer_id": remote_pk_b64,
+        "negotiated_capabilities": negotiated,
+    }));
+    emit_ipc(ipc_tx, "session.sas", serde_json::json!({
+        "sas": sas,
+        "remote_identity_pk_b64": remote_pk_b64,
+    }));
+
+    eprintln!("[QUIC_SESSION] {peer_addr} session established, entering message loop");
+    run_quic_session_with_outbound(
+        sender,
+        receiver,
+        session,
+        peer_addr,
+        remote_identity_pk,
+        ipc_tx,
     )
     .await
 }
@@ -829,6 +1050,374 @@ async fn wait_for_hello(
         format!("[WS_HELLO] {peer_addr} HELLO timeout (30s)").into()
     })??;
     Ok(msg)
+}
+
+#[cfg(feature = "transport-quic")]
+async fn quic_wait_for_text(
+    receiver: &mut crate::quic_transport::QuicMessageReceiver,
+    peer_addr: SocketAddr,
+    phase: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let timeout = tokio::time::Duration::from_secs(30);
+    let payload = tokio::time::timeout(timeout, receiver.recv_message())
+        .await
+        .map_err(|_| format!("[QUIC_HELLO] {peer_addr} {phase} timeout (30s)"))?
+        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to read {phase}: {e}"))?;
+    String::from_utf8(payload)
+        .map_err(|_| format!("[QUIC_HELLO] {peer_addr} {phase} frame is not valid UTF-8").into())
+}
+
+#[cfg(feature = "transport-quic")]
+async fn run_quic_session_with_outbound(
+    mut sender: crate::quic_transport::QuicMessageSender,
+    mut receiver: crate::quic_transport::QuicMessageReceiver,
+    session: SessionContext,
+    peer_addr: SocketAddr,
+    remote_pk: [u8; 32],
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let session = Arc::new(session);
+
+    let btr_engine = if session.has_capability("bolt.transfer-ratchet-v1") {
+        let shared_secret = compute_x25519_shared_secret(
+            &session.local_keypair.secret_key,
+            &session.remote_public_key,
+        );
+        let engine = bolt_btr::BtrEngine::new(&shared_secret);
+        eprintln!(
+            "[BTR] {peer_addr} QUIC engine initialized (generation={})",
+            engine.ratchet_generation()
+        );
+        Some(engine)
+    } else {
+        eprintln!("[BTR] {peer_addr} QUIC BTR not negotiated — static NaCl box mode");
+        None
+    };
+    let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
+
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = Some(ActiveSessionHandle {
+            outbound_tx: outbound_tx.clone(),
+            session: Arc::clone(&session),
+            btr_engine: Arc::clone(&btr_engine_arc),
+        });
+    }
+    eprintln!("[QUIC_SESSION] {peer_addr} active session handle registered");
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = outbound_rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if let Err(e) = sender.send_message(text.as_bytes()).await {
+                                eprintln!("[QUIC_SESSION] outbound send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    match reply {
+                        Some(text) => {
+                            if let Err(e) = sender.send_message(text.as_bytes()).await {
+                                eprintln!("[QUIC_SESSION] reply send error: {e}");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        let _ = sender.finish().await;
+    });
+
+    let result = run_quic_read_loop(
+        &mut receiver,
+        &session,
+        peer_addr,
+        &remote_pk,
+        &reply_tx,
+        &btr_engine_arc,
+        ipc_tx,
+    )
+    .await;
+
+    match &result {
+        Ok(()) => {
+            emit_ipc(ipc_tx, "session.ended", serde_json::json!({
+                "reason": "connection closed",
+            }));
+        }
+        Err(e) => {
+            emit_ipc(ipc_tx, "session.error", serde_json::json!({
+                "reason": format!("{e}"),
+            }));
+        }
+    }
+
+    if let Ok(mut btr) = btr_engine_arc.lock() {
+        if let Some(ref mut engine) = *btr {
+            engine.cleanup_disconnect();
+            eprintln!("[BTR] {peer_addr} QUIC engine zeroized on disconnect");
+        }
+    }
+    {
+        let mut guard = ACTIVE_SESSION.lock().unwrap();
+        *guard = None;
+    }
+    eprintln!("[QUIC_SESSION] {peer_addr} active session handle cleared");
+
+    drop(reply_tx);
+    let _ = writer_handle.await;
+
+    result
+}
+
+#[cfg(feature = "transport-quic")]
+async fn run_quic_read_loop(
+    receiver: &mut crate::quic_transport::QuicMessageReceiver,
+    session: &SessionContext,
+    peer_addr: SocketAddr,
+    _remote_identity_pk: &[u8; 32],
+    reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
+    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashMap;
+
+    struct ReceiveTransfer {
+        filename: String,
+        file_size: u64,
+        total_chunks: u32,
+        chunks: HashMap<u32, Vec<u8>>,
+    }
+    let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
+    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> =
+        HashMap::new();
+
+    DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    loop {
+        if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[QUIC_SESSION] {peer_addr} disconnect requested — closing");
+            break;
+        }
+
+        let frame_result = tokio::select! {
+            r = receiver.recv_message() => r,
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+        };
+
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(crate::quic_transport::QuicTransportError::Closed) => {
+                eprintln!("[QUIC_SESSION] {peer_addr} stream closed cleanly");
+                break;
+            }
+            Err(e) => {
+                eprintln!("[QUIC_SESSION] {peer_addr} read error: {e}");
+                break;
+            }
+        };
+
+        let (inner, btr_fields) = match decode_envelope_with_btr(&frame, session) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("[QUIC_SESSION] {peer_addr} envelope error: {e}");
+                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
+                let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
+                break;
+            }
+        };
+
+        match route_inner_message(&inner, session) {
+            Ok(Some(reply_bytes)) => {
+                let reply_text = String::from_utf8_lossy(&reply_bytes).into_owned();
+                if reply_tx.send(reply_text).is_err() {
+                    eprintln!("[QUIC_SESSION] {peer_addr} reply channel closed");
+                    break;
+                }
+            }
+            Ok(None) => {
+                if let Ok(dc_msg) = crate::dc_messages::parse_dc_message(&inner) {
+                    match dc_msg {
+                        crate::dc_messages::DcMessage::FileChunk {
+                            ref transfer_id,
+                            ref filename,
+                            chunk_index,
+                            total_chunks,
+                            ref chunk,
+                            file_size,
+                            ..
+                        } => {
+                            let data = if let Some(ref btr_env) = btr_fields {
+                                decrypt_chunk_btr(
+                                    transfer_id,
+                                    chunk,
+                                    chunk_index,
+                                    btr_env,
+                                    session,
+                                    peer_addr,
+                                    btr_engine,
+                                    &mut btr_receive_contexts,
+                                )
+                            } else {
+                                bolt_core::crypto::open_box_payload(
+                                    chunk,
+                                    &session.remote_public_key,
+                                    &session.local_keypair.secret_key,
+                                ).map_err(|e| e.to_string())
+                            };
+                            let data = match data {
+                                Ok(plaintext) => plaintext,
+                                Err(e) => {
+                                    eprintln!("[QUIC_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
+                                    continue;
+                                }
+                            };
+
+                            if !active_receives.contains_key(transfer_id) && file_size > MAX_TRANSFER_SIZE {
+                                eprintln!(
+                                    "[QUIC_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
+                                    filename, file_size, MAX_TRANSFER_SIZE
+                                );
+                                continue;
+                            }
+
+                            let rx = active_receives
+                                .entry(transfer_id.clone())
+                                .or_insert_with(|| {
+                                    let safe_name = match sanitize_filename(filename) {
+                                        Ok(name) => name,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[QUIC_TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {:?})",
+                                                filename
+                                            );
+                                            format!("received_{}", transfer_id)
+                                        }
+                                    };
+                                    eprintln!(
+                                        "[QUIC_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
+                                        safe_name, file_size, total_chunks
+                                    );
+                                    emit_ipc(ipc_tx, "transfer.started", serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "file_name": safe_name,
+                                        "file_size_bytes": file_size,
+                                        "direction": "receive",
+                                    }));
+                                    ReceiveTransfer {
+                                        filename: safe_name,
+                                        file_size,
+                                        total_chunks,
+                                        chunks: HashMap::new(),
+                                    }
+                                });
+                            rx.chunks.insert(chunk_index, data);
+
+                            let done = rx.chunks.len() as u32;
+                            let total = rx.total_chunks;
+                            if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                                let bytes_done = if rx.file_size > 0 {
+                                    (done as u64 * rx.file_size) / total as u64
+                                } else { 0 };
+                                let progress = if total > 0 { done as f32 / total as f32 } else { 1.0 };
+                                eprintln!(
+                                    "[QUIC_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
+                                    done, total, rx.filename
+                                );
+                                emit_ipc(ipc_tx, "transfer.progress", serde_json::json!({
+                                    "transfer_id": transfer_id,
+                                    "bytes_transferred": bytes_done,
+                                    "total_bytes": rx.file_size,
+                                    "progress": progress,
+                                }));
+                            }
+
+                            if rx.chunks.len() as u32 >= rx.total_chunks {
+                                let mut file_data = Vec::with_capacity(rx.file_size as usize);
+                                for i in 0..rx.total_chunks {
+                                    if let Some(c) = rx.chunks.get(&i) {
+                                        file_data.extend_from_slice(c);
+                                    }
+                                }
+                                let save_dir = format!(
+                                    "{}/Downloads",
+                                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+                                );
+                                let save_path = format!("{}/{}", save_dir, rx.filename);
+
+                                let canonical_dir = std::path::Path::new(&save_dir);
+                                let canonical_path = std::path::Path::new(&save_path);
+                                if !canonical_path.starts_with(canonical_dir) {
+                                    eprintln!(
+                                        "[QUIC_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
+                                        save_path, save_dir
+                                    );
+                                    active_receives.remove(transfer_id);
+                                    continue;
+                                }
+
+                                match std::fs::write(&save_path, &file_data) {
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "[QUIC_TRANSFER] {peer_addr} saved: {} ({} bytes) -> {}",
+                                            rx.filename, file_data.len(), save_path
+                                        );
+                                        emit_ipc(ipc_tx, "transfer.complete", serde_json::json!({
+                                            "transfer_id": transfer_id,
+                                            "file_name": rx.filename,
+                                            "bytes_transferred": file_data.len(),
+                                            "verified": false,
+                                            "save_path": save_path,
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[QUIC_TRANSFER] {peer_addr} save failed: {} - {}",
+                                            rx.filename, e
+                                        );
+                                        emit_ipc(ipc_tx, "transfer.error", serde_json::json!({
+                                            "transfer_id": transfer_id,
+                                            "file_name": rx.filename,
+                                            "reason": format!("{e}"),
+                                        }));
+                                    }
+                                }
+                                active_receives.remove(transfer_id);
+                                if btr_receive_contexts.remove(transfer_id).is_some() {
+                                    if let Ok(mut btr) = btr_engine.lock() {
+                                        if let Some(ref mut engine) = *btr {
+                                            engine.end_transfer();
+                                            eprintln!("[BTR_TRANSFER_COMPLETE] QUIC receive transfer context cleaned up");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[QUIC_SESSION] {peer_addr} route error: {e}");
+                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
+                let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
+                break;
+            }
+        }
+    }
+
+    eprintln!("[QUIC_SESSION] {peer_addr} message loop ended");
+    Ok(())
 }
 
 /// Post-HELLO envelope message loop.
@@ -1242,7 +1831,7 @@ async fn run_read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::encode_envelope;
+    use crate::envelope::{decode_envelope, encode_envelope};
     use bolt_core::crypto::generate_ephemeral_keypair;
     use bolt_core::identity::generate_identity_keypair;
     use tokio_tungstenite::connect_async;
@@ -1474,6 +2063,117 @@ mod tests {
         let _ = sink.close().await;
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quic_session_adapter_exchanges_hello_and_encrypted_ping() {
+        let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
+        let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
+        pin_set
+            .allow_hash_hex(client_cert.cert_hash_hex())
+            .unwrap();
+
+        let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
+            "127.0.0.1:0".parse().unwrap(),
+            pin_set,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let server_cert_hash = listener.cert_hash_hex().to_string();
+        let server_identity = generate_identity_keypair();
+        let client_identity = generate_identity_keypair();
+
+        let server_handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let result = handle_quic_framed_stream(
+                stream,
+                "127.0.0.1:0".parse().unwrap(),
+                &server_identity,
+                false,
+                None,
+            )
+            .await;
+            listener.close();
+            result
+        });
+
+        let (endpoint, stream) = crate::quic_transport::QuicDialer::connect_with_client_cert(
+            addr,
+            &server_cert_hash,
+            client_cert,
+        )
+        .await
+        .unwrap();
+        let (mut sender, mut receiver) = stream.into_split();
+
+        let client_session_kp = generate_ephemeral_keypair();
+        let client_session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        sender
+            .send_message(client_session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        let server_session_key_text =
+            quic_wait_for_text(&mut receiver, addr, "server session-key")
+                .await
+                .unwrap();
+        let server_session_key_json: serde_json::Value =
+            serde_json::from_str(&server_session_key_text).unwrap();
+        let server_session_pk = crate::web_hello::decode_public_key(
+            server_session_key_json["publicKey"].as_str().unwrap(),
+        )
+        .unwrap();
+
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        sender.send_message(hello_msg.as_bytes()).await.unwrap();
+
+        let hello_response = quic_wait_for_text(&mut receiver, addr, "HELLO response")
+            .await
+            .unwrap();
+        let hello_inner =
+            parse_hello_typed(hello_response.as_bytes(), &server_session_pk, &client_session_kp)
+                .unwrap();
+        let negotiated = negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
+        let client_session = SessionContext::new(
+            copy_keypair(&client_session_kp),
+            server_session_pk,
+            negotiated,
+        )
+        .unwrap();
+
+        let ping = crate::dc_messages::DcMessage::Ping { ts_ms: 1234567890 };
+        let ping_json = crate::dc_messages::encode_dc_message(&ping).unwrap();
+        let envelope = encode_envelope(&ping_json, &client_session).unwrap();
+        sender.send_message(&envelope).await.unwrap();
+
+        let pong_frame = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            receiver.recv_message(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pong_inner = decode_envelope(&pong_frame, &client_session).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&pong_inner).unwrap();
+        assert_eq!(parsed["type"], "pong");
+        assert_eq!(parsed["reply_to_ms"], 1234567890);
+
+        sender.finish().await.unwrap();
+        endpoint.close(0u32.into(), b"done");
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

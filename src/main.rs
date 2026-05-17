@@ -22,7 +22,7 @@ pub(crate) use bolt_daemon::{
 mod ice_filter;
 
 #[cfg(feature = "transport-quic")]
-mod quic_transport;
+pub(crate) use bolt_daemon::quic_transport;
 
 #[cfg(feature = "transport-ws")]
 pub(crate) use bolt_daemon::ws_endpoint;
@@ -497,13 +497,41 @@ fn main() {
                 let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 let signal_path = send_signal_path.clone();
+                #[cfg(feature = "transport-quic")]
+                let quic_identity_pk = identity.public_key;
+                #[cfg(feature = "transport-quic")]
+                let quic_identity_sk = identity.secret_key;
+                #[cfg(feature = "transport-quic")]
+                let quic_ipc_tx = ipc_event_tx.clone();
                 rt.block_on(async {
                     #[cfg(feature = "transport-quic")]
                     if let Some(quic_listener) = quic_listener {
                         tokio::spawn(async move {
-                            let _quic_listener = quic_listener;
                             loop {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                                match quic_listener.accept().await {
+                                    Ok(stream) => {
+                                        let identity = bolt_core::crypto::KeyPair {
+                                            public_key: quic_identity_pk,
+                                            secret_key: quic_identity_sk,
+                                        };
+                                        let ipc = quic_ipc_tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = ws_endpoint::handle_quic_framed_stream(
+                                                stream,
+                                                "0.0.0.0:0".parse().unwrap(),
+                                                &identity,
+                                                wt_enabled,
+                                                ipc.as_ref(),
+                                            ).await {
+                                                eprintln!("[QUIC_SESSION] error: {e}");
+                                            }
+                                        });
+                                    }
+                                    Err(quic_transport::QuicTransportError::Closed) => break,
+                                    Err(e) => {
+                                        eprintln!("[QUIC_SESSION] accept error: {e}");
+                                    }
+                                }
                             }
                         });
                     }

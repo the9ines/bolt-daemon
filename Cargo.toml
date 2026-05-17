@@ -24,6 +24,7 @@ path = "src/ipc_client_main.rs"
 [features]
 default = ["transport-ws"]
 test-support = []
+native-full = ["transport-ws", "transport-webtransport", "transport-quic"]
 transport-quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
 transport-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 transport-webtransport = ["dep:wtransport", "dep:tokio"]

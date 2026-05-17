@@ -1938,6 +1938,43 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    async fn wait_for_ipc_event(
+        rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
+        label: &str,
+        predicate: impl Fn(&crate::ipc::types::IpcMessage) -> bool,
+    ) -> crate::ipc::types::IpcMessage {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(msg) if predicate(&msg) => return msg,
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("IPC channel disconnected while waiting for {label}");
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for IPC event: {label}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_active_session_registered() {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if ACTIVE_SESSION.lock().unwrap().is_some() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for active session registration"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+    }
+
     #[test]
     fn session_trust_answerer_ask_without_pin_fails_closed() {
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -2447,6 +2484,196 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_err(), "server must fail closed on denied identity");
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quic_session_emits_ipc_transfer_events_for_send_and_receive() {
+        let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
+        let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
+        pin_set
+            .allow_hash_hex(client_cert.cert_hash_hex())
+            .unwrap();
+
+        let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
+            "127.0.0.1:0".parse().unwrap(),
+            pin_set,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let server_cert_hash = listener.cert_hash_hex().to_string();
+        let server_identity = generate_identity_keypair();
+        let client_identity = generate_identity_keypair();
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel();
+        *ACTIVE_SESSION.lock().unwrap() = None;
+        *IPC_TX.lock().unwrap() = Some(ipc_tx.clone());
+
+        let server_handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let result = handle_quic_framed_stream(
+                stream,
+                "127.0.0.1:0".parse().unwrap(),
+                &server_identity,
+                false,
+                Some(&ipc_tx),
+                None,
+            )
+            .await;
+            listener.close();
+            result
+        });
+
+        let (endpoint, stream) = crate::quic_transport::QuicDialer::connect_with_client_cert(
+            addr,
+            &server_cert_hash,
+            client_cert,
+        )
+        .await
+        .unwrap();
+        let (mut sender, mut receiver) = stream.into_split();
+
+        let client_session_kp = generate_ephemeral_keypair();
+        let client_session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        sender
+            .send_message(client_session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        let server_session_key_text =
+            quic_wait_for_text(&mut receiver, addr, "server session-key")
+                .await
+                .unwrap();
+        let server_session_key_json: serde_json::Value =
+            serde_json::from_str(&server_session_key_text).unwrap();
+        let server_session_pk = crate::web_hello::decode_public_key(
+            server_session_key_json["publicKey"].as_str().unwrap(),
+        )
+        .unwrap();
+
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        sender.send_message(hello_msg.as_bytes()).await.unwrap();
+
+        let hello_response = quic_wait_for_text(&mut receiver, addr, "HELLO response")
+            .await
+            .unwrap();
+        let hello_inner =
+            parse_hello_typed(hello_response.as_bytes(), &server_session_pk, &client_session_kp)
+                .unwrap();
+        let negotiated = negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
+        let client_session = SessionContext::new(
+            copy_keypair(&client_session_kp),
+            server_session_pk,
+            negotiated,
+        )
+        .unwrap();
+
+        wait_for_active_session_registered().await;
+
+        let send_dir = tempfile::tempdir().unwrap();
+        let send_filename = format!("quic-ipc-send-{}.txt", rand::random::<u64>());
+        let send_path = send_dir.path().join(&send_filename);
+        std::fs::write(&send_path, b"quic ipc send event smoke").unwrap();
+        let send_path_str = send_path.to_string_lossy().to_string();
+        tokio::task::spawn_blocking(move || send_file_to_browser(&send_path_str))
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_for_ipc_event(&ipc_rx, "send transfer.started", |msg| {
+            msg.msg_type == "transfer.started"
+                && msg.payload["direction"] == "send"
+                && msg.payload["file_name"] == send_filename
+        })
+        .await;
+        wait_for_ipc_event(&ipc_rx, "send transfer.progress", |msg| {
+            msg.msg_type == "transfer.progress" && msg.payload["total_bytes"].as_u64() == Some(25)
+        })
+        .await;
+        wait_for_ipc_event(&ipc_rx, "send transfer.complete", |msg| {
+            msg.msg_type == "transfer.complete"
+                && msg.payload["file_name"] == send_filename
+                && msg.payload["bytes_transferred"].as_u64() == Some(25)
+        })
+        .await;
+
+        let sent_frame = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            receiver.recv_message(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sent_inner = decode_envelope(&sent_frame, &client_session).unwrap();
+        let sent_msg = crate::dc_messages::parse_dc_message(&sent_inner).unwrap();
+        assert!(
+            matches!(sent_msg, crate::dc_messages::DcMessage::FileChunk { .. }),
+            "send path should deliver a file chunk over QUIC"
+        );
+
+        let recv_filename = format!("quic-ipc-receive-{}.txt", rand::random::<u64>());
+        let recv_payload = b"quic ipc receive event smoke";
+        let downloads_dir = format!(
+            "{}/Downloads",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+        );
+        std::fs::create_dir_all(&downloads_dir).unwrap();
+        let encrypted = bolt_core::crypto::seal_box_payload(
+            recv_payload,
+            &client_session.remote_public_key,
+            &client_session.local_keypair.secret_key,
+        )
+        .unwrap();
+        let transfer_id = format!("{:032x}", rand::random::<u128>());
+        let recv_msg = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id,
+            filename: recv_filename.clone(),
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk: encrypted,
+            file_size: recv_payload.len() as u64,
+            file_hash: None,
+        };
+        let recv_inner = crate::dc_messages::encode_dc_message(&recv_msg).unwrap();
+        let recv_envelope = encode_envelope(&recv_inner, &client_session).unwrap();
+        sender.send_message(&recv_envelope).await.unwrap();
+
+        wait_for_ipc_event(&ipc_rx, "receive transfer.started", |msg| {
+            msg.msg_type == "transfer.started"
+                && msg.payload["direction"] == "receive"
+                && msg.payload["file_name"] == recv_filename
+        })
+        .await;
+        wait_for_ipc_event(&ipc_rx, "receive transfer.progress", |msg| {
+            msg.msg_type == "transfer.progress"
+                && msg.payload["total_bytes"].as_u64() == Some(recv_payload.len() as u64)
+        })
+        .await;
+        let complete = wait_for_ipc_event(&ipc_rx, "receive transfer.complete", |msg| {
+            msg.msg_type == "transfer.complete"
+                && msg.payload["file_name"] == recv_filename
+                && msg.payload["bytes_transferred"].as_u64() == Some(recv_payload.len() as u64)
+        })
+        .await;
+        let save_path = complete.payload["save_path"].as_str().unwrap();
+        assert_eq!(std::fs::read(save_path).unwrap(), recv_payload);
+        let _ = std::fs::remove_file(save_path);
+
+        sender.finish().await.unwrap();
+        endpoint.close(0u32.into(), b"done");
+        *IPC_TX.lock().unwrap() = None;
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

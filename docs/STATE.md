@@ -46,7 +46,7 @@
 |-----------|--------|-------------|---------|
 | WebSocket (WS) | Active | `transport-ws` | Yes (default feature) |
 | WebTransport (WT/HTTP3) | Active | `transport-webtransport` | Optional |
-| QUIC | Reference | `transport-quic` | Optional |
+| QUIC | Production native↔native path in native builds | `transport-quic` / `native-full` | Optional daemon feature; enabled for native app sidecar |
 
 The `datachannel` and `webrtc-sdp` crates are no longer dependencies.
 `tests/ts-harness/` retains `node-datachannel` for cross-impl E2E testing only.
@@ -226,34 +226,31 @@ Daemon wire error codes aligned with PROTOCOL_ENFORCEMENT.md Appendix A:
 
 | Path | Status | Implementation |
 |------|--------|----------------|
-| WS client mode | Production (current) | `connect_to_remote_ws()` via `connect_remote.signal` |
-| QUIC (Q1/Q2D1) | Reference (strategic target, internal only) | `quic_transport.rs`; one-way dialer cert-hash pinning and mutual cert-hash primitives implemented; `transport-quic` WsEndpoint builds write `quic_info.json`; structured `connect_remote.signal` parsing accepts QUIC metadata but still falls back to WS |
+| QUIC | Production native↔native path in `native-full` builds | `quic_transport.rs` + WsEndpoint QUIC app-session adapter via structured `connect_remote.signal` |
+| WS client mode | Fallback | `connect_to_remote_ws()` via legacy plain WS signal or structured signal fallback |
 
-WS client mode is the active app↔app path. Initiator daemon connects as
-WS client to acceptor daemon's WS server. Discovery via rendezvous
-signaling (`wsUrl` in `connection_accepted` payload). Full Bolt security
-stack: session-key exchange, HELLO, ProfileEnvelopeV1, BTR when negotiated.
+QUIC is the production app↔app path for native builds that enable
+`native-full`. WsEndpoint binds the WS server and a QUIC listener, writes
+`quic_info.json`, consumes signaling-supplied `quicAddr` / `quicCertHash`
+metadata, feeds peer hashes into the dynamic listener allowlist, and routes
+complete structured `connect_remote.signal` payloads to QUIC first. The QUIC
+path uses mutual certificate-hash pinning; both sides present certificates and
+verify the peer hash from signaling. Mismatch fails closed. No production
+app↔app QUIC path may use `Rc3SkipVerification` or accept-any TLS verification.
 
-QUIC Q1 removed the dialer-side accept-any verifier from the internal RC3 path:
-the dialer now pins the listener certificate SHA-256 hash and fails closed on
-mismatch. Q2A added daemon-side metadata plumbing: in `transport-quic`
-WsEndpoint builds, the daemon binds a QUIC listener and writes
-`quic_info.json` containing `quic_port` and `quic_cert_hash` for future
-native-shell consumption. Q2C added internal mutual cert-hash pinning
-primitives: a listener can require a dialer client certificate hash, and a
-dialer can present its own certificate while pinning the listener certificate
-hash. Tests cover success, missing client cert fail-closed, and wrong client
-cert fail-closed. This is not production app-to-app QUIC. Production promotion
-remains blocked until APP-TO-APP-QUIC-MIGRATION-1 Q2 wires those primitives to
-rendezvous/localbolt-app metadata and production routing.
+QUIC sessions run the same app lifecycle as WS: session-key exchange, HELLO,
+ProfileEnvelopeV1, BTR file transfer, pairing trust-store enforcement, transfer
+IPC events, session lifecycle IPC events, disconnect propagation, and BTR state
+cleanup.
 
-Q2D1 added structured `connect_remote.signal` parsing. The daemon accepts the
-legacy plain `ws://...` signal and the forward JSON shape with `wsUrl`,
-`quicAddr`, and `quicCertHash`. When QUIC metadata is present, the daemon logs
-that the QUIC app-session bridge is not wired yet and uses the WS fallback.
-QUIC-only connect signals are rejected until Q2 routing lands.
+WS client mode remains the required fallback. The daemon still accepts legacy
+plain `ws://...` `connect_remote.signal` values, and structured signals fall
+back to WS when QUIC metadata is missing or QUIC connection setup fails.
 
-QUIC graduation tracked by APP-TO-APP-QUIC-MIGRATION-1 (bolt-ecosystem ROADMAP.md).
+Graduation evidence is tracked by APP-TO-APP-QUIC-MIGRATION-1 in
+`bolt-ecosystem/docs/ROADMAP.md`: Q1-Q5 are complete, including two-device
+QUIC/BTR smoke in both directions, WS fallback, disconnect propagation, pairing
+trust enforcement, static verifier guard, and QUIC-vs-WS throughput evidence.
 
 ## Architecture
 

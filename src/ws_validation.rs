@@ -45,10 +45,7 @@ pub fn sanitize_filename(raw: &str) -> Result<String, String> {
     }
 
     // Extract basename: last component after / or \
-    let basename = raw
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("");
+    let basename = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or("");
 
     // Reject empty
     if basename.is_empty() {
@@ -182,7 +179,10 @@ mod tests {
     #[test]
     fn sanitize_filename_normal() {
         assert_eq!(sanitize_filename("report.pdf").unwrap(), "report.pdf");
-        assert_eq!(sanitize_filename("my file (1).txt").unwrap(), "my file (1).txt");
+        assert_eq!(
+            sanitize_filename("my file (1).txt").unwrap(),
+            "my file (1).txt"
+        );
         assert_eq!(sanitize_filename("data.tar.gz").unwrap(), "data.tar.gz");
     }
 
@@ -196,9 +196,15 @@ mod tests {
 
     #[test]
     fn sanitize_filename_nested_paths_stripped_to_basename() {
-        assert_eq!(sanitize_filename("Documents/report.pdf").unwrap(), "report.pdf");
+        assert_eq!(
+            sanitize_filename("Documents/report.pdf").unwrap(),
+            "report.pdf"
+        );
         assert_eq!(sanitize_filename("a/b/c/d.txt").unwrap(), "d.txt");
-        assert_eq!(sanitize_filename("C:\\Users\\file.exe").unwrap(), "file.exe");
+        assert_eq!(
+            sanitize_filename("C:\\Users\\file.exe").unwrap(),
+            "file.exe"
+        );
         assert_eq!(sanitize_filename("/etc/shadow").unwrap(), "shadow");
     }
 
@@ -239,7 +245,9 @@ mod tests {
             assert!(
                 path.starts_with(dir),
                 "Sanitized path {:?} must be inside {:?} (raw: {:?})",
-                full_path, save_dir, raw
+                full_path,
+                save_dir,
+                raw
             );
         }
     }

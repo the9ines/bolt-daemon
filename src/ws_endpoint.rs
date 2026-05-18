@@ -46,13 +46,15 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 
 // Validation functions extracted to ws_validation (MODULARITY-AUDITABILITY-2).
-use crate::ws_validation::{sanitize_filename, parse_transfer_id_bytes, MAX_TRANSFER_SIZE};
 pub use crate::ws_validation::validate_send_file_path;
+use crate::ws_validation::{parse_transfer_id_bytes, sanitize_filename, MAX_TRANSFER_SIZE};
 
 // BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
-use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
-use crate::ipc::trust::{enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult, TrustStore};
+use crate::ipc::trust::{
+    enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult, TrustStore,
+};
 use crate::ipc::types::Decision;
+use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
 
 // ── IPC event emission helper ─────────────────────────────────
 
@@ -91,22 +93,24 @@ fn enforce_session_trust(
 
     let stage_a_decision = match role {
         SessionTrustRole::Offerer => None,
-        SessionTrustRole::Answerer => match config.pairing_policy {
-            PairingPolicy::Allow => Some(Decision::AllowOnce),
-            PairingPolicy::Deny => {
-                eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=deny identity={identity_hex}");
-                return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} policy denied identity {identity_hex}").into());
-            }
-            PairingPolicy::Ask => {
-                let store = TrustStore::load(&config.trust_path);
-                if store.get(&identity_hex).is_some() {
-                    None
-                } else {
-                    eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask has no Stage A decision for identity={identity_hex}");
-                    return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} missing Stage A approval for identity {identity_hex}").into());
+        SessionTrustRole::Answerer => {
+            match config.pairing_policy {
+                PairingPolicy::Allow => Some(Decision::AllowOnce),
+                PairingPolicy::Deny => {
+                    eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=deny identity={identity_hex}");
+                    return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} policy denied identity {identity_hex}").into());
+                }
+                PairingPolicy::Ask => {
+                    let store = TrustStore::load(&config.trust_path);
+                    if store.get(&identity_hex).is_some() {
+                        None
+                    } else {
+                        eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask has no Stage A decision for identity={identity_hex}");
+                        return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} missing Stage A approval for identity {identity_hex}").into());
+                    }
                 }
             }
-        },
+        }
     };
 
     match enforce_stage_b(&config.trust_path, &identity_hex, stage_a_decision) {
@@ -116,7 +120,10 @@ fn enforce_session_trust(
         }
         StageBResult::Deny => {
             eprintln!("[PAIRING_DENIED] {transport} {peer_addr} identity={identity_hex}");
-            Err(format!("[PAIRING_DENIED] {transport} {peer_addr} trust denied identity {identity_hex}").into())
+            Err(format!(
+                "[PAIRING_DENIED] {transport} {peer_addr} trust denied identity {identity_hex}"
+            )
+            .into())
         }
     }
 }
@@ -150,7 +157,8 @@ pub struct ActiveSessionHandle {
 
 /// Global active session — set when a browser connects and HELLO completes,
 /// cleared when the session ends. Protected by std Mutex for cross-thread access.
-pub(crate) static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> = std::sync::Mutex::new(None);
+pub(crate) static ACTIVE_SESSION: std::sync::Mutex<Option<ActiveSessionHandle>> =
+    std::sync::Mutex::new(None);
 
 /// Request to close the active session from outside the WS task (e.g., UI disconnect).
 /// The message loop checks this flag and breaks if set.
@@ -184,7 +192,8 @@ pub fn request_resume() {
 
 /// Global IPC event sender — set when WS endpoint starts with IPC wired.
 /// Used by send_file_to_browser to emit transfer events from the signal-file thread.
-static IPC_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>> = std::sync::Mutex::new(None);
+static IPC_TX: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>> =
+    std::sync::Mutex::new(None);
 
 /// Send a file to the connected browser peer via the active session.
 /// Called from the IPC thread (synchronous). Returns error if no active session.
@@ -208,8 +217,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     };
 
     // Get file size from metadata (no full read)
-    let metadata = std::fs::metadata(file_path)
-        .map_err(|e| format!("metadata: {e}"))?;
+    let metadata = std::fs::metadata(file_path).map_err(|e| format!("metadata: {e}"))?;
     let file_size = metadata.len();
     let filename = std::path::Path::new(file_path)
         .file_name()
@@ -227,21 +235,23 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     );
 
     // Emit transfer.started
-    emit_ipc_global("transfer.started", serde_json::json!({
-        "transfer_id": transfer_id,
-        "file_name": filename,
-        "file_size_bytes": file_size,
-        "direction": "send",
-    }));
+    emit_ipc_global(
+        "transfer.started",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "file_name": filename,
+            "file_size_bytes": file_size,
+            "direction": "send",
+        }),
+    );
 
     // Open file for streaming reads
-    let mut file = std::fs::File::open(file_path)
-        .map_err(|e| format!("open file: {e}"))?;
+    let mut file = std::fs::File::open(file_path).map_err(|e| format!("open file: {e}"))?;
     let mut chunk_buf = vec![0u8; chunk_size];
 
     // Begin BTR send transfer if engine is available
-    let transfer_id_bytes = parse_transfer_id_bytes(&transfer_id)
-        .map_err(|e| format!("transfer_id parse: {e}"))?;
+    let transfer_id_bytes =
+        parse_transfer_id_bytes(&transfer_id).map_err(|e| format!("transfer_id parse: {e}"))?;
     let mut btr_guard = btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
     let mut btr_send = if let Some(ref mut engine) = *btr_guard {
         match engine.begin_transfer_send(&transfer_id_bytes, &session.remote_public_key) {
@@ -274,39 +284,43 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         }
 
         // Read next chunk from file — bounded memory
-        let bytes_read = file.read(&mut chunk_buf)
+        let bytes_read = file
+            .read(&mut chunk_buf)
             .map_err(|e| format!("read chunk {i}: {e}"))?;
         if bytes_read == 0 {
             break;
         }
         let chunk_data = &chunk_buf[..bytes_read];
-        let (encrypted, btr_env_fields) = if let Some((ref mut ctx, ref ratchet_pub, gen)) = btr_send {
-            // BTR: seal with ratcheted symmetric key
-            let (chain_idx, sealed) = ctx.seal_chunk(chunk_data)
-                .map_err(|e| format!("btr seal: {e}"))?;
-            let chunk_b64 = bolt_core::encoding::to_base64(&sealed);
+        let (encrypted, btr_env_fields) =
+            if let Some((ref mut ctx, ref ratchet_pub, gen)) = btr_send {
+                // BTR: seal with ratcheted symmetric key
+                let (chain_idx, sealed) = ctx
+                    .seal_chunk(chunk_data)
+                    .map_err(|e| format!("btr seal: {e}"))?;
+                let chunk_b64 = bolt_core::encoding::to_base64(&sealed);
 
-            // Build BTR envelope fields
-            let fields = crate::envelope::BtrEnvelopeFields {
-                chain_index: chain_idx,
-                // First chunk: include ratchet public key and generation
-                ratchet_public_key: if chain_idx == 0 {
-                    Some(bolt_core::encoding::to_base64(ratchet_pub))
-                } else {
-                    None
-                },
-                ratchet_generation: if chain_idx == 0 { Some(gen) } else { None },
+                // Build BTR envelope fields
+                let fields = crate::envelope::BtrEnvelopeFields {
+                    chain_index: chain_idx,
+                    // First chunk: include ratchet public key and generation
+                    ratchet_public_key: if chain_idx == 0 {
+                        Some(bolt_core::encoding::to_base64(ratchet_pub))
+                    } else {
+                        None
+                    },
+                    ratchet_generation: if chain_idx == 0 { Some(gen) } else { None },
+                };
+                (chunk_b64, Some(fields))
+            } else {
+                // Static NaCl box (no BTR)
+                let encrypted = bolt_core::crypto::seal_box_payload(
+                    chunk_data,
+                    &session.remote_public_key,
+                    &session.local_keypair.secret_key,
+                )
+                .map_err(|e| format!("encrypt chunk: {e}"))?;
+                (encrypted, None)
             };
-            (chunk_b64, Some(fields))
-        } else {
-            // Static NaCl box (no BTR)
-            let encrypted = bolt_core::crypto::seal_box_payload(
-                chunk_data,
-                &session.remote_public_key,
-                &session.local_keypair.secret_key,
-            ).map_err(|e| format!("encrypt chunk: {e}"))?;
-            (encrypted, None)
-        };
 
         // Build file-chunk inner message
         let msg = crate::dc_messages::DcMessage::FileChunk {
@@ -318,8 +332,8 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
             file_size,
             file_hash: None,
         };
-        let inner_json = crate::dc_messages::encode_dc_message(&msg)
-            .map_err(|e| format!("encode: {e}"))?;
+        let inner_json =
+            crate::dc_messages::encode_dc_message(&msg).map_err(|e| format!("encode: {e}"))?;
 
         // Wrap in profile envelope — with or without BTR fields
         let envelope = if let Some(ref fields) = btr_env_fields {
@@ -331,7 +345,8 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         };
         let text = String::from_utf8_lossy(&envelope).into_owned();
 
-        outbound_tx.send(text)
+        outbound_tx
+            .send(text)
             .map_err(|_| "session closed".to_string())?;
 
         // Emit progress for UI consumption — throttled to avoid blocking async
@@ -340,17 +355,24 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         if done == 1 || done == total_chunks || done % (total_chunks / 20).max(1) == 0 {
             let bytes_done = (done as u64).min(total_chunks as u64) * chunk_size as u64;
             let bytes_done = bytes_done.min(file_size);
-            let progress = if file_size > 0 { bytes_done as f32 / file_size as f32 } else { 1.0 };
+            let progress = if file_size > 0 {
+                bytes_done as f32 / file_size as f32
+            } else {
+                1.0
+            };
             eprintln!(
                 "[WS_TRANSFER] progress: {}/{} chunks ({})",
                 done, total_chunks, filename
             );
-            emit_ipc_global("transfer.progress", serde_json::json!({
-                "transfer_id": transfer_id,
-                "bytes_transferred": bytes_done,
-                "total_bytes": file_size,
-                "progress": progress,
-            }));
+            emit_ipc_global(
+                "transfer.progress",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "bytes_transferred": bytes_done,
+                    "total_bytes": file_size,
+                    "progress": progress,
+                }),
+            );
         }
     }
 
@@ -364,15 +386,21 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         }
     }
 
-    eprintln!("[WS_TRANSFER] all {} chunks queued for {}", total_chunks, filename);
+    eprintln!(
+        "[WS_TRANSFER] all {} chunks queued for {}",
+        total_chunks, filename
+    );
 
     // Emit transfer.complete
-    emit_ipc_global("transfer.complete", serde_json::json!({
-        "transfer_id": transfer_id,
-        "file_name": filename,
-        "bytes_transferred": file_size,
-        "verified": false,
-    }));
+    emit_ipc_global(
+        "transfer.complete",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "file_name": filename,
+            "bytes_transferred": file_size,
+            "verified": false,
+        }),
+    );
 
     Ok(())
 }
@@ -436,7 +464,8 @@ pub async fn connect_to_remote_ws(
     use tokio_tungstenite::connect_async;
 
     eprintln!("[WS_CLIENT] connecting to {url}");
-    let (ws_stream, _) = connect_async(url).await
+    let (ws_stream, _) = connect_async(url)
+        .await
         .map_err(|e| format!("[WS_CLIENT] connect failed: {e}"))?;
     eprintln!("[WS_CLIENT] connected to {url}");
 
@@ -491,13 +520,14 @@ pub async fn connect_to_remote_ws(
         .unwrap_or(false);
 
     let (negotiated, remote_identity_pk, sas) = if is_legacy {
-        let legacy_caps: Vec<String> = serde_json::from_str::<serde_json::Value>(&hello_response_raw)
-            .ok()
-            .and_then(|v| v.get("capabilities")?.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        let legacy_caps: Vec<String> =
+            serde_json::from_str::<serde_json::Value>(&hello_response_raw)
+                .ok()
+                .and_then(|v| v.get("capabilities")?.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         let local_caps = daemon_capabilities(wt_enabled);
         let negotiated = negotiate_capabilities(&local_caps, &legacy_caps);
         eprintln!("[WS_CLIENT] legacy HELLO response, caps={negotiated:?}");
@@ -513,8 +543,9 @@ pub async fn connect_to_remote_ws(
 
         let local_caps = daemon_capabilities(wt_enabled);
         let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
-        let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
-            .map_err(|e| format!("[WS_CLIENT] invalid remote identity key: {e}"))?;
+        let remote_identity_pk =
+            crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
+                .map_err(|e| format!("[WS_CLIENT] invalid remote identity key: {e}"))?;
         enforce_session_trust(
             trust_config.as_ref(),
             SessionTrustRole::Offerer,
@@ -544,22 +575,35 @@ pub async fn connect_to_remote_ws(
 
     // Emit session events to IPC
     let remote_pk_b64_identity = bolt_core::encoding::to_base64(&remote_identity_pk);
-    emit_ipc(ipc_tx.as_ref(), "session.connected", serde_json::json!({
-        "remote_peer_id": remote_pk_b64_identity,
-        "negotiated_capabilities": negotiated,
-    }));
+    emit_ipc(
+        ipc_tx.as_ref(),
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": remote_pk_b64_identity,
+            "negotiated_capabilities": negotiated,
+        }),
+    );
     if !sas.is_empty() {
-        emit_ipc(ipc_tx.as_ref(), "session.sas", serde_json::json!({
-            "sas": sas,
-            "remote_identity_pk_b64": remote_pk_b64_identity,
-        }));
+        emit_ipc(
+            ipc_tx.as_ref(),
+            "session.sas",
+            serde_json::json!({
+                "sas": sas,
+                "remote_identity_pk_b64": remote_pk_b64_identity,
+            }),
+        );
     }
 
     eprintln!("[WS_CLIENT] session established, entering message loop");
 
     // Enter the same message loop as server connections
     run_session_with_outbound(
-        ws_sink, ws_source, session, "0.0.0.0:0".parse().unwrap(), remote_identity_pk, ipc_tx.as_ref(),
+        ws_sink,
+        ws_source,
+        session,
+        "0.0.0.0:0".parse().unwrap(),
+        remote_identity_pk,
+        ipc_tx.as_ref(),
     )
     .await
 }
@@ -663,14 +707,22 @@ pub async fn connect_to_remote_quic(
     .map_err(|e| format!("[QUIC_CLIENT] failed to create session: {e}"))?;
 
     let remote_pk_b64_identity = bolt_core::encoding::to_base64(&remote_identity_pk);
-    emit_ipc(ipc_tx.as_ref(), "session.connected", serde_json::json!({
-        "remote_peer_id": remote_pk_b64_identity,
-        "negotiated_capabilities": negotiated,
-    }));
-    emit_ipc(ipc_tx.as_ref(), "session.sas", serde_json::json!({
-        "sas": sas,
-        "remote_identity_pk_b64": remote_pk_b64_identity,
-    }));
+    emit_ipc(
+        ipc_tx.as_ref(),
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": remote_pk_b64_identity,
+            "negotiated_capabilities": negotiated,
+        }),
+    );
+    emit_ipc(
+        ipc_tx.as_ref(),
+        "session.sas",
+        serde_json::json!({
+            "sas": sas,
+            "remote_identity_pk_b64": remote_pk_b64_identity,
+        }),
+    );
 
     let result = run_quic_session_with_outbound(
         sender,
@@ -712,7 +764,9 @@ pub async fn handle_quic_framed_stream(
     let value: serde_json::Value = serde_json::from_str(&first_frame)
         .map_err(|_| format!("[QUIC_HELLO] {peer_addr} first frame is not valid JSON"))?;
     if value.get("type").and_then(|v| v.as_str()) != Some("session-key") {
-        return Err(format!("[QUIC_HELLO] {peer_addr} expected session-key frame before HELLO").into());
+        return Err(
+            format!("[QUIC_HELLO] {peer_addr} expected session-key frame before HELLO").into(),
+        );
     }
     let remote_pk_b64 = value
         .get("publicKey")
@@ -780,14 +834,22 @@ pub async fn handle_quic_framed_stream(
     eprintln!("[SAS] {sas}");
 
     let remote_pk_b64 = bolt_core::encoding::to_base64(&remote_identity_pk);
-    emit_ipc(ipc_tx, "session.connected", serde_json::json!({
-        "remote_peer_id": remote_pk_b64,
-        "negotiated_capabilities": negotiated,
-    }));
-    emit_ipc(ipc_tx, "session.sas", serde_json::json!({
-        "sas": sas,
-        "remote_identity_pk_b64": remote_pk_b64,
-    }));
+    emit_ipc(
+        ipc_tx,
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": remote_pk_b64,
+            "negotiated_capabilities": negotiated,
+        }),
+    );
+    emit_ipc(
+        ipc_tx,
+        "session.sas",
+        serde_json::json!({
+            "sas": sas,
+            "remote_identity_pk_b64": remote_pk_b64,
+        }),
+    );
 
     eprintln!("[QUIC_SESSION] {peer_addr} session established, entering message loop");
     run_quic_session_with_outbound(
@@ -997,7 +1059,9 @@ async fn handle_connection(
         ws_sink
             .send(Message::Text(legacy_response.to_string()))
             .await
-            .map_err(|e| format!("[WS_HELLO] {peer_addr} failed to send legacy HELLO response: {e}"))?;
+            .map_err(|e| {
+                format!("[WS_HELLO] {peer_addr} failed to send legacy HELLO response: {e}")
+            })?;
         eprintln!("[WS_HELLO] {peer_addr} sent legacy HELLO response");
 
         let session = SessionContext::new(
@@ -1010,14 +1074,24 @@ async fn handle_connection(
         eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
 
         // Emit session.connected (legacy — no SAS)
-        emit_ipc(ipc_tx, "session.connected", serde_json::json!({
-            "remote_peer_id": "(legacy)",
-            "negotiated_capabilities": negotiated,
-        }));
+        emit_ipc(
+            ipc_tx,
+            "session.connected",
+            serde_json::json!({
+                "remote_peer_id": "(legacy)",
+                "negotiated_capabilities": negotiated,
+            }),
+        );
 
         return run_session_with_outbound(
-            ws_sink, ws_source, session, peer_addr, remote_session_pk, ipc_tx,
-        ).await;
+            ws_sink,
+            ws_source,
+            session,
+            peer_addr,
+            remote_session_pk,
+            ipc_tx,
+        )
+        .await;
     }
 
     // ── Step 4b: Parse and decrypt HELLO (identity mode) ────
@@ -1083,20 +1157,33 @@ async fn handle_connection(
 
     // Emit session.connected + session.sas to IPC
     let remote_pk_b64 = bolt_core::encoding::to_base64(&remote_identity_pk);
-    emit_ipc(ipc_tx, "session.connected", serde_json::json!({
-        "remote_peer_id": remote_pk_b64,
-        "negotiated_capabilities": negotiated,
-    }));
-    emit_ipc(ipc_tx, "session.sas", serde_json::json!({
-        "sas": sas,
-        "remote_identity_pk_b64": remote_pk_b64,
-    }));
+    emit_ipc(
+        ipc_tx,
+        "session.connected",
+        serde_json::json!({
+            "remote_peer_id": remote_pk_b64,
+            "negotiated_capabilities": negotiated,
+        }),
+    );
+    emit_ipc(
+        ipc_tx,
+        "session.sas",
+        serde_json::json!({
+            "sas": sas,
+            "remote_identity_pk_b64": remote_pk_b64,
+        }),
+    );
 
     eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
 
     // ── Step 8: Envelope message loop ────────────────────────
     run_session_with_outbound(
-        ws_sink, ws_source, session, peer_addr, remote_identity_pk, ipc_tx,
+        ws_sink,
+        ws_source,
+        session,
+        peer_addr,
+        remote_identity_pk,
+        ipc_tx,
     )
     .await
 }
@@ -1142,9 +1229,7 @@ async fn wait_for_hello(
         Err(err)
     })
     .await
-    .map_err(|_| -> BoxErr {
-        format!("[WS_HELLO] {peer_addr} HELLO timeout (30s)").into()
-    })??;
+    .map_err(|_| -> BoxErr { format!("[WS_HELLO] {peer_addr} HELLO timeout (30s)").into() })??;
     Ok(msg)
 }
 
@@ -1246,14 +1331,22 @@ async fn run_quic_session_with_outbound(
 
     match &result {
         Ok(()) => {
-            emit_ipc(ipc_tx, "session.ended", serde_json::json!({
-                "reason": "connection closed",
-            }));
+            emit_ipc(
+                ipc_tx,
+                "session.ended",
+                serde_json::json!({
+                    "reason": "connection closed",
+                }),
+            );
         }
         Err(e) => {
-            emit_ipc(ipc_tx, "session.error", serde_json::json!({
-                "reason": format!("{e}"),
-            }));
+            emit_ipc(
+                ipc_tx,
+                "session.error",
+                serde_json::json!({
+                    "reason": format!("{e}"),
+                }),
+            );
         }
     }
 
@@ -1369,7 +1462,8 @@ async fn run_quic_read_loop(
                                     chunk,
                                     &session.remote_public_key,
                                     &session.local_keypair.secret_key,
-                                ).map_err(|e| e.to_string())
+                                )
+                                .map_err(|e| e.to_string())
                             };
                             let data = match data {
                                 Ok(plaintext) => plaintext,
@@ -1379,7 +1473,9 @@ async fn run_quic_read_loop(
                                 }
                             };
 
-                            if !active_receives.contains_key(transfer_id) && file_size > MAX_TRANSFER_SIZE {
+                            if !active_receives.contains_key(transfer_id)
+                                && file_size > MAX_TRANSFER_SIZE
+                            {
                                 eprintln!(
                                     "[QUIC_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
                                     filename, file_size, MAX_TRANSFER_SIZE
@@ -1424,18 +1520,28 @@ async fn run_quic_read_loop(
                             if done == 1 || done == total || done % (total / 20).max(1) == 0 {
                                 let bytes_done = if rx.file_size > 0 {
                                     (done as u64 * rx.file_size) / total as u64
-                                } else { 0 };
-                                let progress = if total > 0 { done as f32 / total as f32 } else { 1.0 };
+                                } else {
+                                    0
+                                };
+                                let progress = if total > 0 {
+                                    done as f32 / total as f32
+                                } else {
+                                    1.0
+                                };
                                 eprintln!(
                                     "[QUIC_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                     done, total, rx.filename
                                 );
-                                emit_ipc(ipc_tx, "transfer.progress", serde_json::json!({
-                                    "transfer_id": transfer_id,
-                                    "bytes_transferred": bytes_done,
-                                    "total_bytes": rx.file_size,
-                                    "progress": progress,
-                                }));
+                                emit_ipc(
+                                    ipc_tx,
+                                    "transfer.progress",
+                                    serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "bytes_transferred": bytes_done,
+                                        "total_bytes": rx.file_size,
+                                        "progress": progress,
+                                    }),
+                                );
                             }
 
                             if rx.chunks.len() as u32 >= rx.total_chunks {
@@ -1468,24 +1574,32 @@ async fn run_quic_read_loop(
                                             "[QUIC_TRANSFER] {peer_addr} saved: {} ({} bytes) -> {}",
                                             rx.filename, file_data.len(), save_path
                                         );
-                                        emit_ipc(ipc_tx, "transfer.complete", serde_json::json!({
-                                            "transfer_id": transfer_id,
-                                            "file_name": rx.filename,
-                                            "bytes_transferred": file_data.len(),
-                                            "verified": false,
-                                            "save_path": save_path,
-                                        }));
+                                        emit_ipc(
+                                            ipc_tx,
+                                            "transfer.complete",
+                                            serde_json::json!({
+                                                "transfer_id": transfer_id,
+                                                "file_name": rx.filename,
+                                                "bytes_transferred": file_data.len(),
+                                                "verified": false,
+                                                "save_path": save_path,
+                                            }),
+                                        );
                                     }
                                     Err(e) => {
                                         eprintln!(
                                             "[QUIC_TRANSFER] {peer_addr} save failed: {} - {}",
                                             rx.filename, e
                                         );
-                                        emit_ipc(ipc_tx, "transfer.error", serde_json::json!({
-                                            "transfer_id": transfer_id,
-                                            "file_name": rx.filename,
-                                            "reason": format!("{e}"),
-                                        }));
+                                        emit_ipc(
+                                            ipc_tx,
+                                            "transfer.error",
+                                            serde_json::json!({
+                                                "transfer_id": transfer_id,
+                                                "file_name": rx.filename,
+                                                "reason": format!("{e}"),
+                                            }),
+                                        );
                                     }
                                 }
                                 active_receives.remove(transfer_id);
@@ -1541,7 +1655,10 @@ async fn run_session_with_outbound(
             &session.remote_public_key,
         );
         let engine = bolt_btr::BtrEngine::new(&shared_secret);
-        eprintln!("[BTR] {peer_addr} engine initialized (generation={})", engine.ratchet_generation());
+        eprintln!(
+            "[BTR] {peer_addr} engine initialized (generation={})",
+            engine.ratchet_generation()
+        );
         Some(engine)
     } else {
         eprintln!("[BTR] {peer_addr} BTR not negotiated — static NaCl box mode");
@@ -1596,19 +1713,36 @@ async fn run_session_with_outbound(
     });
 
     // Read loop
-    let result = run_read_loop(&mut ws_source, &session, peer_addr, &remote_pk, &reply_tx, &btr_engine_arc, ipc_tx).await;
+    let result = run_read_loop(
+        &mut ws_source,
+        &session,
+        peer_addr,
+        &remote_pk,
+        &reply_tx,
+        &btr_engine_arc,
+        ipc_tx,
+    )
+    .await;
 
     // Emit session lifecycle event based on read loop result
     match &result {
         Ok(()) => {
-            emit_ipc(ipc_tx, "session.ended", serde_json::json!({
-                "reason": "connection closed",
-            }));
+            emit_ipc(
+                ipc_tx,
+                "session.ended",
+                serde_json::json!({
+                    "reason": "connection closed",
+                }),
+            );
         }
         Err(e) => {
-            emit_ipc(ipc_tx, "session.error", serde_json::json!({
-                "reason": format!("{e}"),
-            }));
+            emit_ipc(
+                ipc_tx,
+                "session.error",
+                serde_json::json!({
+                    "reason": format!("{e}"),
+                }),
+            );
         }
     }
 
@@ -1659,7 +1793,8 @@ async fn run_read_loop(
     // BTR receive contexts keyed by transfer_id.
     // Tuple: (BtrTransferContext, generation) — generation captured from first chunk
     // and used for replay guard checks on subsequent chunks that omit ratchet_generation.
-    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> = HashMap::new();
+    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> =
+        HashMap::new();
 
     // Clear any stale disconnect request before entering the loop
     DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1695,9 +1830,7 @@ async fn run_read_loop(
                         eprintln!("[WS_SESSION] {peer_addr} envelope error: {e}");
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
-                        let _ = reply_tx.send(
-                            String::from_utf8_lossy(&error_payload).into_owned(),
-                        );
+                        let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
                         break;
                     }
                 };
@@ -1743,7 +1876,8 @@ async fn run_read_loop(
                                             chunk,
                                             &session.remote_public_key,
                                             &session.local_keypair.secret_key,
-                                        ).map_err(|e| e.to_string())
+                                        )
+                                        .map_err(|e| e.to_string())
                                     };
                                     let data = match data {
                                         Ok(plaintext) => plaintext,
@@ -1753,7 +1887,9 @@ async fn run_read_loop(
                                         }
                                     };
                                     // Reject oversized transfers on first chunk
-                                    if !active_receives.contains_key(transfer_id) && file_size > MAX_TRANSFER_SIZE {
+                                    if !active_receives.contains_key(transfer_id)
+                                        && file_size > MAX_TRANSFER_SIZE
+                                    {
                                         eprintln!(
                                             "[WS_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
                                             filename, file_size, MAX_TRANSFER_SIZE
@@ -1799,27 +1935,39 @@ async fn run_read_loop(
                                     // Emit progress for UI — throttled to ~5% intervals
                                     let done = rx.chunks.len() as u32;
                                     let total = rx.total_chunks;
-                                    if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                                    if done == 1 || done == total || done % (total / 20).max(1) == 0
+                                    {
                                         let bytes_done = if rx.file_size > 0 {
                                             (done as u64 * rx.file_size) / total as u64
-                                        } else { 0 };
-                                        let progress = if total > 0 { done as f32 / total as f32 } else { 1.0 };
+                                        } else {
+                                            0
+                                        };
+                                        let progress = if total > 0 {
+                                            done as f32 / total as f32
+                                        } else {
+                                            1.0
+                                        };
                                         eprintln!(
                                             "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                             done, total, rx.filename
                                         );
-                                        emit_ipc(ipc_tx, "transfer.progress", serde_json::json!({
-                                            "transfer_id": transfer_id,
-                                            "bytes_transferred": bytes_done,
-                                            "total_bytes": rx.file_size,
-                                            "progress": progress,
-                                        }));
+                                        emit_ipc(
+                                            ipc_tx,
+                                            "transfer.progress",
+                                            serde_json::json!({
+                                                "transfer_id": transfer_id,
+                                                "bytes_transferred": bytes_done,
+                                                "total_bytes": rx.file_size,
+                                                "progress": progress,
+                                            }),
+                                        );
                                     }
 
                                     // Check if all chunks received
                                     if rx.chunks.len() as u32 >= rx.total_chunks {
                                         // Assemble and save file
-                                        let mut file_data = Vec::with_capacity(rx.file_size as usize);
+                                        let mut file_data =
+                                            Vec::with_capacity(rx.file_size as usize);
                                         for i in 0..rx.total_chunks {
                                             if let Some(c) = rx.chunks.get(&i) {
                                                 file_data.extend_from_slice(c);
@@ -1849,24 +1997,32 @@ async fn run_read_loop(
                                                     "[WS_TRANSFER] {peer_addr} saved: {} ({} bytes) → {}",
                                                     rx.filename, file_data.len(), save_path
                                                 );
-                                                emit_ipc(ipc_tx, "transfer.complete", serde_json::json!({
-                                                    "transfer_id": transfer_id,
-                                                    "file_name": rx.filename,
-                                                    "bytes_transferred": file_data.len(),
-                                                    "verified": false,
-                                                    "save_path": save_path,
-                                                }));
+                                                emit_ipc(
+                                                    ipc_tx,
+                                                    "transfer.complete",
+                                                    serde_json::json!({
+                                                        "transfer_id": transfer_id,
+                                                        "file_name": rx.filename,
+                                                        "bytes_transferred": file_data.len(),
+                                                        "verified": false,
+                                                        "save_path": save_path,
+                                                    }),
+                                                );
                                             }
                                             Err(e) => {
                                                 eprintln!(
                                                     "[WS_TRANSFER] {peer_addr} save failed: {} — {}",
                                                     rx.filename, e
                                                 );
-                                                emit_ipc(ipc_tx, "transfer.error", serde_json::json!({
-                                                    "transfer_id": transfer_id,
-                                                    "file_name": rx.filename,
-                                                    "reason": format!("{e}"),
-                                                }));
+                                                emit_ipc(
+                                                    ipc_tx,
+                                                    "transfer.error",
+                                                    serde_json::json!({
+                                                        "transfer_id": transfer_id,
+                                                        "file_name": rx.filename,
+                                                        "reason": format!("{e}"),
+                                                    }),
+                                                );
                                             }
                                         }
                                         active_receives.remove(transfer_id);
@@ -1889,9 +2045,7 @@ async fn run_read_loop(
                         eprintln!("[WS_SESSION] {peer_addr} route error: {e}");
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
-                        let _ = reply_tx.send(
-                            String::from_utf8_lossy(&error_payload).into_owned(),
-                        );
+                        let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
                         break;
                     }
                 }
@@ -2278,9 +2432,7 @@ mod tests {
     async fn quic_session_adapter_exchanges_hello_and_encrypted_ping() {
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
-        pin_set
-            .allow_hash_hex(client_cert.cert_hash_hex())
-            .unwrap();
+        pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
 
         let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
             "127.0.0.1:0".parse().unwrap(),
@@ -2326,10 +2478,9 @@ mod tests {
             .await
             .unwrap();
 
-        let server_session_key_text =
-            quic_wait_for_text(&mut receiver, addr, "server session-key")
-                .await
-                .unwrap();
+        let server_session_key_text = quic_wait_for_text(&mut receiver, addr, "server session-key")
+            .await
+            .unwrap();
         let server_session_key_json: serde_json::Value =
             serde_json::from_str(&server_session_key_text).unwrap();
         let server_session_pk = crate::web_hello::decode_public_key(
@@ -2348,10 +2499,14 @@ mod tests {
         let hello_response = quic_wait_for_text(&mut receiver, addr, "HELLO response")
             .await
             .unwrap();
-        let hello_inner =
-            parse_hello_typed(hello_response.as_bytes(), &server_session_pk, &client_session_kp)
-                .unwrap();
-        let negotiated = negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
+        let hello_inner = parse_hello_typed(
+            hello_response.as_bytes(),
+            &server_session_pk,
+            &client_session_kp,
+        )
+        .unwrap();
+        let negotiated =
+            negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
         let client_session = SessionContext::new(
             copy_keypair(&client_session_kp),
             server_session_pk,
@@ -2364,13 +2519,11 @@ mod tests {
         let envelope = encode_envelope(&ping_json, &client_session).unwrap();
         sender.send_message(&envelope).await.unwrap();
 
-        let pong_frame = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            receiver.recv_message(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let pong_frame =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv_message())
+                .await
+                .unwrap()
+                .unwrap();
         let pong_inner = decode_envelope(&pong_frame, &client_session).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&pong_inner).unwrap();
         assert_eq!(parsed["type"], "pong");
@@ -2390,9 +2543,7 @@ mod tests {
     async fn quic_session_adapter_rejects_denied_identity_pin() {
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
-        pin_set
-            .allow_hash_hex(client_cert.cert_hash_hex())
-            .unwrap();
+        pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
 
         let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
             "127.0.0.1:0".parse().unwrap(),
@@ -2449,10 +2600,9 @@ mod tests {
             .await
             .unwrap();
 
-        let server_session_key_text =
-            quic_wait_for_text(&mut receiver, addr, "server session-key")
-                .await
-                .unwrap();
+        let server_session_key_text = quic_wait_for_text(&mut receiver, addr, "server session-key")
+            .await
+            .unwrap();
         let server_session_key_json: serde_json::Value =
             serde_json::from_str(&server_session_key_text).unwrap();
         let server_session_pk = crate::web_hello::decode_public_key(
@@ -2483,7 +2633,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_err(), "server must fail closed on denied identity");
+        assert!(
+            result.is_err(),
+            "server must fail closed on denied identity"
+        );
     }
 
     #[cfg(feature = "transport-quic")]
@@ -2491,9 +2644,7 @@ mod tests {
     async fn quic_session_emits_ipc_transfer_events_for_send_and_receive() {
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
-        pin_set
-            .allow_hash_hex(client_cert.cert_hash_hex())
-            .unwrap();
+        pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
 
         let listener = crate::quic_transport::QuicListener::bind_with_dynamic_client_cert_pins(
             "127.0.0.1:0".parse().unwrap(),
@@ -2542,10 +2693,9 @@ mod tests {
             .await
             .unwrap();
 
-        let server_session_key_text =
-            quic_wait_for_text(&mut receiver, addr, "server session-key")
-                .await
-                .unwrap();
+        let server_session_key_text = quic_wait_for_text(&mut receiver, addr, "server session-key")
+            .await
+            .unwrap();
         let server_session_key_json: serde_json::Value =
             serde_json::from_str(&server_session_key_text).unwrap();
         let server_session_pk = crate::web_hello::decode_public_key(
@@ -2564,10 +2714,14 @@ mod tests {
         let hello_response = quic_wait_for_text(&mut receiver, addr, "HELLO response")
             .await
             .unwrap();
-        let hello_inner =
-            parse_hello_typed(hello_response.as_bytes(), &server_session_pk, &client_session_kp)
-                .unwrap();
-        let negotiated = negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
+        let hello_inner = parse_hello_typed(
+            hello_response.as_bytes(),
+            &server_session_pk,
+            &client_session_kp,
+        )
+        .unwrap();
+        let negotiated =
+            negotiate_capabilities(&daemon_capabilities(false), &hello_inner.capabilities);
         let client_session = SessionContext::new(
             copy_keypair(&client_session_kp),
             server_session_pk,
@@ -2604,13 +2758,11 @@ mod tests {
         })
         .await;
 
-        let sent_frame = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            receiver.recv_message(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let sent_frame =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv_message())
+                .await
+                .unwrap()
+                .unwrap();
         let sent_inner = decode_envelope(&sent_frame, &client_session).unwrap();
         let sent_msg = crate::dc_messages::parse_dc_message(&sent_inner).unwrap();
         assert!(
@@ -2784,14 +2936,11 @@ mod tests {
             .unwrap();
 
         // Step 4: Receive daemon's legacy HELLO response
-        let response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            source.next(),
-        )
-        .await
-        .expect("should receive legacy HELLO response within 5s")
-        .unwrap()
-        .unwrap();
+        let response = tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next())
+            .await
+            .expect("should receive legacy HELLO response within 5s")
+            .unwrap()
+            .unwrap();
 
         let response_text = match response {
             Message::Text(t) => t,
@@ -2842,7 +2991,10 @@ mod tests {
 
         // Second client connects — server must still be alive
         let result = connect_async(&url).await;
-        assert!(result.is_ok(), "Server must accept new connections after client disconnect");
+        assert!(
+            result.is_ok(),
+            "Server must accept new connections after client disconnect"
+        );
 
         let (ws2, _) = result.unwrap();
         let (mut sink2, _) = ws2.split();
@@ -2891,7 +3043,9 @@ mod tests {
             "type": "session-key",
             "publicKey": bolt_core::encoding::to_base64(&browser_session_kp.public_key),
         });
-        sink.send(Message::Text(session_key_msg.to_string())).await.unwrap();
+        sink.send(Message::Text(session_key_msg.to_string()))
+            .await
+            .unwrap();
 
         let daemon_sk_msg = source.next().await.unwrap().unwrap();
         let daemon_sk_text = match daemon_sk_msg {
@@ -2907,7 +3061,8 @@ mod tests {
             &browser_identity.public_key,
             &browser_session_kp,
             &daemon_session_pk,
-        ).unwrap();
+        )
+        .unwrap();
         sink.send(Message::Text(hello_msg)).await.unwrap();
 
         let _hello_response = source.next().await.unwrap().unwrap();
@@ -2925,22 +3080,21 @@ mod tests {
 
         // Trigger file send on a blocking thread (it's synchronous)
         let file_path = test_file.to_str().unwrap().to_string();
-        let send_handle = tokio::task::spawn_blocking(move || {
-            send_file_to_browser(&file_path)
-        });
+        let send_handle = tokio::task::spawn_blocking(move || send_file_to_browser(&file_path));
 
         // Read a few chunks to confirm transfer started
         let mut chunks_received = 0u32;
         for _ in 0..4 {
-            let msg = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                source.next(),
-            ).await;
+            let msg =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next()).await;
             if msg.is_ok() {
                 chunks_received += 1;
             }
         }
-        assert!(chunks_received > 0, "should receive at least some chunks before pause");
+        assert!(
+            chunks_received > 0,
+            "should receive at least some chunks before pause"
+        );
 
         // -- PAUSE --
         request_pause();
@@ -2948,44 +3102,57 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         let mut drain_count = 0;
         loop {
-            match tokio::time::timeout(tokio::time::Duration::from_millis(100), source.next()).await {
-                Ok(Some(Ok(_))) => { drain_count += 1; }
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), source.next()).await
+            {
+                Ok(Some(Ok(_))) => {
+                    drain_count += 1;
+                }
                 _ => break,
             }
         }
 
         // Verify no new chunks arrive during pause window (500ms)
-        let paused_msg = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            source.next(),
-        ).await;
-        assert!(paused_msg.is_err(), "no messages should arrive while paused (got one after drain of {drain_count})");
+        let paused_msg =
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), source.next()).await;
+        assert!(
+            paused_msg.is_err(),
+            "no messages should arrive while paused (got one after drain of {drain_count})"
+        );
 
         // -- RESUME --
         request_resume();
 
         // Verify chunks resume flowing
-        let resumed_msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            source.next(),
-        ).await;
+        let resumed_msg =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next()).await;
         assert!(resumed_msg.is_ok(), "chunks should resume after unpause");
 
         // Drain remaining chunks until send completes
         loop {
             match tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next()).await {
-                Ok(Some(Ok(_))) => { chunks_received += 1; }
+                Ok(Some(Ok(_))) => {
+                    chunks_received += 1;
+                }
                 _ => break,
             }
         }
 
         // Verify send thread completed successfully
         let send_result = send_handle.await.unwrap();
-        assert!(send_result.is_ok(), "send should complete: {:?}", send_result);
+        assert!(
+            send_result.is_ok(),
+            "send should complete: {:?}",
+            send_result
+        );
 
         // Total chunks received should account for the full file
         // 256KB / 16KB = 16 chunks minimum
-        assert!(chunks_received + drain_count >= 10, "should receive most chunks (got {}, drained {})", chunks_received, drain_count);
+        assert!(
+            chunks_received + drain_count >= 10,
+            "should receive most chunks (got {}, drained {})",
+            chunks_received,
+            drain_count
+        );
 
         // Clean close
         let _ = sink.close().await;

@@ -54,9 +54,7 @@ fn app_to_app_quic_source_has_no_accept_any_tls_verifier() {
 
     let quic_transport = read_source(repo, "src/quic_transport.rs");
     assert!(
-        quic_transport.contains(
-            "with_custom_certificate_verifier(CertHashPinServerVerifier::new("
-        ),
+        quic_transport.contains("with_custom_certificate_verifier(CertHashPinServerVerifier::new("),
         "the custom QUIC client verifier must be the cert-hash pin verifier"
     );
     assert!(

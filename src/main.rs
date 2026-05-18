@@ -128,7 +128,10 @@ fn parse_args_from(argv: &[String]) -> Args {
                         eprintln!("--mode '{other}' requires --features legacy-webrtc");
                         std::process::exit(1);
                     }
-                    None => { eprintln!("--mode requires a value"); std::process::exit(1); }
+                    None => {
+                        eprintln!("--mode requires a value");
+                        std::process::exit(1);
+                    }
                 });
             }
             "--simulate-event" => {
@@ -136,7 +139,10 @@ fn parse_args_from(argv: &[String]) -> Args {
                 simulate_event = Some(match argv.get(i).map(|s| s.as_str()) {
                     Some("pairing-request") => SimulateEvent::PairingRequest,
                     Some("incoming-transfer") => SimulateEvent::IncomingTransfer,
-                    other => { eprintln!("--simulate-event: invalid {:?}", other); std::process::exit(1); }
+                    other => {
+                        eprintln!("--simulate-event: invalid {:?}", other);
+                        std::process::exit(1);
+                    }
                 });
             }
             "--pairing-policy" => {
@@ -145,30 +151,64 @@ fn parse_args_from(argv: &[String]) -> Args {
                     Some("ask") => ipc::trust::PairingPolicy::Ask,
                     Some("allow") => ipc::trust::PairingPolicy::Allow,
                     Some("deny") => ipc::trust::PairingPolicy::Deny,
-                    other => { eprintln!("--pairing-policy: invalid {:?}", other); std::process::exit(1); }
+                    other => {
+                        eprintln!("--pairing-policy: invalid {:?}", other);
+                        std::process::exit(1);
+                    }
                 });
             }
-            "--phase-timeout-secs" => { i += 1; phase_timeout_secs = argv.get(i).and_then(|s| s.parse().ok()); }
-            "--socket-path" => { i += 1; socket_path = argv.get(i).cloned(); }
-            "--data-dir" => { i += 1; data_dir = argv.get(i).cloned(); }
+            "--phase-timeout-secs" => {
+                i += 1;
+                phase_timeout_secs = argv.get(i).and_then(|s| s.parse().ok());
+            }
+            "--socket-path" => {
+                i += 1;
+                socket_path = argv.get(i).cloned();
+            }
+            "--data-dir" => {
+                i += 1;
+                data_dir = argv.get(i).cloned();
+            }
             #[cfg(feature = "transport-ws")]
-            "--ws-listen" => { i += 1; ws_listen = argv.get(i).and_then(|s| if s.is_empty() { None } else { Some(s.clone()) }); }
+            "--ws-listen" => {
+                i += 1;
+                ws_listen = argv
+                    .get(i)
+                    .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
+            }
             #[cfg(feature = "transport-webtransport")]
-            "--wt-listen" => { i += 1; wt_listen = argv.get(i).cloned(); }
+            "--wt-listen" => {
+                i += 1;
+                wt_listen = argv.get(i).cloned();
+            }
             #[cfg(feature = "transport-webtransport")]
-            "--wt-cert" => { i += 1; wt_cert = argv.get(i).cloned(); }
+            "--wt-cert" => {
+                i += 1;
+                wt_cert = argv.get(i).cloned();
+            }
             #[cfg(feature = "transport-webtransport")]
-            "--wt-key" => { i += 1; wt_key = argv.get(i).cloned(); }
+            "--wt-key" => {
+                i += 1;
+                wt_key = argv.get(i).cloned();
+            }
             #[cfg(feature = "transport-webtransport")]
-            "--no-wt" => { no_wt = true; }
+            "--no-wt" => {
+                no_wt = true;
+            }
             other => {
-                if other.starts_with("--role") || other.starts_with("--signal") || other.starts_with("--offer")
-                    || other.starts_with("--answer") || other.starts_with("--interop") {
+                if other.starts_with("--role")
+                    || other.starts_with("--signal")
+                    || other.starts_with("--offer")
+                    || other.starts_with("--answer")
+                    || other.starts_with("--interop")
+                {
                     eprintln!("Legacy flag '{other}' requires --features legacy-webrtc");
                     std::process::exit(1);
                 }
                 if other.starts_with("--") {
-                    if argv.get(i + 1).map_or(false, |v| !v.starts_with("--")) { i += 1; }
+                    if argv.get(i + 1).map_or(false, |v| !v.starts_with("--")) {
+                        i += 1;
+                    }
                 }
             }
         }
@@ -176,7 +216,9 @@ fn parse_args_from(argv: &[String]) -> Args {
     }
 
     let daemon_mode = daemon_mode.unwrap_or(DaemonMode::WsEndpoint);
-    let phase_timeout = phase_timeout_secs.map(Duration::from_secs).unwrap_or(DEFAULT_PHASE_TIMEOUT);
+    let phase_timeout = phase_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PHASE_TIMEOUT);
 
     Args {
         phase_timeout,
@@ -303,8 +345,11 @@ fn main() {
     let args = parse_args();
     eprintln!(
         "[bolt-daemon] mode={:?} pairing={:?} timeout={}s socket_path={:?} data_dir={:?}",
-        args.daemon_mode, args.pairing_policy, args.phase_timeout.as_secs(),
-        args.socket_path, args.data_dir,
+        args.daemon_mode,
+        args.pairing_policy,
+        args.phase_timeout.as_secs(),
+        args.socket_path,
+        args.data_dir,
     );
 
     match args.daemon_mode {
@@ -335,17 +380,25 @@ fn main() {
                             if let Some(ref dd) = data_dir_for_watchdog {
                                 let _ = std::fs::write(
                                     format!("{dd}/watchdog_exit.log"),
-                                    format!("parent {} died (ppid now {}), exiting\n", initial_ppid, ppid),
+                                    format!(
+                                        "parent {} died (ppid now {}), exiting\n",
+                                        initial_ppid, ppid
+                                    ),
                                 );
                             }
                             // Use libc::_exit to bypass all cleanup — avoids
                             // potential deadlocks in atexit/drop when the tokio
                             // runtime or broken stderr pipe block std::process::exit.
-                            unsafe { libc::_exit(0); }
+                            unsafe {
+                                libc::_exit(0);
+                            }
                         }
                     }
                 });
-                eprintln!("[bolt-daemon] parent-death watchdog active (ppid={})", initial_ppid);
+                eprintln!(
+                    "[bolt-daemon] parent-death watchdog active (ppid={})",
+                    initial_ppid
+                );
             }
 
             use ipc::server::{IpcServer, DEFAULT_SOCKET_PATH};
@@ -413,7 +466,9 @@ fn main() {
                 let ws_addr: std::net::SocketAddr = match ws_addr_str.parse() {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("[WS_ENDPOINT] FATAL: invalid --ws-listen address '{ws_addr_str}': {e}");
+                        eprintln!(
+                            "[WS_ENDPOINT] FATAL: invalid --ws-listen address '{ws_addr_str}': {e}"
+                        );
                         std::process::exit(1);
                     }
                 };

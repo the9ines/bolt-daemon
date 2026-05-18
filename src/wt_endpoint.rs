@@ -25,11 +25,11 @@ use bolt_core::session::SessionContext;
 use std::sync::Arc;
 
 use crate::envelope::{build_error_payload, decode_envelope, route_inner_message};
-use crate::ws_endpoint::{ActiveSessionHandle, ACTIVE_SESSION};
-use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
+use crate::ws_endpoint::{ActiveSessionHandle, ACTIVE_SESSION};
+use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
 
 /// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
 fn copy_keypair(kp: &KeyPair) -> KeyPair {
@@ -362,14 +362,20 @@ async fn handle_incoming_session(
     // Emit session lifecycle IPC event (mirrors WS endpoint pattern)
     match &result {
         Ok(()) => {
-            crate::ws_endpoint::emit_ipc_global("session.ended", serde_json::json!({
-                "reason": "connection closed",
-            }));
+            crate::ws_endpoint::emit_ipc_global(
+                "session.ended",
+                serde_json::json!({
+                    "reason": "connection closed",
+                }),
+            );
         }
         Err(e) => {
-            crate::ws_endpoint::emit_ipc_global("session.error", serde_json::json!({
-                "reason": format!("{e}"),
-            }));
+            crate::ws_endpoint::emit_ipc_global(
+                "session.error",
+                serde_json::json!({
+                    "reason": format!("{e}"),
+                }),
+            );
         }
     }
 
@@ -495,7 +501,9 @@ async fn run_message_loop(
                             };
 
                             // Reject oversized transfers
-                            if !active_receives.contains_key(transfer_id) && file_size > MAX_TRANSFER_SIZE {
+                            if !active_receives.contains_key(transfer_id)
+                                && file_size > MAX_TRANSFER_SIZE
+                            {
                                 eprintln!(
                                     "[WT_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
                                     filename, file_size, MAX_TRANSFER_SIZE

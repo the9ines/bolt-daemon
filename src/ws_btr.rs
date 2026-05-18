@@ -93,7 +93,10 @@ pub(crate) fn decrypt_chunk_btr(
         let ratchet_pub_bytes = bolt_core::encoding::from_base64(ratchet_pub_b64)
             .map_err(|e| format!("BTR ratchet_public_key decode: {e}"))?;
         if ratchet_pub_bytes.len() != 32 {
-            return Err(format!("BTR ratchet_public_key length {} != 32", ratchet_pub_bytes.len()));
+            return Err(format!(
+                "BTR ratchet_public_key length {} != 32",
+                ratchet_pub_bytes.len()
+            ));
         }
         let mut ratchet_pub = [0u8; 32];
         ratchet_pub.copy_from_slice(&ratchet_pub_bytes);
@@ -123,23 +126,30 @@ pub(crate) fn decrypt_chunk_btr(
     // Replay guard: check (transfer_id, generation, chain_index) triple.
     {
         let tid_bytes = parse_transfer_id_bytes(transfer_id)?;
-        let generation = receive_contexts.get(transfer_id)
+        let generation = receive_contexts
+            .get(transfer_id)
             .map(|(_, gen)| *gen)
             .or(btr_env.ratchet_generation)
             .ok_or_else(|| "BTR: cannot determine generation for replay check".to_string())?;
         let mut btr_guard = btr_engine.lock().map_err(|e| format!("btr lock: {e}"))?;
         if let Some(ref mut engine) = *btr_guard {
-            engine.check_replay(&tid_bytes, generation, btr_env.chain_index)
+            engine
+                .check_replay(&tid_bytes, generation, btr_env.chain_index)
                 .map_err(|e| format!("BTR replay check failed: {e}"))?;
         }
     }
 
     // Get transfer context and decrypt
-    let (ctx, _gen) = receive_contexts.get_mut(transfer_id)
-        .ok_or_else(|| format!("BTR: no receive context for transfer {transfer_id} at chunk {chunk_index}"))?;
+    let (ctx, _gen) = receive_contexts.get_mut(transfer_id).ok_or_else(|| {
+        format!("BTR: no receive context for transfer {transfer_id} at chunk {chunk_index}")
+    })?;
 
-    let plaintext = ctx.open_chunk(btr_env.chain_index, &sealed)
-        .map_err(|e| format!("BTR open_chunk({}, {}): {e}", transfer_id, btr_env.chain_index))?;
+    let plaintext = ctx.open_chunk(btr_env.chain_index, &sealed).map_err(|e| {
+        format!(
+            "BTR open_chunk({}, {}): {e}",
+            transfer_id, btr_env.chain_index
+        )
+    })?;
 
     Ok(plaintext)
 }
@@ -147,9 +157,9 @@ pub(crate) fn decrypt_chunk_btr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws_validation::parse_transfer_id_bytes;
     use bolt_core::crypto::generate_ephemeral_keypair;
     use bolt_core::session::SessionContext;
-    use crate::ws_validation::parse_transfer_id_bytes;
 
     // ── BTR engine lifecycle tests ──────────────────────────
 
@@ -158,17 +168,15 @@ mod tests {
         let daemon_kp = generate_ephemeral_keypair();
         let browser_kp = generate_ephemeral_keypair();
 
-        let daemon_shared = compute_x25519_shared_secret(
-            &daemon_kp.secret_key,
-            &browser_kp.public_key,
-        );
-        let browser_shared = compute_x25519_shared_secret(
-            &browser_kp.secret_key,
-            &daemon_kp.public_key,
-        );
+        let daemon_shared =
+            compute_x25519_shared_secret(&daemon_kp.secret_key, &browser_kp.public_key);
+        let browser_shared =
+            compute_x25519_shared_secret(&browser_kp.secret_key, &daemon_kp.public_key);
 
-        assert_eq!(daemon_shared, browser_shared,
-            "X25519 DH must be commutative — both sides derive identical shared secret");
+        assert_eq!(
+            daemon_shared, browser_shared,
+            "X25519 DH must be commutative — both sides derive identical shared secret"
+        );
     }
 
     #[test]
@@ -179,8 +187,11 @@ mod tests {
         let shared = compute_x25519_shared_secret(&kp_a.secret_key, &kp_b.public_key);
         let engine = bolt_btr::BtrEngine::new(&shared);
 
-        assert_eq!(engine.ratchet_generation(), 0,
-            "Fresh BTR engine must have generation 0");
+        assert_eq!(
+            engine.ratchet_generation(),
+            0,
+            "Fresh BTR engine must have generation 0"
+        );
     }
 
     #[test]
@@ -201,16 +212,18 @@ mod tests {
 
     #[test]
     fn btr_engine_not_created_without_capability() {
-        let caps = vec!["bolt.profile-envelope-v1".to_string(), "bolt.file-hash".to_string()];
+        let caps = vec![
+            "bolt.profile-envelope-v1".to_string(),
+            "bolt.file-hash".to_string(),
+        ];
         let kp = generate_ephemeral_keypair();
-        let session = SessionContext::new(
-            copy_keypair(&kp),
-            [0u8; 32],
-            caps,
-        ).unwrap();
+        let session = SessionContext::new(copy_keypair(&kp), [0u8; 32], caps).unwrap();
 
         let should_init = session.has_capability("bolt.transfer-ratchet-v1");
-        assert!(!should_init, "BTR engine must NOT be created without negotiated capability");
+        assert!(
+            !should_init,
+            "BTR engine must NOT be created without negotiated capability"
+        );
     }
 
     #[test]
@@ -221,14 +234,13 @@ mod tests {
             "bolt.transfer-ratchet-v1".to_string(),
         ];
         let kp = generate_ephemeral_keypair();
-        let session = SessionContext::new(
-            copy_keypair(&kp),
-            [0u8; 32],
-            caps,
-        ).unwrap();
+        let session = SessionContext::new(copy_keypair(&kp), [0u8; 32], caps).unwrap();
 
         let should_init = session.has_capability("bolt.transfer-ratchet-v1");
-        assert!(should_init, "BTR engine must be created when capability is negotiated");
+        assert!(
+            should_init,
+            "BTR engine must be created when capability is negotiated"
+        );
     }
 
     #[test]
@@ -241,8 +253,11 @@ mod tests {
         assert_eq!(engine.ratchet_generation(), 0);
 
         engine.cleanup_disconnect();
-        assert_eq!(engine.ratchet_generation(), 0,
-            "Generation reset to 0 after cleanup");
+        assert_eq!(
+            engine.ratchet_generation(),
+            0,
+            "Generation reset to 0 after cleanup"
+        );
     }
 
     // ── BTR receive path tests ──────────────────────────────
@@ -252,16 +267,16 @@ mod tests {
         let daemon_kp = generate_ephemeral_keypair();
         let browser_kp = generate_ephemeral_keypair();
 
-        let shared = compute_x25519_shared_secret(
-            &daemon_kp.secret_key,
-            &browser_kp.public_key,
-        );
+        let shared = compute_x25519_shared_secret(&daemon_kp.secret_key, &browser_kp.public_key);
 
         let mut browser_engine = bolt_btr::BtrEngine::new(&shared);
         let mut daemon_engine = bolt_btr::BtrEngine::new(&shared);
 
         let transfer_id: [u8; 16] = [0xAB; 16];
-        let transfer_id_hex = transfer_id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let transfer_id_hex = transfer_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
 
         let (mut browser_ctx, browser_ratchet_pub) = browser_engine
             .begin_transfer_send(&transfer_id, &daemon_kp.public_key)
@@ -275,14 +290,20 @@ mod tests {
             )
             .unwrap();
 
-        let chunks = vec![b"chunk zero data".to_vec(), b"chunk one data".to_vec(), b"final chunk".to_vec()];
+        let chunks = vec![
+            b"chunk zero data".to_vec(),
+            b"chunk one data".to_vec(),
+            b"final chunk".to_vec(),
+        ];
         for (i, plaintext) in chunks.iter().enumerate() {
             let (chain_idx, sealed) = browser_ctx.seal_chunk(plaintext).unwrap();
             assert_eq!(chain_idx, i as u32);
 
             let decrypted = daemon_ctx.open_chunk(chain_idx, &sealed).unwrap();
-            assert_eq!(decrypted, *plaintext,
-                "Chunk {i}: daemon must decrypt browser's BTR-sealed chunk");
+            assert_eq!(
+                decrypted, *plaintext,
+                "Chunk {i}: daemon must decrypt browser's BTR-sealed chunk"
+            );
         }
     }
 
@@ -345,7 +366,10 @@ mod tests {
 
         let mut browser_engine = bolt_btr::BtrEngine::new(&shared);
         let transfer_id: [u8; 16] = [0xEE; 16];
-        let transfer_id_hex = transfer_id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let transfer_id_hex = transfer_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let (mut browser_ctx, browser_ratchet_pub) = browser_engine
             .begin_transfer_send(&transfer_id, &daemon_kp.public_key)
             .unwrap();
@@ -360,7 +384,8 @@ mod tests {
                 "bolt.file-hash".to_string(),
                 "bolt.transfer-ratchet-v1".to_string(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let btr_engine = std::sync::Mutex::new(Some(bolt_btr::BtrEngine::new(&shared)));
 
@@ -382,7 +407,11 @@ mod tests {
             &mut receive_contexts,
         );
 
-        assert!(result.is_ok(), "decrypt_chunk_btr must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "decrypt_chunk_btr must succeed: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap(), b"hello from browser");
     }
 
@@ -393,7 +422,8 @@ mod tests {
             copy_keypair(&kp),
             [0u8; 32],
             vec!["bolt.profile-envelope-v1".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         let btr_fields = crate::envelope::BtrEnvelopeFields {
             chain_index: 5,
@@ -414,7 +444,10 @@ mod tests {
             &mut receive_contexts,
         );
 
-        assert!(result.is_err(), "Missing BTR context for non-first chunk must fail closed");
+        assert!(
+            result.is_err(),
+            "Missing BTR context for non-first chunk must fail closed"
+        );
     }
 
     // ── BTR send path tests ─────────────────────────────────
@@ -424,10 +457,7 @@ mod tests {
         let daemon_kp = generate_ephemeral_keypair();
         let browser_kp = generate_ephemeral_keypair();
 
-        let shared = compute_x25519_shared_secret(
-            &daemon_kp.secret_key,
-            &browser_kp.public_key,
-        );
+        let shared = compute_x25519_shared_secret(&daemon_kp.secret_key, &browser_kp.public_key);
 
         let mut daemon_engine = bolt_btr::BtrEngine::new(&shared);
         let mut browser_engine = bolt_btr::BtrEngine::new(&shared);
@@ -456,8 +486,10 @@ mod tests {
             assert_eq!(chain_idx, i as u32);
 
             let decrypted = browser_ctx.open_chunk(chain_idx, &sealed).unwrap();
-            assert_eq!(decrypted, *plaintext,
-                "Chunk {i}: browser must decrypt daemon's BTR-sealed chunk");
+            assert_eq!(
+                decrypted, *plaintext,
+                "Chunk {i}: browser must decrypt daemon's BTR-sealed chunk"
+            );
         }
     }
 
@@ -506,19 +538,18 @@ mod tests {
         let daemon_kp = generate_ephemeral_keypair();
         let browser_kp = generate_ephemeral_keypair();
 
-        let shared = compute_x25519_shared_secret(
-            &daemon_kp.secret_key,
-            &browser_kp.public_key,
-        );
+        let shared = compute_x25519_shared_secret(&daemon_kp.secret_key, &browser_kp.public_key);
 
         let mut daemon_engine = bolt_btr::BtrEngine::new(&shared);
         let mut browser_engine = bolt_btr::BtrEngine::new(&shared);
 
         let tid1: [u8; 16] = [0x01; 16];
         let (mut d_send_ctx, d_ratchet_pub) = daemon_engine
-            .begin_transfer_send(&tid1, &browser_kp.public_key).unwrap();
+            .begin_transfer_send(&tid1, &browser_kp.public_key)
+            .unwrap();
         let mut b_recv_ctx = browser_engine
-            .begin_transfer_receive_with_key(&tid1, &d_ratchet_pub, &browser_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid1, &d_ratchet_pub, &browser_kp.secret_key)
+            .unwrap();
 
         let (idx, sealed) = d_send_ctx.seal_chunk(b"daemon to browser").unwrap();
         let decrypted = b_recv_ctx.open_chunk(idx, &sealed).unwrap();
@@ -529,9 +560,11 @@ mod tests {
 
         let tid2: [u8; 16] = [0x02; 16];
         let (mut b_send_ctx, b_ratchet_pub) = browser_engine
-            .begin_transfer_send(&tid2, &daemon_kp.public_key).unwrap();
+            .begin_transfer_send(&tid2, &daemon_kp.public_key)
+            .unwrap();
         let mut d_recv_ctx = daemon_engine
-            .begin_transfer_receive_with_key(&tid2, &b_ratchet_pub, &daemon_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid2, &b_ratchet_pub, &daemon_kp.secret_key)
+            .unwrap();
 
         let (idx2, sealed2) = b_send_ctx.seal_chunk(b"browser to daemon").unwrap();
         let decrypted2 = d_recv_ctx.open_chunk(idx2, &sealed2).unwrap();
@@ -550,12 +583,14 @@ mod tests {
             copy_keypair(&kp_a),
             kp_b.public_key,
             vec!["bolt.profile-envelope-v1".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
         let session_b = SessionContext::new(
             copy_keypair(&kp_b),
             kp_a.public_key,
             vec!["bolt.profile-envelope-v1".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         let inner = b"test inner message";
         let btr_fields = crate::envelope::BtrEnvelopeFields {
@@ -564,13 +599,18 @@ mod tests {
             ratchet_generation: Some(1),
         };
 
-        let encoded = crate::envelope::encode_envelope_with_btr(inner, &session_a, &btr_fields).unwrap();
-        let (decoded, extracted_btr) = crate::envelope::decode_envelope_with_btr(&encoded, &session_b).unwrap();
+        let encoded =
+            crate::envelope::encode_envelope_with_btr(inner, &session_a, &btr_fields).unwrap();
+        let (decoded, extracted_btr) =
+            crate::envelope::decode_envelope_with_btr(&encoded, &session_b).unwrap();
 
         assert_eq!(decoded, inner);
         let extracted = extracted_btr.unwrap();
         assert_eq!(extracted.chain_index, 0);
-        assert_eq!(extracted.ratchet_public_key, Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()));
+        assert_eq!(
+            extracted.ratchet_public_key,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string())
+        );
         assert_eq!(extracted.ratchet_generation, Some(1));
     }
 
@@ -587,9 +627,11 @@ mod tests {
 
         let tid: [u8; 16] = rand::random();
         let (mut b_ctx, b_ratchet_pub) = browser_engine
-            .begin_transfer_send(&tid, &daemon_kp.public_key).unwrap();
+            .begin_transfer_send(&tid, &daemon_kp.public_key)
+            .unwrap();
         let mut d_ctx = daemon_engine
-            .begin_transfer_receive_with_key(&tid, &b_ratchet_pub, &daemon_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid, &b_ratchet_pub, &daemon_kp.secret_key)
+            .unwrap();
 
         for i in 0..10u32 {
             let data = vec![i as u8; (i as usize + 1) * 1000];
@@ -611,9 +653,11 @@ mod tests {
 
         let tid: [u8; 16] = rand::random();
         let (mut d_ctx, d_ratchet_pub) = daemon_engine
-            .begin_transfer_send(&tid, &browser_kp.public_key).unwrap();
+            .begin_transfer_send(&tid, &browser_kp.public_key)
+            .unwrap();
         let mut b_ctx = browser_engine
-            .begin_transfer_receive_with_key(&tid, &d_ratchet_pub, &browser_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid, &d_ratchet_pub, &browser_kp.secret_key)
+            .unwrap();
 
         for i in 0..10u32 {
             let data = vec![(i + 100) as u8; (i as usize + 1) * 500];
@@ -637,16 +681,20 @@ mod tests {
 
             if round % 2 == 0 {
                 let (mut d_ctx, d_pub) = daemon_engine
-                    .begin_transfer_send(&tid, &browser_kp.public_key).unwrap();
+                    .begin_transfer_send(&tid, &browser_kp.public_key)
+                    .unwrap();
                 let mut b_ctx = browser_engine
-                    .begin_transfer_receive_with_key(&tid, &d_pub, &browser_kp.secret_key).unwrap();
+                    .begin_transfer_receive_with_key(&tid, &d_pub, &browser_kp.secret_key)
+                    .unwrap();
                 let (idx, sealed) = d_ctx.seal_chunk(b"round data d2b").unwrap();
                 assert_eq!(b_ctx.open_chunk(idx, &sealed).unwrap(), b"round data d2b");
             } else {
                 let (mut b_ctx, b_pub) = browser_engine
-                    .begin_transfer_send(&tid, &daemon_kp.public_key).unwrap();
+                    .begin_transfer_send(&tid, &daemon_kp.public_key)
+                    .unwrap();
                 let mut d_ctx = daemon_engine
-                    .begin_transfer_receive_with_key(&tid, &b_pub, &daemon_kp.secret_key).unwrap();
+                    .begin_transfer_receive_with_key(&tid, &b_pub, &daemon_kp.secret_key)
+                    .unwrap();
                 let (idx, sealed) = b_ctx.seal_chunk(b"round data b2d").unwrap();
                 assert_eq!(d_ctx.open_chunk(idx, &sealed).unwrap(), b"round data b2d");
             }
@@ -687,9 +735,11 @@ mod tests {
 
         let tid1: [u8; 16] = [0x01; 16];
         let (mut ctx1_s, pub1) = sender_engine
-            .begin_transfer_send(&tid1, &browser_kp.public_key).unwrap();
+            .begin_transfer_send(&tid1, &browser_kp.public_key)
+            .unwrap();
         let mut ctx1_r = receiver_engine
-            .begin_transfer_receive_with_key(&tid1, &pub1, &browser_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid1, &pub1, &browser_kp.secret_key)
+            .unwrap();
 
         let (_idx, sealed1) = ctx1_s.seal_chunk(b"transfer 1 data").unwrap();
         let _ok = ctx1_r.open_chunk(0, &sealed1).unwrap();
@@ -699,9 +749,11 @@ mod tests {
 
         let tid2: [u8; 16] = [0x02; 16];
         let (mut ctx2_s, pub2) = sender_engine
-            .begin_transfer_send(&tid2, &browser_kp.public_key).unwrap();
+            .begin_transfer_send(&tid2, &browser_kp.public_key)
+            .unwrap();
         let mut ctx2_r = receiver_engine
-            .begin_transfer_receive_with_key(&tid2, &pub2, &browser_kp.secret_key).unwrap();
+            .begin_transfer_receive_with_key(&tid2, &pub2, &browser_kp.secret_key)
+            .unwrap();
 
         let (_idx, sealed2) = ctx2_s.seal_chunk(b"transfer 2 data").unwrap();
 
@@ -709,17 +761,22 @@ mod tests {
         assert_eq!(ok2, b"transfer 2 data");
 
         let cross = ctx2_r.open_chunk(1, &sealed1);
-        assert!(cross.is_err(), "Transfer 1 sealed data must not decrypt with transfer 2 context");
+        assert!(
+            cross.is_err(),
+            "Transfer 1 sealed data must not decrypt with transfer 2 context"
+        );
     }
 
     #[test]
     fn btr_golden_vector_session_root_derivation() {
         let shared_secret = bolt_core::encoding::from_hex(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-        ).unwrap();
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
         let expected_root = bolt_core::encoding::from_hex(
-            "beff9b312b06cff7d24e1acb6fddc01cf12ab35eca1c93cf498433b51f8ae488"
-        ).unwrap();
+            "beff9b312b06cff7d24e1acb6fddc01cf12ab35eca1c93cf498433b51f8ae488",
+        )
+        .unwrap();
 
         let mut shared_arr = [0u8; 32];
         shared_arr.copy_from_slice(&shared_secret);

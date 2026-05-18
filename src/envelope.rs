@@ -614,7 +614,10 @@ mod tests {
         assert!(json.contains(r#""ratchet_generation":1"#));
         let decoded: ProfileEnvelopeV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.chain_index, Some(0));
-        assert_eq!(decoded.ratchet_public_key, Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()));
+        assert_eq!(
+            decoded.ratchet_public_key,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string())
+        );
         assert_eq!(decoded.ratchet_generation, Some(1));
     }
 
@@ -643,7 +646,8 @@ mod tests {
     #[test]
     fn profile_envelope_v1_btr_fields_absent_from_browser_non_btr() {
         // Browser sends envelope without BTR fields — must deserialize correctly
-        let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA=="}"#;
+        let json =
+            r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA=="}"#;
         let decoded: ProfileEnvelopeV1 = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.chain_index, None);
         assert_eq!(decoded.ratchet_public_key, None);
@@ -673,7 +677,10 @@ mod tests {
         // ratchet_generation as negative — must fail (u32 cannot be negative)
         let json = r#"{"type":"profile-envelope","version":1,"encoding":"base64","payload":"dGVzdA==","ratchet_generation":-1}"#;
         let result = serde_json::from_str::<ProfileEnvelopeV1>(json);
-        assert!(result.is_err(), "negative ratchet_generation must fail parse");
+        assert!(
+            result.is_err(),
+            "negative ratchet_generation must fail parse"
+        );
     }
 
     #[test]

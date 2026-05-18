@@ -54,15 +54,16 @@ pub fn generate_ephemeral_cert() -> Result<EphemeralCert, String> {
     }
 
     // Generate key pair and self-signed cert
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| format!("[WT_CERT] key generation failed: {e}"))?;
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| format!("[WT_CERT] key generation failed: {e}"))?;
 
     let mut params = rcgen::CertificateParams::new(san_names)
         .map_err(|e| format!("[WT_CERT] cert params failed: {e}"))?;
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(13);
 
-    let cert = params.self_signed(&key_pair)
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| format!("[WT_CERT] self-signed cert generation failed: {e}"))?;
 
     // Compute SHA-256 hash of DER-encoded cert
@@ -71,8 +72,8 @@ pub fn generate_ephemeral_cert() -> Result<EphemeralCert, String> {
     let cert_hash_hex: String = cert_hash.iter().map(|b| format!("{b:02x}")).collect();
 
     // Write PEM to temp files
-    let tmp_dir = tempfile::tempdir()
-        .map_err(|e| format!("[WT_CERT] temp dir creation failed: {e}"))?;
+    let tmp_dir =
+        tempfile::tempdir().map_err(|e| format!("[WT_CERT] temp dir creation failed: {e}"))?;
     let cert_pem_path = tmp_dir.path().join("wt-cert.pem");
     let key_pem_path = tmp_dir.path().join("wt-key.pem");
 
@@ -108,7 +109,11 @@ mod tests {
         let cert = generate_ephemeral_cert().expect("cert generation must succeed");
 
         // Hash is 64 hex chars (32 bytes SHA-256)
-        assert_eq!(cert.cert_hash_hex.len(), 64, "cert hash must be 64 hex chars");
+        assert_eq!(
+            cert.cert_hash_hex.len(),
+            64,
+            "cert hash must be 64 hex chars"
+        );
         assert!(cert.cert_hash_hex.chars().all(|c| c.is_ascii_hexdigit()));
 
         // PEM files exist
@@ -126,7 +131,9 @@ mod tests {
     fn each_generation_produces_unique_hash() {
         let cert1 = generate_ephemeral_cert().unwrap();
         let cert2 = generate_ephemeral_cert().unwrap();
-        assert_ne!(cert1.cert_hash_hex, cert2.cert_hash_hex,
-            "each generation must produce a unique cert/hash");
+        assert_ne!(
+            cert1.cert_hash_hex, cert2.cert_hash_hex,
+            "each generation must produce a unique cert/hash"
+        );
     }
 }

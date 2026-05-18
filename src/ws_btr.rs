@@ -73,6 +73,7 @@ pub(crate) fn copy_keypair(kp: &KeyPair) -> KeyPair {
 /// function has no global state dependency.
 ///
 /// Fail-closed: returns Err on any crypto or state error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decrypt_chunk_btr(
     transfer_id: &str,
     chunk_b64: &str,
@@ -88,8 +89,10 @@ pub(crate) fn decrypt_chunk_btr(
         .map_err(|e| format!("BTR chunk base64 decode: {e}"))?;
 
     // First chunk: initialize transfer receive context
-    if btr_env.chain_index == 0 && btr_env.ratchet_public_key.is_some() {
-        let ratchet_pub_b64 = btr_env.ratchet_public_key.as_ref().unwrap();
+    if btr_env.chain_index == 0 {
+        let Some(ratchet_pub_b64) = btr_env.ratchet_public_key.as_ref() else {
+            return Err("BTR first chunk missing ratchet_public_key".to_string());
+        };
         let ratchet_pub_bytes = bolt_core::encoding::from_base64(ratchet_pub_b64)
             .map_err(|e| format!("BTR ratchet_public_key decode: {e}"))?;
         if ratchet_pub_bytes.len() != 32 {

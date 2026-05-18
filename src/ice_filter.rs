@@ -11,6 +11,7 @@ use std::net::IpAddr;
 
 /// Network scope policy for ICE candidate filtering.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum NetworkScope {
     /// LocalBolt: only private/link-local/loopback IPs.
     Lan,
@@ -27,6 +28,7 @@ pub enum NetworkScope {
 ///
 /// The connection-address is at token index 4 (0-based) of the `candidate:` attribute value.
 /// If the candidate string starts with "candidate:", that prefix is part of token 0.
+#[allow(dead_code)]
 pub fn is_allowed_candidate(candidate_str: &str, scope: NetworkScope) -> bool {
     // Empty or end-of-candidates marker
     let trimmed = candidate_str.trim();
@@ -66,6 +68,7 @@ pub fn is_lan_candidate(candidate_str: &str) -> bool {
 }
 
 /// Returns `true` if the IP is private (RFC 1918 / RFC 4193) or link-local.
+#[allow(dead_code)]
 fn is_private_or_link_local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -112,6 +115,7 @@ fn is_private_or_link_local(ip: &IpAddr) -> bool {
 }
 
 /// Returns `true` if the IP is in the CGNAT range 100.64.0.0/10.
+#[allow(dead_code)]
 fn is_cgnat(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

@@ -14,6 +14,7 @@
 
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
+#[allow(unused_imports)]
 pub(crate) use bolt_daemon::{
     connect_signal, dc_messages, envelope, identity_store, ipc, session, transfer, web_hello,
     HELLO_PAYLOAD,
@@ -30,14 +31,8 @@ pub(crate) use bolt_daemon::ws_endpoint;
 #[cfg(feature = "transport-webtransport")]
 pub(crate) use bolt_daemon::wt_endpoint;
 
-use std::fs;
-use std::io::{self, BufRead, Write};
-use std::path::Path;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 pub(crate) use ice_filter::NetworkScope;
 
@@ -59,6 +54,7 @@ pub(crate) enum SimulateEvent {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct Args {
     pub(crate) phase_timeout: Duration,
     pub(crate) network_scope: NetworkScope,
@@ -205,10 +201,9 @@ fn parse_args_from(argv: &[String]) -> Args {
                     eprintln!("Legacy flag '{other}' requires --features legacy-webrtc");
                     std::process::exit(1);
                 }
-                if other.starts_with("--") {
-                    if argv.get(i + 1).map_or(false, |v| !v.starts_with("--")) {
-                        i += 1;
-                    }
+                if other.starts_with("--") && argv.get(i + 1).is_some_and(|v| !v.starts_with("--"))
+                {
+                    i += 1;
                 }
             }
         }

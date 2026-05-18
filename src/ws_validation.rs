@@ -45,7 +45,7 @@ pub fn sanitize_filename(raw: &str) -> Result<String, String> {
     }
 
     // Extract basename: last component after / or \
-    let basename = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or("");
+    let basename = raw.rsplit(['/', '\\']).next().unwrap_or("");
 
     // Reject empty
     if basename.is_empty() {

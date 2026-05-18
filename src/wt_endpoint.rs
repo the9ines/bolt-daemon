@@ -410,6 +410,7 @@ async fn read_frame_with_timeout(
 /// Receives encrypted ProfileEnvelopeV1 frames (length-prefixed),
 /// decrypts, routes via `route_inner_message`, and sends any reply.
 /// Runs until the peer disconnects or a protocol violation occurs.
+#[allow(clippy::collapsible_match, clippy::single_match)]
 async fn run_message_loop(
     recv: &mut wtransport::stream::RecvStream,
     session: &SessionContext,
@@ -537,7 +538,10 @@ async fn run_message_loop(
                             // Progress (throttled)
                             let done = rx.chunks.len() as u32;
                             let total = rx.total_chunks;
-                            if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                            if done == 1
+                                || done == total
+                                || done.is_multiple_of((total / 20).max(1))
+                            {
                                 eprintln!(
                                     "[WT_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                     done, total, rx.filename

@@ -226,7 +226,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
 
     // Chunk (16KB per chunk, matching browser)
     let chunk_size = 16 * 1024usize;
-    let total_chunks = ((file_size as usize + chunk_size - 1) / chunk_size) as u32;
+    let total_chunks = (file_size as usize).div_ceil(chunk_size) as u32;
     let transfer_id = format!("{:032x}", rand::random::<u128>());
 
     eprintln!(
@@ -326,7 +326,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
         let msg = crate::dc_messages::DcMessage::FileChunk {
             transfer_id: transfer_id.clone(),
             filename: filename.clone(),
-            chunk_index: i as u32,
+            chunk_index: i,
             total_chunks,
             chunk: encrypted,
             file_size,
@@ -351,8 +351,8 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
 
         // Emit progress for UI consumption — throttled to avoid blocking async
         // runtime with per-chunk stderr I/O. Emit at ~5% intervals, first, and last.
-        let done = (i + 1) as u32;
-        if done == 1 || done == total_chunks || done % (total_chunks / 20).max(1) == 0 {
+        let done = i + 1;
+        if done == 1 || done == total_chunks || done.is_multiple_of((total_chunks / 20).max(1)) {
             let bytes_done = (done as u64).min(total_chunks as u64) * chunk_size as u64;
             let bytes_done = bytes_done.min(file_size);
             let progress = if file_size > 0 {
@@ -1369,6 +1369,7 @@ async fn run_quic_session_with_outbound(
 }
 
 #[cfg(feature = "transport-quic")]
+#[allow(clippy::collapsible_match, clippy::single_match)]
 async fn run_quic_read_loop(
     receiver: &mut crate::quic_transport::QuicMessageReceiver,
     session: &SessionContext,
@@ -1517,7 +1518,10 @@ async fn run_quic_read_loop(
 
                             let done = rx.chunks.len() as u32;
                             let total = rx.total_chunks;
-                            if done == 1 || done == total || done % (total / 20).max(1) == 0 {
+                            if done == 1
+                                || done == total
+                                || done.is_multiple_of((total / 20).max(1))
+                            {
                                 let bytes_done = if rx.file_size > 0 {
                                     (done as u64 * rx.file_size) / total as u64
                                 } else {
@@ -1769,6 +1773,7 @@ async fn run_session_with_outbound(
 
 /// Read loop for active sessions. Sends replies via `reply_tx` channel
 /// instead of writing to ws_sink directly (writer task handles that).
+#[allow(clippy::collapsible_match, clippy::single_match)]
 async fn run_read_loop(
     ws_source: &mut (impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin),
     session: &SessionContext,
@@ -1935,7 +1940,9 @@ async fn run_read_loop(
                                     // Emit progress for UI — throttled to ~5% intervals
                                     let done = rx.chunks.len() as u32;
                                     let total = rx.total_chunks;
-                                    if done == 1 || done == total || done % (total / 20).max(1) == 0
+                                    if done == 1
+                                        || done == total
+                                        || done.is_multiple_of((total / 20).max(1))
                                     {
                                         let bytes_done = if rx.file_size > 0 {
                                             (done as u64 * rx.file_size) / total as u64

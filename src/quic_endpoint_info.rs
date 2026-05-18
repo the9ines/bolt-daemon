@@ -22,7 +22,7 @@ pub fn ws_endpoint_quic_port(ws_port: u16) -> Option<u16> {
 
 pub fn write_quic_info(data_dir: &Path, info: &QuicEndpointInfo) -> io::Result<PathBuf> {
     let path = data_dir.join(QUIC_INFO_FILE);
-    let json = serde_json::to_string(info).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string(info).map_err(io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
 }

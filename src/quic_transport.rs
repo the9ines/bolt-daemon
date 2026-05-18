@@ -928,7 +928,7 @@ impl QuicDialer {
         remote: SocketAddr,
         client_config: ClientConfig,
     ) -> Result<(Endpoint, QuicFramedStream), QuicTransportError> {
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
             .map_err(|e| QuicTransportError::Connection(format!("client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 

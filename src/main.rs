@@ -514,7 +514,13 @@ fn main() {
 
                 // Run WS + WT endpoints on the main thread — blocks until shutdown.
                 let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("[WS_ENDPOINT] FATAL: tokio runtime: {e}");
+                        std::process::exit(1);
+                    }
+                };
                 let signal_path = send_signal_path.clone();
                 #[cfg(feature = "transport-quic")]
                 let quic_identity_pk = identity.public_key;
@@ -566,7 +572,7 @@ fn main() {
                                                     tokio::spawn(async move {
                                                         if let Err(e) = ws_endpoint::handle_quic_framed_stream(
                                                             stream,
-                                                            "0.0.0.0:0".parse().unwrap(),
+                                                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
                                                             &identity,
                                                             wt_enabled,
                                                             ipc.as_ref(),
@@ -786,8 +792,7 @@ fn main() {
                     #[cfg(feature = "transport-webtransport")]
                     if let Some(ref cert) = wt_cert {
                         let wt_port = ws_addr.port() + 1; // WT on adjacent port
-                        let wt_addr: std::net::SocketAddr = format!("0.0.0.0:{wt_port}")
-                            .parse().expect("valid WT addr");
+                        let wt_addr = std::net::SocketAddr::from(([0, 0, 0, 0], wt_port));
                         let wt_identity_kp = bolt_core::crypto::KeyPair {
                             public_key: identity.public_key,
                             secret_key: identity.secret_key,

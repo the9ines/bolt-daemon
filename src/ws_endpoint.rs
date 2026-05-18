@@ -463,6 +463,7 @@ pub async fn connect_to_remote_ws(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_tungstenite::connect_async;
 
+    let synthetic_peer_addr = SocketAddr::from(([0, 0, 0, 0], 0));
     eprintln!("[WS_CLIENT] connecting to {url}");
     let (ws_stream, _) = connect_async(url)
         .await
@@ -486,7 +487,7 @@ pub async fn connect_to_remote_ws(
     eprintln!("[WS_CLIENT] sent session-key");
 
     // Step 2: Read remote's session-key
-    let remote_key_msg = wait_for_hello(&mut ws_source, "0.0.0.0:0".parse().unwrap()).await?;
+    let remote_key_msg = wait_for_hello(&mut ws_source, synthetic_peer_addr).await?;
     let remote_key_json: serde_json::Value = serde_json::from_str(&remote_key_msg)
         .map_err(|e| format!("[WS_CLIENT] invalid session-key JSON: {e}"))?;
 
@@ -511,7 +512,7 @@ pub async fn connect_to_remote_ws(
     eprintln!("[WS_CLIENT] sent HELLO");
 
     // Step 4: Read HELLO response
-    let hello_response_raw = wait_for_hello(&mut ws_source, "0.0.0.0:0".parse().unwrap()).await?;
+    let hello_response_raw = wait_for_hello(&mut ws_source, synthetic_peer_addr).await?;
 
     // Check if legacy
     let is_legacy = serde_json::from_str::<serde_json::Value>(&hello_response_raw)
@@ -550,7 +551,7 @@ pub async fn connect_to_remote_ws(
             trust_config.as_ref(),
             SessionTrustRole::Offerer,
             "WS_CLIENT",
-            "0.0.0.0:0".parse().unwrap(),
+            synthetic_peer_addr,
             &remote_identity_pk,
         )?;
 
@@ -601,7 +602,7 @@ pub async fn connect_to_remote_ws(
         ws_sink,
         ws_source,
         session,
-        "0.0.0.0:0".parse().unwrap(),
+        synthetic_peer_addr,
         remote_identity_pk,
         ipc_tx.as_ref(),
     )
@@ -879,7 +880,10 @@ pub async fn run_ws_endpoint(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Store IPC sender globally for send_file_to_browser to use
     if let Some(ref tx) = ipc_tx {
-        *IPC_TX.lock().unwrap() = Some(tx.clone());
+        match IPC_TX.lock() {
+            Ok(mut guard) => *guard = Some(tx.clone()),
+            Err(e) => eprintln!("[WS_ENDPOINT] IPC sender lock poisoned: {e}"),
+        }
     }
 
     let listener = TcpListener::bind(config.listen_addr).await?;
@@ -1278,12 +1282,16 @@ async fn run_quic_session_with_outbound(
     let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
 
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = Some(ActiveSessionHandle {
-            outbound_tx: outbound_tx.clone(),
-            session: Arc::clone(&session),
-            btr_engine: Arc::clone(&btr_engine_arc),
-        });
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => {
+                *guard = Some(ActiveSessionHandle {
+                    outbound_tx: outbound_tx.clone(),
+                    session: Arc::clone(&session),
+                    btr_engine: Arc::clone(&btr_engine_arc),
+                });
+            }
+            Err(e) => eprintln!("[QUIC_SESSION] {peer_addr} active session lock poisoned: {e}"),
+        }
     }
     eprintln!("[QUIC_SESSION] {peer_addr} active session handle registered");
 
@@ -1357,8 +1365,10 @@ async fn run_quic_session_with_outbound(
         }
     }
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = None;
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => *guard = None,
+            Err(e) => eprintln!("[QUIC_SESSION] {peer_addr} active session lock poisoned: {e}"),
+        }
     }
     eprintln!("[QUIC_SESSION] {peer_addr} active session handle cleared");
 
@@ -1675,12 +1685,16 @@ async fn run_session_with_outbound(
 
     // Register active session globally so IPC file.send can use it
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = Some(ActiveSessionHandle {
-            outbound_tx: outbound_tx.clone(),
-            session: Arc::clone(&session),
-            btr_engine: Arc::clone(&btr_engine_arc),
-        });
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => {
+                *guard = Some(ActiveSessionHandle {
+                    outbound_tx: outbound_tx.clone(),
+                    session: Arc::clone(&session),
+                    btr_engine: Arc::clone(&btr_engine_arc),
+                });
+            }
+            Err(e) => eprintln!("[WS_SESSION] {peer_addr} active session lock poisoned: {e}"),
+        }
     }
     eprintln!("[WS_SESSION] {peer_addr} active session handle registered");
 
@@ -1759,8 +1773,10 @@ async fn run_session_with_outbound(
     }
     // Clear global session handle
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = None;
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => *guard = None,
+            Err(e) => eprintln!("[WS_SESSION] {peer_addr} active session lock poisoned: {e}"),
+        }
     }
     eprintln!("[WS_SESSION] {peer_addr} active session handle cleared");
 

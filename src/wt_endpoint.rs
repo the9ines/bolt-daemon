@@ -309,12 +309,16 @@ async fn handle_incoming_session(
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let btr_engine_arc = Arc::new(std::sync::Mutex::new(None::<bolt_btr::BtrEngine>));
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = Some(ActiveSessionHandle {
-            outbound_tx: outbound_tx.clone(),
-            session: Arc::clone(&session),
-            btr_engine: Arc::clone(&btr_engine_arc),
-        });
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => {
+                *guard = Some(ActiveSessionHandle {
+                    outbound_tx: outbound_tx.clone(),
+                    session: Arc::clone(&session),
+                    btr_engine: Arc::clone(&btr_engine_arc),
+                });
+            }
+            Err(e) => eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION lock poisoned: {e}"),
+        }
     }
     eprintln!("[WT_SESSION] {peer_addr} session established, ACTIVE_SESSION registered");
 
@@ -381,8 +385,10 @@ async fn handle_incoming_session(
 
     // Cleanup: clear ACTIVE_SESSION
     {
-        let mut guard = ACTIVE_SESSION.lock().unwrap();
-        *guard = None;
+        match ACTIVE_SESSION.lock() {
+            Ok(mut guard) => *guard = None,
+            Err(e) => eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION lock poisoned: {e}"),
+        }
     }
     eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION cleared");
 

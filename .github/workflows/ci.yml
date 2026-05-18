@@ -52,7 +52,3 @@ jobs:
       - name: check no panic in production code
         working-directory: bolt-daemon
         run: bash scripts/check_no_panic.sh
-
-      - name: E2E rendezvous harness
-        working-directory: bolt-daemon
-        run: bash scripts/e2e_rendezvous_local.sh

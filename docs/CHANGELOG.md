@@ -2,6 +2,19 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## TRANSPORT-UNIFY-1 Phase 2 test — WebTransport session IPC integration test — 2026-07-03
+
+Closes the coverage gap flagged during Phase 2 review: no test exercised the
+WebTransport post-HELLO session path (it was never covered, even for the recovered
+May code). New `wt_session_emits_ipc_transfer_events_on_receive` (in `wt_endpoint.rs`
+test module) stands up a real wtransport client + server, drives
+`handle_incoming_session` through the full HELLO handshake, sends one NaCl-sealed file
+chunk, and asserts the daemon emits `transfer.started` + `transfer.complete` via the
+threaded `ipc_tx` (the shared read loop) and saves the exact bytes. This runtime-proves
+the Phase 2 fold (WT -> shared loop) and the `ipc_tx` threading end to end — the log
+shows `[WT_SESSION] entering shared session loop` -> `[BTR] engine initialized` ->
+`[WS_TRANSFER] saved`. 379 tests pass; fmt + clippy (project gate) clean.
+
 ## TRANSPORT-UNIFY-1 Phase 2 — fold WebTransport onto the shared session loop — 2026-07-03
 
 Behavior-preserving refactor. WebTransport now routes through the same

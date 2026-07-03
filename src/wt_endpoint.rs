@@ -472,4 +472,161 @@ mod tests {
 
         assert!(result.is_ok());
     }
+
+    /// TRANSPORT-UNIFY-1 Phase 2 coverage: a real WebTransport client drives
+    /// `handle_incoming_session` through the HELLO handshake and sends one encrypted
+    /// file chunk. Asserts the daemon emits `transfer.started` + `transfer.complete`
+    /// via the threaded `ipc_tx` (the shared read loop) and saves the exact bytes.
+    /// The WT twin of `ws_endpoint`'s `quic_session_emits_ipc_transfer_events_*` test;
+    /// closes the previously-untested WT post-HELLO session path.
+    #[tokio::test]
+    async fn wt_session_emits_ipc_transfer_events_on_receive() {
+        // ── server: one WT session through handle_incoming_session with a real ipc_tx ──
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let wt_identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(addr)
+                .with_identity(wt_identity)
+                .build(),
+        )
+        .unwrap();
+        let bound = server.local_addr().unwrap();
+
+        let server_identity = generate_ephemeral_keypair();
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
+        *crate::ws_endpoint::ACTIVE_SESSION.lock().unwrap() = None;
+
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let _ = handle_incoming_session(incoming, &server_identity, Some(ipc_tx)).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // ── client: connect, run the HELLO handshake, send one encrypted chunk ──
+        let client = Endpoint::client(
+            wtransport::ClientConfig::builder()
+                .with_bind_default()
+                .with_no_cert_validation()
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}", bound.port());
+        let conn = client.connect(&url).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+
+        let client_identity = generate_ephemeral_keypair();
+        let client_session_kp = generate_ephemeral_keypair();
+
+        // session-key exchange (both sides send first, then read — stream-buffered)
+        let session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        write_frame(&mut send, session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+        let server_key_frame = read_frame(&mut recv).await.unwrap().unwrap();
+        let server_key_json: serde_json::Value = serde_json::from_slice(&server_key_frame).unwrap();
+        let server_session_pk =
+            crate::web_hello::decode_public_key(server_key_json["publicKey"].as_str().unwrap())
+                .unwrap();
+
+        // HELLO
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        write_frame(&mut send, hello_msg.as_bytes()).await.unwrap();
+        let hello_resp = read_frame(&mut recv).await.unwrap().unwrap();
+        let hello_inner =
+            parse_hello_typed(&hello_resp, &server_session_pk, &client_session_kp).unwrap();
+        let negotiated =
+            negotiate_capabilities(&daemon_capabilities(true), &hello_inner.capabilities);
+        let client_session = SessionContext::new(
+            copy_keypair(&client_session_kp),
+            server_session_pk,
+            negotiated,
+        )
+        .unwrap();
+
+        // ── send one encrypted file chunk (daemon receive path over the shared loop) ──
+        let filename = format!("wt-ipc-recv-{}.txt", rand::random::<u64>());
+        let payload = b"wt ipc receive smoke through the unified session loop";
+        let encrypted = bolt_core::crypto::seal_box_payload(
+            payload,
+            &client_session.remote_public_key,
+            &client_session.local_keypair.secret_key,
+        )
+        .unwrap();
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: format!("{:032x}", rand::random::<u128>()),
+            filename: filename.clone(),
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk: encrypted,
+            file_size: payload.len() as u64,
+            file_hash: None,
+        };
+        let inner = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let envelope = crate::envelope::encode_envelope(&inner, &client_session).unwrap();
+        write_frame(&mut send, &envelope).await.unwrap();
+
+        // ── assert: transfer.started + transfer.complete over the threaded ipc_tx ──
+        let started = wait_for_ipc(&ipc_rx, |m| {
+            m.msg_type == "transfer.started"
+                && m.payload["direction"] == "receive"
+                && m.payload["file_name"] == filename
+        })
+        .await;
+        assert!(
+            started.is_some(),
+            "WT session must emit transfer.started (receive) via the threaded ipc_tx"
+        );
+        let complete = wait_for_ipc(&ipc_rx, |m| {
+            m.msg_type == "transfer.complete"
+                && m.payload["file_name"] == filename
+                && m.payload["bytes_transferred"].as_u64() == Some(payload.len() as u64)
+        })
+        .await
+        .expect("WT session must emit transfer.complete via the threaded ipc_tx");
+        let save_path = complete.payload["save_path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(save_path).unwrap(),
+            payload,
+            "WT-received file bytes must match exactly"
+        );
+        let _ = std::fs::remove_file(save_path);
+
+        let _ = send.finish().await;
+        *crate::ws_endpoint::ACTIVE_SESSION.lock().unwrap() = None;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
+    }
+
+    /// Poll an IPC receiver up to ~5s for an event matching `pred`, without blocking
+    /// the (single-threaded) test runtime so the server task can make progress.
+    async fn wait_for_ipc(
+        rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
+        pred: impl Fn(&crate::ipc::types::IpcMessage) -> bool,
+    ) -> Option<crate::ipc::types::IpcMessage> {
+        for _ in 0..50 {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        if pred(&msg) {
+                            return Some(msg);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        None
+    }
 }

@@ -27,7 +27,7 @@ use crate::web_hello::{
 };
 // TRANSPORT-UNIFY-1 Phase 2: WT routes through the shared session loop; the
 // envelope/BTR/transfer machinery is inherited from it, not re-owned here.
-use crate::ws_endpoint::run_session_with_outbound;
+use crate::session_loop::run_session_with_outbound;
 
 /// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
 fn copy_keypair(kp: &KeyPair) -> KeyPair {
@@ -477,7 +477,7 @@ mod tests {
     /// `handle_incoming_session` through the HELLO handshake and sends one encrypted
     /// file chunk. Asserts the daemon emits `transfer.started` + `transfer.complete`
     /// via the threaded `ipc_tx` (the shared read loop) and saves the exact bytes.
-    /// The WT twin of `ws_endpoint`'s `quic_session_emits_ipc_transfer_events_*` test;
+    /// The WT twin of `session_loop`'s `quic_session_emits_ipc_transfer_events_*` test;
     /// closes the previously-untested WT post-HELLO session path.
     #[tokio::test]
     async fn wt_session_emits_ipc_transfer_events_on_receive() {
@@ -496,7 +496,7 @@ mod tests {
 
         let server_identity = generate_ephemeral_keypair();
         let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
-        *crate::ws_endpoint::ACTIVE_SESSION.lock().unwrap() = None;
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
 
         let server_handle = tokio::spawn(async move {
             let incoming = server.accept().await;
@@ -603,7 +603,7 @@ mod tests {
         let _ = std::fs::remove_file(save_path);
 
         let _ = send.finish().await;
-        *crate::ws_endpoint::ACTIVE_SESSION.lock().unwrap() = None;
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
     }
 

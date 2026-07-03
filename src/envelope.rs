@@ -3,7 +3,7 @@
 //! # Module Contract (MODULARITY-AUDITABILITY-1)
 //!
 //! **Owner:** bolt-daemon
-//! **Consumers:** ws_endpoint.rs, wt_endpoint.rs, rendezvous.rs (legacy), tests
+//! **Consumers:** session_loop.rs, wt_endpoint.rs, rendezvous.rs (legacy), tests
 //!
 //! **Exports:**
 //! - `ProfileEnvelopeV1` — wire type with optional BTR fields

@@ -45,7 +45,7 @@ pub mod wt_cert;
 /// Feature-gated behind `transport-ws`.
 #[cfg(feature = "transport-ws")]
 #[doc(hidden)]
-pub mod ws_endpoint;
+pub mod session_loop;
 
 /// Deterministic payload exchanged during the legacy hello protocol.
 /// Used by `web_hello::parse_hello_message` for no-downgrade detection.

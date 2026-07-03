@@ -2,7 +2,7 @@
 //!
 //! The Bolt session protocol is JSON text over one framed transport. This module
 //! is the single seam every transport plugs into, so the session lifecycle is
-//! written once in `ws_endpoint::run_session_with_outbound` + `run_read_loop`
+//! written once in `session_loop::run_session_with_outbound` + `run_read_loop`
 //! instead of copied per transport. WS and QUIC adapt here; WebTransport folds in
 //! next (Phase 2).
 //!

@@ -2,6 +2,25 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## TRANSPORT-UNIFY-1 cleanup — neutral session-loop log tags + rename ws_endpoint.rs — 2026-07-03
+
+Finishes the transport-unification cleanup now that all three transports share one
+session loop. Two changes, behavior-preserving:
+
+1. Log tags: the shared session loop (`run_session_with_outbound` + `run_read_loop`),
+   the outbound send path (`send_file_to_browser`), and the pause/resume/disconnect
+   controls now log transport-neutral `[SESSION]`/`[TRANSFER]` instead of
+   `[WS_SESSION]`/`[WS_TRANSFER]` — they fire for WS, QUIC, and WebTransport alike, so
+   the `[WS_*]` prefix was misleading (a WebTransport transfer logged `[WS_TRANSFER]`).
+   WS-endpoint-specific paths (accept, WS upgrade, WS HELLO establishment) keep `[WS_*]`.
+2. Rename: `src/ws_endpoint.rs` -> `src/session_loop.rs` (`mod ws_endpoint` ->
+   `mod session_loop`). The file's defining role post-unification is the shared session
+   loop, not WS-specific code. All references across 10 files updated; module doc header
+   rewritten. (`session` was already taken by the `bolt_core::session` re-export shim.)
+
+Runtime-confirmed: the WebTransport session test now logs only `[SESSION]`/`[TRANSFER]`,
+no `[WS_*]`. 380 tests pass; fmt + clippy clean.
+
 ## APP-TO-APP-DIAL-FIX-1 — bound the QUIC handshake so app-to-app falls back to WS fast — 2026-07-03
 
 Fixes the native app-to-app "waiting for encrypted channel" hang. The native app

@@ -3,7 +3,7 @@
 //! # Module Contract (MODULARITY-AUDITABILITY-2, Slice 2)
 //!
 //! **Owner:** bolt-daemon
-//! **Consumers:** ws_endpoint (session init, transfer send/receive paths)
+//! **Consumers:** session_loop (session init, transfer send/receive paths)
 //!
 //! **Exports:**
 //! - `compute_x25519_shared_secret()` — DH shared secret for BTR engine init
@@ -18,10 +18,10 @@
 //! - Transfer context lifecycle (init on first chunk, lookup on subsequent)
 //!
 //! **Does NOT own:**
-//! - BTR engine lifecycle (create/cleanup owned by ws_endpoint session layer)
+//! - BTR engine lifecycle (create/cleanup owned by session_loop session layer)
 //! - ACTIVE_SESSION global state (engine reference passed by caller)
 //! - Envelope decoding (owned by envelope.rs)
-//! - File assembly/save (owned by ws_endpoint run_read_loop)
+//! - File assembly/save (owned by session_loop run_read_loop)
 //!
 //! **Security invariants:**
 //! - decrypt_chunk_btr is fail-closed: any crypto or state error returns Err

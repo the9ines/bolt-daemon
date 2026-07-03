@@ -10,7 +10,7 @@
 //! No `datachannel` or `webrtc-sdp` dependencies.
 //!
 //! **This file owns:** CLI parsing, mode dispatch, boot diagnostics.
-//! **Delegates to:** ws_endpoint, wt_endpoint, simulate.
+//! **Delegates to:** session_loop, wt_endpoint, simulate.
 
 // Core protocol modules live in lib.rs for integration-test access.
 // Re-export into the binary crate so existing `crate::` paths still resolve.
@@ -26,7 +26,7 @@ mod ice_filter;
 pub(crate) use bolt_daemon::quic_transport;
 
 #[cfg(feature = "transport-ws")]
-pub(crate) use bolt_daemon::ws_endpoint;
+pub(crate) use bolt_daemon::session_loop;
 
 #[cfg(feature = "transport-webtransport")]
 pub(crate) use bolt_daemon::wt_endpoint;
@@ -418,7 +418,7 @@ fn main() {
                 .as_ref()
                 .map(|dd| ipc::trust::trust_path_from_data_dir(dd))
                 .unwrap_or_else(ipc::trust::default_trust_path);
-            let session_trust_config = ws_endpoint::SessionTrustConfig {
+            let session_trust_config = session_loop::SessionTrustConfig {
                 trust_path,
                 pairing_policy: args.pairing_policy,
             };
@@ -504,7 +504,7 @@ fn main() {
                 #[cfg(feature = "transport-quic")]
                 let quic_client_cert_pins = quic_transport::QuicClientCertPinSet::new();
 
-                let ws_config = ws_endpoint::WsEndpointConfig {
+                let ws_config = session_loop::WsEndpointConfig {
                     listen_addr: ws_addr,
                     identity_keypair: ws_identity,
                     wt_enabled,
@@ -570,7 +570,7 @@ fn main() {
                                                     let ipc = quic_ipc_tx.clone();
                                                     let trust = quic_trust_config.clone();
                                                     tokio::spawn(async move {
-                                                        if let Err(e) = ws_endpoint::handle_quic_framed_stream(
+                                                        if let Err(e) = session_loop::handle_quic_framed_stream(
                                                             stream,
                                                             std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
                                                             &identity,
@@ -645,13 +645,13 @@ fn main() {
                                     }
 
                                     // Validate the file-to-send path
-                                    if let Err(e) = ws_endpoint::validate_send_file_path(path_str) {
+                                    if let Err(e) = session_loop::validate_send_file_path(path_str) {
                                         eprintln!("[WS_TRANSFER] REJECTED send signal: {e}");
                                         continue;
                                     }
 
                                     eprintln!("[WS_TRANSFER] send signal: {path_str}");
-                                    match ws_endpoint::send_file_to_browser(path_str) {
+                                    match session_loop::send_file_to_browser(path_str) {
                                         Ok(()) => eprintln!("[WS_TRANSFER] send complete"),
                                         Err(e) => eprintln!("[WS_TRANSFER] send error: {e}"),
                                     }
@@ -704,7 +704,7 @@ fn main() {
                                                 match quic_addr.parse::<std::net::SocketAddr>() {
                                                     Ok(addr) => {
                                                         eprintln!("[QUIC_CLIENT] connect_remote signal: {addr}");
-                                                        match ws_endpoint::connect_to_remote_quic(
+                                                        match session_loop::connect_to_remote_quic(
                                                             addr,
                                                             quic_hash,
                                                             client_cert,
@@ -736,7 +736,7 @@ fn main() {
                                             return;
                                         };
                                         eprintln!("[WS_CLIENT] connect_remote signal: {url_str}");
-                                        match ws_endpoint::connect_to_remote_ws(
+                                        match session_loop::connect_to_remote_ws(
                                             &url_str, &id, wt_enabled, ipc, Some(trust),
                                         ).await {
                                             Ok(()) => eprintln!("[WS_CLIENT] session ended normally"),
@@ -758,7 +758,7 @@ fn main() {
                             tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                             if disconnect_signal_path.exists() {
                                 let _ = std::fs::remove_file(&disconnect_signal_path);
-                                ws_endpoint::request_disconnect();
+                                session_loop::request_disconnect();
                             }
                         }
                     });
@@ -777,11 +777,11 @@ fn main() {
                             tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                             if pause_signal_path.exists() {
                                 let _ = std::fs::remove_file(&pause_signal_path);
-                                ws_endpoint::request_pause();
+                                session_loop::request_pause();
                             }
                             if resume_signal_path.exists() {
                                 let _ = std::fs::remove_file(&resume_signal_path);
-                                ws_endpoint::request_resume();
+                                session_loop::request_resume();
                             }
                         }
                     });
@@ -813,7 +813,7 @@ fn main() {
                         eprintln!("[WT_ENDPOINT] starting on {wt_addr} (cert_hash={})", cert.cert_hash_hex);
                     }
 
-                    if let Err(e) = ws_endpoint::run_ws_endpoint(ws_config, shutdown_rx, ipc_event_tx).await {
+                    if let Err(e) = session_loop::run_ws_endpoint(ws_config, shutdown_rx, ipc_event_tx).await {
                         eprintln!("[WS_ENDPOINT] FATAL: {e}");
                         std::process::exit(1);
                     }

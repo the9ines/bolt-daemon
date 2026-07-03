@@ -3,7 +3,7 @@
 //! # Module Contract (MODULARITY-AUDITABILITY-2)
 //!
 //! **Owner:** bolt-daemon
-//! **Consumers:** ws_endpoint (file send/receive paths)
+//! **Consumers:** session_loop (file send/receive paths)
 //!
 //! **Exports:**
 //! - `sanitize_filename()` — basename extraction + dangerous pattern rejection (TI-02)

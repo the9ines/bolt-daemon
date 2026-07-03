@@ -19,7 +19,7 @@ fn app_to_app_quic_source_has_no_accept_any_tls_verifier() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let production_sources = [
         "src/quic_transport.rs",
-        "src/ws_endpoint.rs",
+        "src/session_loop.rs",
         "src/main.rs",
         "src/connect_signal.rs",
         "src/quic_endpoint_info.rs",

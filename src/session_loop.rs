@@ -1,4 +1,11 @@
-//! WebSocket server endpoint for browser-to-daemon sessions.
+//! Shared session loop for daemon sessions, plus the WebSocket server endpoint.
+//!
+//! Post TRANSPORT-UNIFY-1 this module owns the transport-neutral session loop
+//! (`run_session_with_outbound` + `run_read_loop`) that every transport — WS,
+//! QUIC, WebTransport — runs through, alongside the WS-specific server and the
+//! WS/QUIC remote-dial entry points. Shared-loop log lines use transport-neutral
+//! `[SESSION]`/`[TRANSFER]` tags; the remaining `[WS_*]` tags mark genuinely
+//! WS-specific paths (accept, HELLO, client dial).
 //!
 //! # Module Contract (MODULARITY-AUDITABILITY-1)
 //!
@@ -31,10 +38,11 @@
 //! - BTR engine lifecycle → `ws_btr.rs`
 //!
 //! **Log tokens:**
-//!   [WS_ENDPOINT]  — server lifecycle (bind, shutdown)
-//!   [WS_SESSION]   — per-connection session lifecycle
+//!   [SESSION]      — transport-neutral session lifecycle (shared loop; WS/QUIC/WT)
+//!   [TRANSFER]     — transport-neutral file transfer events (shared loop; WS/QUIC/WT)
+//!   [WS_ENDPOINT]  — WS server lifecycle (bind, shutdown)
+//!   [WS_SESSION]   — WS-specific session events (accept, upgrade, HELLO establishment)
 //!   [WS_HELLO]     — HELLO handshake over WS
-//!   [WS_TRANSFER]  — file transfer events
 //!   [BTR]          — BTR engine lifecycle
 //!   [BTR_TRANSFER_SEND/RECV/COMPLETE] — BTR transfer events
 //!   [SAS]          — SAS verification code
@@ -172,7 +180,7 @@ pub(crate) static DISCONNECT_REQUESTED: std::sync::atomic::AtomicBool =
 /// Signal the active WS session to close gracefully.
 pub fn request_disconnect() {
     DISCONNECT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[WS_SESSION] disconnect requested");
+    eprintln!("[SESSION] disconnect requested");
 }
 
 /// Request to pause the active file transfer (DAEMON-TRANSFER-CONTROL-1).
@@ -183,14 +191,14 @@ pub(crate) static PAUSE_REQUESTED: std::sync::atomic::AtomicBool =
 /// Pause the active outbound transfer. Sender sleeps between chunks until resumed.
 pub fn request_pause() {
     PAUSE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[WS_TRANSFER] pause requested");
+    eprintln!("[TRANSFER] pause requested");
     emit_ipc_global("transfer.paused", serde_json::json!({}));
 }
 
 /// Resume a paused outbound transfer.
 pub fn request_resume() {
     PAUSE_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[WS_TRANSFER] resume requested");
+    eprintln!("[TRANSFER] resume requested");
     emit_ipc_global("transfer.resumed", serde_json::json!({}));
 }
 
@@ -234,7 +242,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     let transfer_id = format!("{:032x}", rand::random::<u128>());
 
     eprintln!(
-        "[WS_TRANSFER] sending: {} ({} bytes, {} chunks, tid={})",
+        "[TRANSFER] sending: {} ({} bytes, {} chunks, tid={})",
         filename, file_size, total_chunks, transfer_id
     );
 
@@ -365,7 +373,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
                 1.0
             };
             eprintln!(
-                "[WS_TRANSFER] progress: {}/{} chunks ({})",
+                "[TRANSFER] progress: {}/{} chunks ({})",
                 done, total_chunks, filename
             );
             emit_ipc_global(
@@ -391,7 +399,7 @@ pub fn send_file_to_browser(file_path: &str) -> Result<(), String> {
     }
 
     eprintln!(
-        "[WS_TRANSFER] all {} chunks queued for {}",
+        "[TRANSFER] all {} chunks queued for {}",
         total_chunks, filename
     );
 
@@ -1305,10 +1313,10 @@ pub(crate) async fn run_session_with_outbound(
                     btr_engine: Arc::clone(&btr_engine_arc),
                 });
             }
-            Err(e) => eprintln!("[WS_SESSION] {peer_addr} active session lock poisoned: {e}"),
+            Err(e) => eprintln!("[SESSION] {peer_addr} active session lock poisoned: {e}"),
         }
     }
-    eprintln!("[WS_SESSION] {peer_addr} active session handle registered");
+    eprintln!("[SESSION] {peer_addr} active session handle registered");
 
     // Writer task: drains outbound channel → ws_sink
     // Also handles replies from the read loop via a second channel.
@@ -1320,7 +1328,7 @@ pub(crate) async fn run_session_with_outbound(
                     match msg {
                         Some(text) => {
                             if let Err(e) = ws_sink.send_text(text).await {
-                                eprintln!("[WS_SESSION] outbound send error: {e}");
+                                eprintln!("[SESSION] outbound send error: {e}");
                                 break;
                             }
                         }
@@ -1331,7 +1339,7 @@ pub(crate) async fn run_session_with_outbound(
                     match reply {
                         Some(text) => {
                             if let Err(e) = ws_sink.send_text(text).await {
-                                eprintln!("[WS_SESSION] reply send error: {e}");
+                                eprintln!("[SESSION] reply send error: {e}");
                                 break;
                             }
                         }
@@ -1388,10 +1396,10 @@ pub(crate) async fn run_session_with_outbound(
     {
         match ACTIVE_SESSION.lock() {
             Ok(mut guard) => *guard = None,
-            Err(e) => eprintln!("[WS_SESSION] {peer_addr} active session lock poisoned: {e}"),
+            Err(e) => eprintln!("[SESSION] {peer_addr} active session lock poisoned: {e}"),
         }
     }
-    eprintln!("[WS_SESSION] {peer_addr} active session handle cleared");
+    eprintln!("[SESSION] {peer_addr} active session handle cleared");
 
     // Stop writer task
     drop(reply_tx);
@@ -1437,7 +1445,7 @@ async fn run_read_loop(
         // Check disconnect flag every iteration
         if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[WS_SESSION] {peer_addr} disconnect requested — closing");
+            eprintln!("[SESSION] {peer_addr} disconnect requested — closing");
             break;
         }
 
@@ -1449,7 +1457,7 @@ async fn run_read_loop(
         let msg = match result {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
-                eprintln!("[WS_SESSION] {peer_addr} read error: {e}");
+                eprintln!("[SESSION] {peer_addr} read error: {e}");
                 break;
             }
             None => break, // stream ended
@@ -1461,7 +1469,7 @@ async fn run_read_loop(
                 let (inner, btr_fields) = match decode_envelope_with_btr(text.as_bytes(), session) {
                     Ok(result) => result,
                     Err(e) => {
-                        eprintln!("[WS_SESSION] {peer_addr} envelope error: {e}");
+                        eprintln!("[SESSION] {peer_addr} envelope error: {e}");
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
                         let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
@@ -1474,7 +1482,7 @@ async fn run_read_loop(
                     Ok(Some(reply_bytes)) => {
                         let reply_text = String::from_utf8_lossy(&reply_bytes).into_owned();
                         if reply_tx.send(reply_text).is_err() {
-                            eprintln!("[WS_SESSION] {peer_addr} reply channel closed");
+                            eprintln!("[SESSION] {peer_addr} reply channel closed");
                             break;
                         }
                     }
@@ -1516,7 +1524,7 @@ async fn run_read_loop(
                                     let data = match data {
                                         Ok(plaintext) => plaintext,
                                         Err(e) => {
-                                            eprintln!("[WS_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
+                                            eprintln!("[TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
                                             continue;
                                         }
                                     };
@@ -1525,7 +1533,7 @@ async fn run_read_loop(
                                         && file_size > MAX_TRANSFER_SIZE
                                     {
                                         eprintln!(
-                                            "[WS_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
+                                            "[TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
                                             filename, file_size, MAX_TRANSFER_SIZE
                                         );
                                         continue;
@@ -1539,7 +1547,7 @@ async fn run_read_loop(
                                                 Ok(name) => name,
                                                 Err(e) => {
                                                     eprintln!(
-                                                        "[WS_TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {:?})",
+                                                        "[TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {:?})",
                                                         filename
                                                     );
                                                     // Use a safe fallback — transfer still accepted but
@@ -1548,7 +1556,7 @@ async fn run_read_loop(
                                                 }
                                             };
                                             eprintln!(
-                                                "[WS_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
+                                                "[TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
                                                 safe_name, file_size, total_chunks
                                             );
                                             emit_ipc(ipc_tx, "transfer.started", serde_json::json!({
@@ -1584,7 +1592,7 @@ async fn run_read_loop(
                                             1.0
                                         };
                                         eprintln!(
-                                            "[WS_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
+                                            "[TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                             done, total, rx.filename
                                         );
                                         emit_ipc(
@@ -1620,7 +1628,7 @@ async fn run_read_loop(
                                         let canonical_path = std::path::Path::new(&save_path);
                                         if !canonical_path.starts_with(canonical_dir) {
                                             eprintln!(
-                                                "[WS_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
+                                                "[TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
                                                 save_path, save_dir
                                             );
                                             active_receives.remove(transfer_id);
@@ -1633,7 +1641,7 @@ async fn run_read_loop(
                                         match std::fs::write(&save_path, &file_data) {
                                             Ok(()) => {
                                                 eprintln!(
-                                                    "[WS_TRANSFER] {peer_addr} saved: {} ({} bytes) → {}",
+                                                    "[TRANSFER] {peer_addr} saved: {} ({} bytes) → {}",
                                                     rx.filename, file_data.len(), save_path
                                                 );
                                                 emit_ipc(
@@ -1650,7 +1658,7 @@ async fn run_read_loop(
                                             }
                                             Err(e) => {
                                                 eprintln!(
-                                                    "[WS_TRANSFER] {peer_addr} save failed: {} — {}",
+                                                    "[TRANSFER] {peer_addr} save failed: {} — {}",
                                                     rx.filename, e
                                                 );
                                                 emit_ipc(
@@ -1681,7 +1689,7 @@ async fn run_read_loop(
                         }
                     }
                     Err(e) => {
-                        eprintln!("[WS_SESSION] {peer_addr} route error: {e}");
+                        eprintln!("[SESSION] {peer_addr} route error: {e}");
                         let error_payload =
                             build_error_payload(e.code(), &e.to_string(), Some(session));
                         let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
@@ -1698,11 +1706,11 @@ async fn run_read_loop(
                 // Ignore WS-level pongs
             }
             Message::Close(_) => {
-                eprintln!("[WS_SESSION] {peer_addr} received close frame");
+                eprintln!("[SESSION] {peer_addr} received close frame");
                 break;
             }
             Message::Binary(_) => {
-                eprintln!("[WS_SESSION] {peer_addr} binary frame rejected (text-only protocol)");
+                eprintln!("[SESSION] {peer_addr} binary frame rejected (text-only protocol)");
                 break;
             }
             Message::Frame(_) => {
@@ -1711,7 +1719,7 @@ async fn run_read_loop(
         }
     }
 
-    eprintln!("[WS_SESSION] {peer_addr} message loop ended");
+    eprintln!("[SESSION] {peer_addr} message loop ended");
     Ok(())
 }
 

@@ -2,6 +2,20 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## WT-BTR-RECEIVE-1 — BTR decrypt + IPC transfer events on WT receive — 2026-07-03
+
+Recovered May-era working-tree progress (found uncommitted during the
+Governance OS sweep, kept per PM direction). The WebTransport receive path now
+initializes a BtrEngine when `bolt.transfer-ratchet-v1` is negotiated, decrypts
+chunks via `decode_envelope_with_btr`/`decrypt_chunk_btr` with per-transfer
+receive contexts and `end_transfer()` cleanup, and falls back to static NaCl
+box when BTR is not negotiated. WT receive also emits
+`transfer.started/progress/complete/error` IPC events (parity with WS/QUIC).
+
+Validation: `cargo test --features native-full -- --test-threads=1` → 378
+passed, 0 failed (incl. `wti5_btr_over_wt`); `cargo fmt --check` clean; clippy
+no warnings. Automated-test-validated per `os/rules/validation-protocol.md`.
+
 ## LOCALBOLT-NATIVE-QUIT-TEARDOWN-1 — Parent-Death Watchdog (`bffbc02`) — 2026-04-26
 
 When the native LocalBolt.app quits (Cmd+Q), normal termination hooks

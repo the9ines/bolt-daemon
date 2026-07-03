@@ -24,10 +24,11 @@ use bolt_core::session::SessionContext;
 
 use std::sync::Arc;
 
-use crate::envelope::{build_error_payload, decode_envelope, route_inner_message};
+use crate::envelope::{build_error_payload, decode_envelope_with_btr, route_inner_message};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
+use crate::ws_btr::{compute_x25519_shared_secret, decrypt_chunk_btr};
 use crate::ws_endpoint::{ActiveSessionHandle, ACTIVE_SESSION};
 use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
 
@@ -307,7 +308,22 @@ async fn handle_incoming_session(
 
     // Register ACTIVE_SESSION so IPC file.send can use this WT session
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let btr_engine_arc = Arc::new(std::sync::Mutex::new(None::<bolt_btr::BtrEngine>));
+    let btr_engine = if session.has_capability("bolt.transfer-ratchet-v1") {
+        let shared_secret = compute_x25519_shared_secret(
+            &session.local_keypair.secret_key,
+            &session.remote_public_key,
+        );
+        let engine = bolt_btr::BtrEngine::new(&shared_secret);
+        eprintln!(
+            "[BTR] {peer_addr} WT engine initialized (generation={})",
+            engine.ratchet_generation()
+        );
+        Some(engine)
+    } else {
+        eprintln!("[BTR] {peer_addr} WT BTR not negotiated — static NaCl box mode");
+        None
+    };
+    let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
     {
         match ACTIVE_SESSION.lock() {
             Ok(mut guard) => {
@@ -360,6 +376,7 @@ async fn handle_incoming_session(
         peer_addr,
         &remote_identity_pk,
         &reply_tx,
+        &btr_engine_arc,
     )
     .await;
 
@@ -423,6 +440,7 @@ async fn run_message_loop(
     peer_addr: SocketAddr,
     _remote_identity_pk: &[u8; 32],
     reply_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::collections::HashMap;
 
@@ -433,6 +451,8 @@ async fn run_message_loop(
         chunks: HashMap<u32, Vec<u8>>,
     }
     let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
+    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> =
+        HashMap::new();
 
     // Clear any stale disconnect request before entering the loop
     DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -462,9 +482,9 @@ async fn run_message_loop(
             }
         };
 
-        // Decode envelope
-        let inner = match decode_envelope(&frame, session) {
-            Ok(plaintext) => plaintext,
+        // Decode envelope, preserving BTR fields for protected file chunks.
+        let (inner, btr_fields) = match decode_envelope_with_btr(&frame, session) {
+            Ok(decoded) => decoded,
             Err(e) => {
                 eprintln!("[WT_SESSION] {peer_addr} envelope error: {e}");
                 let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
@@ -494,12 +514,25 @@ async fn run_message_loop(
                             file_size,
                             ..
                         } => {
-                            // Decrypt chunk (static NaCl box — WT path)
-                            let data = match bolt_core::crypto::open_box_payload(
-                                chunk,
-                                &session.remote_public_key,
-                                &session.local_keypair.secret_key,
-                            ) {
+                            let data = match if let Some(ref btr_env) = btr_fields {
+                                decrypt_chunk_btr(
+                                    transfer_id,
+                                    chunk,
+                                    chunk_index,
+                                    btr_env,
+                                    session,
+                                    peer_addr,
+                                    btr_engine,
+                                    &mut btr_receive_contexts,
+                                )
+                            } else {
+                                bolt_core::crypto::open_box_payload(
+                                    chunk,
+                                    &session.remote_public_key,
+                                    &session.local_keypair.secret_key,
+                                )
+                                .map_err(|e| e.to_string())
+                            } {
                                 Ok(plaintext) => plaintext,
                                 Err(e) => {
                                     eprintln!("[WT_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
@@ -532,6 +565,15 @@ async fn run_message_loop(
                                         "[WT_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
                                         safe_name, file_size, total_chunks
                                     );
+                                    crate::ws_endpoint::emit_ipc_global(
+                                        "transfer.started",
+                                        serde_json::json!({
+                                            "transfer_id": transfer_id,
+                                            "file_name": safe_name,
+                                            "file_size_bytes": file_size,
+                                            "direction": "receive",
+                                        }),
+                                    );
                                     ReceiveTransfer {
                                         filename: safe_name,
                                         file_size,
@@ -548,9 +590,28 @@ async fn run_message_loop(
                                 || done == total
                                 || done.is_multiple_of((total / 20).max(1))
                             {
+                                let bytes_done = if rx.file_size > 0 {
+                                    (done as u64 * rx.file_size) / total as u64
+                                } else {
+                                    0
+                                };
+                                let progress = if total > 0 {
+                                    done as f32 / total as f32
+                                } else {
+                                    1.0
+                                };
                                 eprintln!(
                                     "[WT_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
                                     done, total, rx.filename
+                                );
+                                crate::ws_endpoint::emit_ipc_global(
+                                    "transfer.progress",
+                                    serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "bytes_transferred": bytes_done,
+                                        "total_bytes": rx.file_size,
+                                        "progress": progress,
+                                    }),
                                 );
                             }
 
@@ -575,6 +636,14 @@ async fn run_message_loop(
                                         "[WT_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
                                         save_path, save_dir
                                     );
+                                    crate::ws_endpoint::emit_ipc_global(
+                                        "transfer.error",
+                                        serde_json::json!({
+                                            "transfer_id": transfer_id,
+                                            "file_name": rx.filename,
+                                            "reason": "save path escaped Downloads",
+                                        }),
+                                    );
                                 } else {
                                     let _ = std::fs::create_dir_all(&save_dir);
                                     match std::fs::write(&save_path, &file_data) {
@@ -583,16 +652,42 @@ async fn run_message_loop(
                                                 "[WT_TRANSFER] {peer_addr} saved: {} ({} bytes) \u{2192} {}",
                                                 rx.filename, file_data.len(), save_path
                                             );
+                                            crate::ws_endpoint::emit_ipc_global(
+                                                "transfer.complete",
+                                                serde_json::json!({
+                                                    "transfer_id": transfer_id,
+                                                    "file_name": rx.filename,
+                                                    "bytes_transferred": file_data.len(),
+                                                    "verified": false,
+                                                    "save_path": save_path,
+                                                }),
+                                            );
                                         }
                                         Err(e) => {
                                             eprintln!(
                                                 "[WT_TRANSFER] {peer_addr} save failed: {} \u{2014} {}",
                                                 rx.filename, e
                                             );
+                                            crate::ws_endpoint::emit_ipc_global(
+                                                "transfer.error",
+                                                serde_json::json!({
+                                                    "transfer_id": transfer_id,
+                                                    "file_name": rx.filename,
+                                                    "reason": format!("{e}"),
+                                                }),
+                                            );
                                         }
                                     }
                                 }
                                 active_receives.remove(transfer_id);
+                                if btr_receive_contexts.remove(transfer_id).is_some() {
+                                    if let Ok(mut btr) = btr_engine.lock() {
+                                        if let Some(ref mut engine) = *btr {
+                                            engine.end_transfer();
+                                            eprintln!("[BTR_TRANSFER_COMPLETE] WT receive transfer context cleaned up");
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {} // Other message types (FileOffer, etc.) — ignored for now

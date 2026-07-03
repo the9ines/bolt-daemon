@@ -2,6 +2,25 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## APP-TO-APP-DIAL-FIX-1 — bound the QUIC handshake so app-to-app falls back to WS fast — 2026-07-03
+
+Fixes the native app-to-app "waiting for encrypted channel" hang. The native app
+correctly writes a QUIC-complete `connect_remote` signal (wsUrl + quicAddr +
+quicCertHash), and the daemon tries QUIC first, falling back to WS on error. But the
+QUIC handshake (`QuicDialer::connect_with_config`) had no short timeout — a stalled or
+unreachable QUIC peer blocked ~30s on the idle timeout before erroring, delaying the
+(working) WS fallback and reading as a connection hang.
+
+Fix: bound the handshake with `QUIC_CONNECT_TIMEOUT` (5s). A stalled QUIC connect now
+errors in 5s and the connect watcher falls back to WS immediately. Reproduced
+same-machine: a QUIC-complete signal with an unreachable quicAddr + valid wsUrl now
+establishes the WS session in ~6s (was ~35s). Healthy QUIC is unaffected (LAN
+handshakes complete in milliseconds). New regression test
+`connect_handshake_fails_fast_for_unreachable_peer`. 380 tests pass; fmt + clippy clean.
+
+Corrects the earlier app-to-app root-cause note: the defect is daemon-side QUIC dial
+timing, NOT a missing dial in the localbolt-app Swift wiring (the app wiring is correct).
+
 ## TRANSPORT-UNIFY-1 Phase 2 test — WebTransport session IPC integration test — 2026-07-03
 
 Closes the coverage gap flagged during Phase 2 review: no test exercised the

@@ -39,6 +39,12 @@ const ALPN_RC3: &[u8] = b"bolt-rc3";
 
 /// Keepalive prevents normal user think time from making active app sessions idle out.
 const APP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max time to wait for a QUIC handshake before giving up. A stalled or
+/// unreachable QUIC peer must fail fast so the native connect watcher can fall
+/// back to WS; otherwise the dial blocks ~30s on the idle timeout, which the user
+/// experiences as an app-to-app connection hang. (APP-TO-APP-DIAL-FIX-1.)
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SESSION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default QUIC listen port.
@@ -934,10 +940,19 @@ impl QuicDialer {
 
         eprintln!("[quic] connecting to {remote}...");
 
-        let connection = endpoint
+        let connecting = endpoint
             .connect(remote, "bolt-rc3-reference")
-            .map_err(|e| QuicTransportError::Connection(format!("connect {remote}: {e}")))?
+            .map_err(|e| QuicTransportError::Connection(format!("connect {remote}: {e}")))?;
+        // Bound the handshake so a stalled/unreachable QUIC peer fails fast and the
+        // caller can fall back to WS, instead of blocking ~30s on the idle timeout.
+        let connection = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, connecting)
             .await
+            .map_err(|_| {
+                QuicTransportError::Connection(format!(
+                    "handshake {remote} timed out after {}s",
+                    QUIC_CONNECT_TIMEOUT.as_secs()
+                ))
+            })?
             .map_err(|e| QuicTransportError::Connection(format!("handshake {remote}: {e}")))?;
 
         eprintln!(
@@ -1391,5 +1406,25 @@ mod tests {
         let size = MAX_MESSAGE_SIZE + 1;
         let err = QuicTransportError::MessageTooLarge(size);
         assert!(err.to_string().contains("too large"));
+    }
+
+    /// APP-TO-APP-DIAL-FIX-1: a stalled/unreachable QUIC handshake must fail within
+    /// ~QUIC_CONNECT_TIMEOUT so the native connect watcher falls back to WS, instead
+    /// of blocking ~30s on the idle timeout (which reads as an app-to-app hang).
+    #[tokio::test]
+    async fn connect_handshake_fails_fast_for_unreachable_peer() {
+        // 192.0.2.0/24 is RFC 5737 TEST-NET-1: unroutable, so handshake packets go
+        // nowhere and the connect genuinely stalls (not an immediate ICMP reject).
+        let unreachable: SocketAddr = "192.0.2.1:9999".parse().unwrap();
+        let dummy_hash = "0".repeat(64);
+        let start = std::time::Instant::now();
+        let result = QuicDialer::connect(unreachable, &dummy_hash).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "connect to an unreachable peer must error");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "handshake must fail fast (~{}s), took {elapsed:?}",
+            QUIC_CONNECT_TIMEOUT.as_secs()
+        );
     }
 }

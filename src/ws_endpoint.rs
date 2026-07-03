@@ -1261,7 +1261,7 @@ async fn quic_wait_for_text(
 /// Set up the active session handle, spawn a writer task for outbound messages,
 /// register the global ACTIVE_SESSION, and run the read loop.
 /// Clears ACTIVE_SESSION on exit.
-async fn run_session_with_outbound(
+pub(crate) async fn run_session_with_outbound(
     mut ws_sink: impl FrameSink,
     mut ws_source: impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
     session: SessionContext,
@@ -1627,6 +1627,9 @@ async fn run_read_loop(
                                             continue;
                                         }
 
+                                        // Ensure the destination dir exists (preserves the
+                                        // WT path's create_dir_all after transport unification).
+                                        let _ = std::fs::create_dir_all(&save_dir);
                                         match std::fs::write(&save_path, &file_data) {
                                             Ok(()) => {
                                                 eprintln!(

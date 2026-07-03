@@ -99,3 +99,56 @@ mod quic {
 }
 #[cfg(feature = "transport-quic")]
 pub use quic::{quic_message_stream, QuicFrameSink};
+
+// ── WebTransport adapters ─────────────────────────────────────
+#[cfg(feature = "transport-webtransport")]
+mod wt {
+    use super::FrameSink;
+    use crate::wt_endpoint::{read_frame, write_frame};
+    use futures_util::Stream;
+    use tokio_tungstenite::tungstenite::{self, Message};
+    use wtransport::stream::{RecvStream, SendStream};
+
+    /// Adapts a WebTransport bidi send stream to `FrameSink`. Outbound JSON text
+    /// is written as a 4-byte big-endian length-prefixed frame — the same wire
+    /// framing the WT HELLO handshake already uses (via `write_frame`).
+    pub struct WtFrameSink(pub SendStream);
+
+    impl FrameSink for WtFrameSink {
+        async fn send_text(&mut self, text: String) -> Result<(), String> {
+            write_frame(&mut self.0, text.as_bytes())
+                .await
+                .map_err(|e| e.to_string())
+        }
+        async fn close(&mut self) {
+            let _ = self.0.finish().await;
+        }
+    }
+
+    /// Presents a WT recv stream as `Stream<Item = Result<Message, tungstenite::Error>>`
+    /// so the shared read loop consumes it unchanged. Each length-prefixed WT frame
+    /// becomes `Message::Text`; a clean close ends the stream; other framing/IO errors
+    /// surface as an I/O error (the read loop logs and breaks, matching the old WT
+    /// path). WT carries JSON text only, so `from_utf8_lossy` is the identity map.
+    /// Using `unfold` keeps the in-flight `read_frame` future across `.next()`
+    /// cancellations, so a partial length-prefixed frame resumes rather than desyncs.
+    pub fn wt_message_stream(
+        receiver: RecvStream,
+    ) -> impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send {
+        Box::pin(futures_util::stream::unfold(receiver, |mut r| async move {
+            match read_frame(&mut r).await {
+                Ok(Some(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    Some((Ok(Message::Text(text)), r))
+                }
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(tungstenite::Error::Io(std::io::Error::other(e.to_string()))),
+                    r,
+                )),
+            }
+        }))
+    }
+}
+#[cfg(feature = "transport-webtransport")]
+pub use wt::{wt_message_stream, WtFrameSink};

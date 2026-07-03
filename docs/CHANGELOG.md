@@ -2,6 +2,34 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## TRANSPORT-UNIFY-1 Phase 2 — fold WebTransport onto the shared session loop — 2026-07-03
+
+Behavior-preserving refactor. WebTransport now routes through the same
+`ws_endpoint::run_session_with_outbound` + `run_read_loop` that WS and QUIC use.
+Added `session_frame::{WtFrameSink, wt_message_stream}` (mirroring the QUIC adapters;
+`wt_message_stream` wraps the existing `read_frame` via `stream::unfold`, preserving
+the 4-byte length-prefix wire framing and retaining in-flight reads across select
+cancellations). Deleted `wt_endpoint::run_message_loop` (~280 lines — the
+recovered-May-code BTR/transfer copy) plus WT's own `DISCONNECT_REQUESTED` flag;
+WT inherits BTR, `transfer.*` IPC events, and disconnect handling from the shared
+loop. `wt_endpoint.rs` 855 -> 478 lines.
+
+Key correctness (the one real risk): `ipc_tx` is threaded `main.rs` ->
+`run_wt_endpoint` -> `handle_incoming_session` -> `run_session_with_outbound`. The
+shared loop emits via `emit_ipc(ipc_tx)` (a no-op on `None`); the threaded sender and
+the global `IPC_TX` are clones of the same channel, so IPC delivery is identical to
+the old `emit_ipc_global` path. `create_dir_all` was lifted into the shared loop to
+preserve WT's destination-dir creation (a strict improvement for WS/QUIC too).
+
+Validation: `cargo test --features native-full -- --test-threads=1` -> 378 passing;
+fmt + clippy clean; WS-only and QUIC-only builds compile (WT cfg-gated). A 3-agent
+adversarial review of the diff returned CLEAN — all six identified risks handled or
+benign. Open follow-up: no test exercises the WT post-HELLO session path (a
+pre-existing gap, never covered even for the recovered May code); a WT session/IPC
+integration test is the top NOW item. A runtime browser-over-WT check was attempted
+but blocked by an environmental Chrome WebTransport cert-handshake issue unrelated to
+this change (the WT endpoint was confirmed listening).
+
 ## TRANSPORT-UNIFY-1 Phase 1 — unify WS+QUIC session loop onto a frame seam — 2026-07-03
 
 Behavior-preserving refactor (architecture debt paydown). Added `session_frame.rs`

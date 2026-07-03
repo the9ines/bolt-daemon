@@ -22,15 +22,12 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
-use std::sync::Arc;
-
-use crate::envelope::{build_error_payload, decode_envelope_with_btr, route_inner_message};
 use crate::web_hello::{
     build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
 };
-use crate::ws_btr::{compute_x25519_shared_secret, decrypt_chunk_btr};
-use crate::ws_endpoint::{ActiveSessionHandle, ACTIVE_SESSION};
-use crate::ws_validation::{sanitize_filename, MAX_TRANSFER_SIZE};
+// TRANSPORT-UNIFY-1 Phase 2: WT routes through the shared session loop; the
+// envelope/BTR/transfer machinery is inherited from it, not re-owned here.
+use crate::ws_endpoint::run_session_with_outbound;
 
 /// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
 fn copy_keypair(kp: &KeyPair) -> KeyPair {
@@ -38,19 +35,6 @@ fn copy_keypair(kp: &KeyPair) -> KeyPair {
         public_key: kp.public_key,
         secret_key: kp.secret_key,
     }
-}
-
-// ── Disconnect flag (mirrors ws_endpoint pattern) ───────────
-
-/// Request to close the active WT session from outside the WT task (e.g., UI disconnect).
-/// The message loop checks this flag and breaks if set.
-pub(crate) static DISCONNECT_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Signal the active WT session to close gracefully.
-pub fn request_disconnect() {
-    DISCONNECT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[WT_SESSION] disconnect requested");
 }
 
 // ── Configuration ────────────────────────────────────────────
@@ -70,7 +54,7 @@ pub struct WtEndpointConfig {
 // ── Framing helpers (4-byte big-endian length prefix) ────────
 
 /// Write a length-prefixed JSON frame to a WebTransport send stream.
-async fn write_frame(
+pub(crate) async fn write_frame(
     send: &mut wtransport::stream::SendStream,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -82,7 +66,7 @@ async fn write_frame(
 
 /// Read a length-prefixed JSON frame from a WebTransport recv stream.
 /// Returns None on clean stream close. Enforces a 1 MiB max frame size.
-async fn read_frame(
+pub(crate) async fn read_frame(
     recv: &mut wtransport::stream::RecvStream,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
     use wtransport::error::StreamReadExactError;
@@ -117,6 +101,7 @@ async fn read_frame(
 pub async fn run_wt_endpoint(
     config: WtEndpointConfig,
     mut shutdown_rx: watch::Receiver<bool>,
+    ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load TLS identity from PEM files
     let identity = Identity::load_pemfiles(&config.cert_path, &config.key_path)
@@ -153,12 +138,13 @@ pub async fn run_wt_endpoint(
             incoming = server.accept() => {
                 let pk = std::sync::Arc::clone(&identity_pk);
                 let sk = std::sync::Arc::clone(&identity_sk);
+                let ipc = ipc_tx.clone();
                 tokio::spawn(async move {
                     let identity = KeyPair {
                         public_key: *pk,
                         secret_key: *sk,
                     };
-                    if let Err(e) = handle_incoming_session(incoming, &identity).await {
+                    if let Err(e) = handle_incoming_session(incoming, &identity, ipc).await {
                         eprintln!("[WT_SESSION] error: {e}");
                     }
                 });
@@ -186,6 +172,7 @@ pub async fn run_wt_endpoint(
 async fn handle_incoming_session(
     incoming: IncomingSession,
     identity: &KeyPair,
+    ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Step 1: Accept WebTransport session ──────────────────
     let session_request = incoming
@@ -304,115 +291,17 @@ async fn handle_incoming_session(
     );
     eprintln!("[SAS] {sas}");
 
-    let session = Arc::new(session);
+    eprintln!("[WT_SESSION] {peer_addr} session established, entering shared session loop");
 
-    // Register ACTIVE_SESSION so IPC file.send can use this WT session
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let btr_engine = if session.has_capability("bolt.transfer-ratchet-v1") {
-        let shared_secret = compute_x25519_shared_secret(
-            &session.local_keypair.secret_key,
-            &session.remote_public_key,
-        );
-        let engine = bolt_btr::BtrEngine::new(&shared_secret);
-        eprintln!(
-            "[BTR] {peer_addr} WT engine initialized (generation={})",
-            engine.ratchet_generation()
-        );
-        Some(engine)
-    } else {
-        eprintln!("[BTR] {peer_addr} WT BTR not negotiated — static NaCl box mode");
-        None
-    };
-    let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
-    {
-        match ACTIVE_SESSION.lock() {
-            Ok(mut guard) => {
-                *guard = Some(ActiveSessionHandle {
-                    outbound_tx: outbound_tx.clone(),
-                    session: Arc::clone(&session),
-                    btr_engine: Arc::clone(&btr_engine_arc),
-                });
-            }
-            Err(e) => eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION lock poisoned: {e}"),
-        }
-    }
-    eprintln!("[WT_SESSION] {peer_addr} session established, ACTIVE_SESSION registered");
-
-    // Writer task: drains outbound channel (IPC file sends) → WT send stream
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let writer_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                msg = outbound_rx.recv() => {
-                    match msg {
-                        Some(text) => {
-                            if let Err(e) = write_frame(&mut send, text.as_bytes()).await {
-                                eprintln!("[WT_SESSION] outbound send error: {e}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                reply = reply_rx.recv() => {
-                    match reply {
-                        Some(data) => {
-                            if let Err(e) = write_frame(&mut send, &data).await {
-                                eprintln!("[WT_SESSION] reply send error: {e}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
-
-    // Read loop
-    let result = run_message_loop(
-        &mut recv,
-        &session,
+    run_session_with_outbound(
+        crate::session_frame::WtFrameSink(send),
+        crate::session_frame::wt_message_stream(recv),
+        session,
         peer_addr,
-        &remote_identity_pk,
-        &reply_tx,
-        &btr_engine_arc,
+        remote_identity_pk,
+        ipc_tx.as_ref(),
     )
-    .await;
-
-    // Emit session lifecycle IPC event (mirrors WS endpoint pattern)
-    match &result {
-        Ok(()) => {
-            crate::ws_endpoint::emit_ipc_global(
-                "session.ended",
-                serde_json::json!({
-                    "reason": "connection closed",
-                }),
-            );
-        }
-        Err(e) => {
-            crate::ws_endpoint::emit_ipc_global(
-                "session.error",
-                serde_json::json!({
-                    "reason": format!("{e}"),
-                }),
-            );
-        }
-    }
-
-    // Cleanup: clear ACTIVE_SESSION
-    {
-        match ACTIVE_SESSION.lock() {
-            Ok(mut guard) => *guard = None,
-            Err(e) => eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION lock poisoned: {e}"),
-        }
-    }
-    eprintln!("[WT_SESSION] {peer_addr} ACTIVE_SESSION cleared");
-
-    drop(reply_tx);
-    let _ = writer_handle.await;
-
-    result
+    .await
 }
 
 /// Read a frame with a 30s timeout.
@@ -427,287 +316,6 @@ async fn read_frame_with_timeout(
         .ok_or_else(|| format!("[WT_HELLO] {peer_addr} stream closed during handshake"))?;
     Ok(frame)
 }
-
-/// Post-HELLO envelope message loop.
-///
-/// Receives encrypted ProfileEnvelopeV1 frames (length-prefixed),
-/// decrypts, routes via `route_inner_message`, and sends any reply.
-/// Runs until the peer disconnects or a protocol violation occurs.
-#[allow(clippy::collapsible_match, clippy::single_match)]
-async fn run_message_loop(
-    recv: &mut wtransport::stream::RecvStream,
-    session: &SessionContext,
-    peer_addr: SocketAddr,
-    _remote_identity_pk: &[u8; 32],
-    reply_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::collections::HashMap;
-
-    struct ReceiveTransfer {
-        filename: String,
-        file_size: u64,
-        total_chunks: u32,
-        chunks: HashMap<u32, Vec<u8>>,
-    }
-    let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
-    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> =
-        HashMap::new();
-
-    // Clear any stale disconnect request before entering the loop
-    DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-
-    loop {
-        // Check disconnect flag every iteration (mirrors WS read loop pattern)
-        if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[WT_SESSION] {peer_addr} disconnect requested — closing");
-            break;
-        }
-
-        let frame_result = tokio::select! {
-            r = read_frame(recv) => r,
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
-        };
-
-        let frame = match frame_result {
-            Ok(Some(data)) => data,
-            Ok(None) => {
-                eprintln!("[WT_SESSION] {peer_addr} stream closed cleanly");
-                break;
-            }
-            Err(e) => {
-                eprintln!("[WT_SESSION] {peer_addr} read error: {e}");
-                break;
-            }
-        };
-
-        // Decode envelope, preserving BTR fields for protected file chunks.
-        let (inner, btr_fields) = match decode_envelope_with_btr(&frame, session) {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                eprintln!("[WT_SESSION] {peer_addr} envelope error: {e}");
-                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = reply_tx.send(error_payload);
-                break;
-            }
-        };
-
-        // Route inner message
-        match route_inner_message(&inner, session) {
-            Ok(Some(reply_bytes)) => {
-                if reply_tx.send(reply_bytes).is_err() {
-                    eprintln!("[WT_SESSION] {peer_addr} reply channel closed");
-                    break;
-                }
-            }
-            Ok(None) => {
-                // Check for file-transfer messages (FileChunk, etc.)
-                if let Ok(dc_msg) = crate::dc_messages::parse_dc_message(&inner) {
-                    match dc_msg {
-                        crate::dc_messages::DcMessage::FileChunk {
-                            ref transfer_id,
-                            ref filename,
-                            chunk_index,
-                            total_chunks,
-                            ref chunk,
-                            file_size,
-                            ..
-                        } => {
-                            let data = match if let Some(ref btr_env) = btr_fields {
-                                decrypt_chunk_btr(
-                                    transfer_id,
-                                    chunk,
-                                    chunk_index,
-                                    btr_env,
-                                    session,
-                                    peer_addr,
-                                    btr_engine,
-                                    &mut btr_receive_contexts,
-                                )
-                            } else {
-                                bolt_core::crypto::open_box_payload(
-                                    chunk,
-                                    &session.remote_public_key,
-                                    &session.local_keypair.secret_key,
-                                )
-                                .map_err(|e| e.to_string())
-                            } {
-                                Ok(plaintext) => plaintext,
-                                Err(e) => {
-                                    eprintln!("[WT_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
-                                    continue;
-                                }
-                            };
-
-                            // Reject oversized transfers
-                            if !active_receives.contains_key(transfer_id)
-                                && file_size > MAX_TRANSFER_SIZE
-                            {
-                                eprintln!(
-                                    "[WT_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
-                                    filename, file_size, MAX_TRANSFER_SIZE
-                                );
-                                continue;
-                            }
-
-                            let rx = active_receives
-                                .entry(transfer_id.clone())
-                                .or_insert_with(|| {
-                                    let safe_name = match sanitize_filename(filename) {
-                                        Ok(name) => name,
-                                        Err(e) => {
-                                            eprintln!("[WT_TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {filename:?})");
-                                            format!("received_{}", transfer_id)
-                                        }
-                                    };
-                                    eprintln!(
-                                        "[WT_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
-                                        safe_name, file_size, total_chunks
-                                    );
-                                    crate::ws_endpoint::emit_ipc_global(
-                                        "transfer.started",
-                                        serde_json::json!({
-                                            "transfer_id": transfer_id,
-                                            "file_name": safe_name,
-                                            "file_size_bytes": file_size,
-                                            "direction": "receive",
-                                        }),
-                                    );
-                                    ReceiveTransfer {
-                                        filename: safe_name,
-                                        file_size,
-                                        total_chunks,
-                                        chunks: HashMap::new(),
-                                    }
-                                });
-                            rx.chunks.insert(chunk_index, data);
-
-                            // Progress (throttled)
-                            let done = rx.chunks.len() as u32;
-                            let total = rx.total_chunks;
-                            if done == 1
-                                || done == total
-                                || done.is_multiple_of((total / 20).max(1))
-                            {
-                                let bytes_done = if rx.file_size > 0 {
-                                    (done as u64 * rx.file_size) / total as u64
-                                } else {
-                                    0
-                                };
-                                let progress = if total > 0 {
-                                    done as f32 / total as f32
-                                } else {
-                                    1.0
-                                };
-                                eprintln!(
-                                    "[WT_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
-                                    done, total, rx.filename
-                                );
-                                crate::ws_endpoint::emit_ipc_global(
-                                    "transfer.progress",
-                                    serde_json::json!({
-                                        "transfer_id": transfer_id,
-                                        "bytes_transferred": bytes_done,
-                                        "total_bytes": rx.file_size,
-                                        "progress": progress,
-                                    }),
-                                );
-                            }
-
-                            // All chunks received — assemble and save
-                            if rx.chunks.len() as u32 >= rx.total_chunks {
-                                let mut file_data = Vec::with_capacity(rx.file_size as usize);
-                                for i in 0..rx.total_chunks {
-                                    if let Some(c) = rx.chunks.get(&i) {
-                                        file_data.extend_from_slice(c);
-                                    }
-                                }
-                                let save_dir = format!(
-                                    "{}/Downloads",
-                                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-                                );
-                                let save_path = format!("{}/{}", save_dir, rx.filename);
-
-                                let canonical_dir = std::path::Path::new(&save_dir);
-                                let canonical_path = std::path::Path::new(&save_path);
-                                if !canonical_path.starts_with(canonical_dir) {
-                                    eprintln!(
-                                        "[WT_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
-                                        save_path, save_dir
-                                    );
-                                    crate::ws_endpoint::emit_ipc_global(
-                                        "transfer.error",
-                                        serde_json::json!({
-                                            "transfer_id": transfer_id,
-                                            "file_name": rx.filename,
-                                            "reason": "save path escaped Downloads",
-                                        }),
-                                    );
-                                } else {
-                                    let _ = std::fs::create_dir_all(&save_dir);
-                                    match std::fs::write(&save_path, &file_data) {
-                                        Ok(()) => {
-                                            eprintln!(
-                                                "[WT_TRANSFER] {peer_addr} saved: {} ({} bytes) \u{2192} {}",
-                                                rx.filename, file_data.len(), save_path
-                                            );
-                                            crate::ws_endpoint::emit_ipc_global(
-                                                "transfer.complete",
-                                                serde_json::json!({
-                                                    "transfer_id": transfer_id,
-                                                    "file_name": rx.filename,
-                                                    "bytes_transferred": file_data.len(),
-                                                    "verified": false,
-                                                    "save_path": save_path,
-                                                }),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[WT_TRANSFER] {peer_addr} save failed: {} \u{2014} {}",
-                                                rx.filename, e
-                                            );
-                                            crate::ws_endpoint::emit_ipc_global(
-                                                "transfer.error",
-                                                serde_json::json!({
-                                                    "transfer_id": transfer_id,
-                                                    "file_name": rx.filename,
-                                                    "reason": format!("{e}"),
-                                                }),
-                                            );
-                                        }
-                                    }
-                                }
-                                active_receives.remove(transfer_id);
-                                if btr_receive_contexts.remove(transfer_id).is_some() {
-                                    if let Ok(mut btr) = btr_engine.lock() {
-                                        if let Some(ref mut engine) = *btr {
-                                            engine.end_transfer();
-                                            eprintln!("[BTR_TRANSFER_COMPLETE] WT receive transfer context cleaned up");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {} // Other message types (FileOffer, etc.) — ignored for now
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[WT_SESSION] {peer_addr} route error: {e}");
-                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = reply_tx.send(error_payload);
-                break;
-            }
-        }
-    }
-
-    eprintln!("[WT_SESSION] {peer_addr} message loop ended");
-    Ok(())
-}
-
-// ── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -850,7 +458,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let handle = tokio::spawn(async move { run_wt_endpoint(config, shutdown_rx).await });
+        let handle = tokio::spawn(async move { run_wt_endpoint(config, shutdown_rx, None).await });
 
         // Give server time to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

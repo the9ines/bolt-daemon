@@ -759,8 +759,6 @@ fn main() {
                             if disconnect_signal_path.exists() {
                                 let _ = std::fs::remove_file(&disconnect_signal_path);
                                 ws_endpoint::request_disconnect();
-                                #[cfg(feature = "transport-webtransport")]
-                                wt_endpoint::request_disconnect();
                             }
                         }
                     });
@@ -804,8 +802,11 @@ fn main() {
                             key_path: cert.key_pem_path.to_string_lossy().to_string(),
                         };
                         let wt_shutdown_rx = _shutdown_tx.subscribe();
+                        let wt_ipc_tx = ipc_event_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = wt_endpoint::run_wt_endpoint(wt_config, wt_shutdown_rx).await {
+                            if let Err(e) =
+                                wt_endpoint::run_wt_endpoint(wt_config, wt_shutdown_rx, wt_ipc_tx).await
+                            {
                                 eprintln!("[WT_ENDPOINT] error: {e}");
                             }
                         });

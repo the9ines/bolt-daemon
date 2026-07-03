@@ -2,6 +2,26 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## TRANSPORT-UNIFY-1 Phase 1 — unify WS+QUIC session loop onto a frame seam — 2026-07-03
+
+Behavior-preserving refactor (architecture debt paydown). Added `session_frame.rs`
+— a transport-neutral `FrameSink` seam plus WS/QUIC adapters. The session lifecycle
+(`run_session_with_outbound` + `run_read_loop`) is now written once; QUIC routes
+through it via a `FrameSink` sender adapter and a `Stream<Message>` receiver adapter
+(`quic_message_stream`). Deleted the duplicate `run_quic_session_with_outbound` and
+`run_quic_read_loop` (~390 lines); `ws_endpoint.rs` 3188 -> 2801 lines.
+
+No protocol, wire-format, or cryptographic change — adapters translate frames in
+memory only. Validation: `cargo test --features native-full -- --test-threads=1`
+-> 378 passing (incl. rc3_btr_over_quic, rc3_quic_e2e, rc5_btr_over_ws,
+wti5_btr_over_wt); `cargo fmt`/`clippy` clean; WS-only default build compiles (QUIC
+seam is cfg-gated).
+
+Known cosmetic follow-up: QUIC sessions now log under the shared loop's `[WS_*]`
+tags (no behavior/wire/test impact); log-tag neutralization + the misnamed
+`ws_endpoint.rs`/loop rename are deferred. WebTransport folds onto the same seam in
+Phase 2.
+
 ## WT-BTR-RECEIVE-1 — BTR decrypt + IPC transfer events on WT receive — 2026-07-03
 
 Recovered May-era working-tree progress (found uncommitted during the

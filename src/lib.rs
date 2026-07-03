@@ -21,6 +21,11 @@ pub mod web_hello;
 #[doc(hidden)]
 pub mod connect_signal;
 
+/// Transport-neutral session frame seam (TRANSPORT-UNIFY-1). One session loop,
+/// per-transport adapters (WS/QUIC/WT).
+#[doc(hidden)]
+pub mod session_frame;
+
 /// Input validation boundary for WS file transfers (MODULARITY-AUDITABILITY-2).
 /// Pure functions — no global state, no async.
 #[doc(hidden)]

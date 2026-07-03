@@ -45,6 +45,10 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 
+// Transport-neutral outbound seam (TRANSPORT-UNIFY-1): the session writer sends
+// through FrameSink so the loop is shared across WS/QUIC/WT.
+use crate::session_frame::FrameSink;
+
 // Validation functions extracted to ws_validation (MODULARITY-AUDITABILITY-2).
 pub use crate::ws_validation::validate_send_file_path;
 use crate::ws_validation::{parse_transfer_id_bytes, sanitize_filename, MAX_TRANSFER_SIZE};
@@ -599,7 +603,7 @@ pub async fn connect_to_remote_ws(
 
     // Enter the same message loop as server connections
     run_session_with_outbound(
-        ws_sink,
+        crate::session_frame::WsFrameSink(ws_sink),
         ws_source,
         session,
         synthetic_peer_addr,
@@ -725,9 +729,9 @@ pub async fn connect_to_remote_quic(
         }),
     );
 
-    let result = run_quic_session_with_outbound(
-        sender,
-        receiver,
+    let result = run_session_with_outbound(
+        crate::session_frame::QuicFrameSink(sender),
+        crate::session_frame::quic_message_stream(receiver),
         session,
         remote,
         remote_identity_pk,
@@ -853,9 +857,9 @@ pub async fn handle_quic_framed_stream(
     );
 
     eprintln!("[QUIC_SESSION] {peer_addr} session established, entering message loop");
-    run_quic_session_with_outbound(
-        sender,
-        receiver,
+    run_session_with_outbound(
+        crate::session_frame::QuicFrameSink(sender),
+        crate::session_frame::quic_message_stream(receiver),
         session,
         peer_addr,
         remote_identity_pk,
@@ -1088,7 +1092,7 @@ async fn handle_connection(
         );
 
         return run_session_with_outbound(
-            ws_sink,
+            crate::session_frame::WsFrameSink(ws_sink),
             ws_source,
             session,
             peer_addr,
@@ -1182,7 +1186,7 @@ async fn handle_connection(
 
     // ── Step 8: Envelope message loop ────────────────────────
     run_session_with_outbound(
-        ws_sink,
+        crate::session_frame::WsFrameSink(ws_sink),
         ws_source,
         session,
         peer_addr,
@@ -1252,405 +1256,13 @@ async fn quic_wait_for_text(
         .map_err(|_| format!("[QUIC_HELLO] {peer_addr} {phase} frame is not valid UTF-8").into())
 }
 
-#[cfg(feature = "transport-quic")]
-async fn run_quic_session_with_outbound(
-    mut sender: crate::quic_transport::QuicMessageSender,
-    mut receiver: crate::quic_transport::QuicMessageReceiver,
-    session: SessionContext,
-    peer_addr: SocketAddr,
-    remote_pk: [u8; 32],
-    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let session = Arc::new(session);
-
-    let btr_engine = if session.has_capability("bolt.transfer-ratchet-v1") {
-        let shared_secret = compute_x25519_shared_secret(
-            &session.local_keypair.secret_key,
-            &session.remote_public_key,
-        );
-        let engine = bolt_btr::BtrEngine::new(&shared_secret);
-        eprintln!(
-            "[BTR] {peer_addr} QUIC engine initialized (generation={})",
-            engine.ratchet_generation()
-        );
-        Some(engine)
-    } else {
-        eprintln!("[BTR] {peer_addr} QUIC BTR not negotiated — static NaCl box mode");
-        None
-    };
-    let btr_engine_arc = Arc::new(std::sync::Mutex::new(btr_engine));
-
-    {
-        match ACTIVE_SESSION.lock() {
-            Ok(mut guard) => {
-                *guard = Some(ActiveSessionHandle {
-                    outbound_tx: outbound_tx.clone(),
-                    session: Arc::clone(&session),
-                    btr_engine: Arc::clone(&btr_engine_arc),
-                });
-            }
-            Err(e) => eprintln!("[QUIC_SESSION] {peer_addr} active session lock poisoned: {e}"),
-        }
-    }
-    eprintln!("[QUIC_SESSION] {peer_addr} active session handle registered");
-
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let writer_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                msg = outbound_rx.recv() => {
-                    match msg {
-                        Some(text) => {
-                            if let Err(e) = sender.send_message(text.as_bytes()).await {
-                                eprintln!("[QUIC_SESSION] outbound send error: {e}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                reply = reply_rx.recv() => {
-                    match reply {
-                        Some(text) => {
-                            if let Err(e) = sender.send_message(text.as_bytes()).await {
-                                eprintln!("[QUIC_SESSION] reply send error: {e}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        let _ = sender.finish().await;
-    });
-
-    let result = run_quic_read_loop(
-        &mut receiver,
-        &session,
-        peer_addr,
-        &remote_pk,
-        &reply_tx,
-        &btr_engine_arc,
-        ipc_tx,
-    )
-    .await;
-
-    match &result {
-        Ok(()) => {
-            emit_ipc(
-                ipc_tx,
-                "session.ended",
-                serde_json::json!({
-                    "reason": "connection closed",
-                }),
-            );
-        }
-        Err(e) => {
-            emit_ipc(
-                ipc_tx,
-                "session.error",
-                serde_json::json!({
-                    "reason": format!("{e}"),
-                }),
-            );
-        }
-    }
-
-    if let Ok(mut btr) = btr_engine_arc.lock() {
-        if let Some(ref mut engine) = *btr {
-            engine.cleanup_disconnect();
-            eprintln!("[BTR] {peer_addr} QUIC engine zeroized on disconnect");
-        }
-    }
-    {
-        match ACTIVE_SESSION.lock() {
-            Ok(mut guard) => *guard = None,
-            Err(e) => eprintln!("[QUIC_SESSION] {peer_addr} active session lock poisoned: {e}"),
-        }
-    }
-    eprintln!("[QUIC_SESSION] {peer_addr} active session handle cleared");
-
-    drop(reply_tx);
-    let _ = writer_handle.await;
-
-    result
-}
-
-#[cfg(feature = "transport-quic")]
-#[allow(clippy::collapsible_match, clippy::single_match)]
-async fn run_quic_read_loop(
-    receiver: &mut crate::quic_transport::QuicMessageReceiver,
-    session: &SessionContext,
-    peer_addr: SocketAddr,
-    _remote_identity_pk: &[u8; 32],
-    reply_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    btr_engine: &Arc<std::sync::Mutex<Option<bolt_btr::BtrEngine>>>,
-    ipc_tx: Option<&std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::collections::HashMap;
-
-    struct ReceiveTransfer {
-        filename: String,
-        file_size: u64,
-        total_chunks: u32,
-        chunks: HashMap<u32, Vec<u8>>,
-    }
-    let mut active_receives: HashMap<String, ReceiveTransfer> = HashMap::new();
-    let mut btr_receive_contexts: HashMap<String, (bolt_btr::BtrTransferContext, u32)> =
-        HashMap::new();
-
-    DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-
-    loop {
-        if DISCONNECT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            DISCONNECT_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[QUIC_SESSION] {peer_addr} disconnect requested — closing");
-            break;
-        }
-
-        let frame_result = tokio::select! {
-            r = receiver.recv_message() => r,
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
-        };
-
-        let frame = match frame_result {
-            Ok(frame) => frame,
-            Err(crate::quic_transport::QuicTransportError::Closed) => {
-                eprintln!("[QUIC_SESSION] {peer_addr} stream closed cleanly");
-                break;
-            }
-            Err(e) => {
-                eprintln!("[QUIC_SESSION] {peer_addr} read error: {e}");
-                break;
-            }
-        };
-
-        let (inner, btr_fields) = match decode_envelope_with_btr(&frame, session) {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[QUIC_SESSION] {peer_addr} envelope error: {e}");
-                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
-                break;
-            }
-        };
-
-        match route_inner_message(&inner, session) {
-            Ok(Some(reply_bytes)) => {
-                let reply_text = String::from_utf8_lossy(&reply_bytes).into_owned();
-                if reply_tx.send(reply_text).is_err() {
-                    eprintln!("[QUIC_SESSION] {peer_addr} reply channel closed");
-                    break;
-                }
-            }
-            Ok(None) => {
-                if let Ok(dc_msg) = crate::dc_messages::parse_dc_message(&inner) {
-                    match dc_msg {
-                        crate::dc_messages::DcMessage::FileChunk {
-                            ref transfer_id,
-                            ref filename,
-                            chunk_index,
-                            total_chunks,
-                            ref chunk,
-                            file_size,
-                            ..
-                        } => {
-                            let data = if let Some(ref btr_env) = btr_fields {
-                                decrypt_chunk_btr(
-                                    transfer_id,
-                                    chunk,
-                                    chunk_index,
-                                    btr_env,
-                                    session,
-                                    peer_addr,
-                                    btr_engine,
-                                    &mut btr_receive_contexts,
-                                )
-                            } else {
-                                bolt_core::crypto::open_box_payload(
-                                    chunk,
-                                    &session.remote_public_key,
-                                    &session.local_keypair.secret_key,
-                                )
-                                .map_err(|e| e.to_string())
-                            };
-                            let data = match data {
-                                Ok(plaintext) => plaintext,
-                                Err(e) => {
-                                    eprintln!("[QUIC_TRANSFER] {peer_addr} chunk {chunk_index} decrypt FAILED: {e}");
-                                    continue;
-                                }
-                            };
-
-                            if !active_receives.contains_key(transfer_id)
-                                && file_size > MAX_TRANSFER_SIZE
-                            {
-                                eprintln!(
-                                    "[QUIC_TRANSFER] {peer_addr} REJECTED: {} ({} bytes) exceeds {} byte limit",
-                                    filename, file_size, MAX_TRANSFER_SIZE
-                                );
-                                continue;
-                            }
-
-                            let rx = active_receives
-                                .entry(transfer_id.clone())
-                                .or_insert_with(|| {
-                                    let safe_name = match sanitize_filename(filename) {
-                                        Ok(name) => name,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[QUIC_TRANSFER] {peer_addr} REJECTED filename: {e} (raw: {:?})",
-                                                filename
-                                            );
-                                            format!("received_{}", transfer_id)
-                                        }
-                                    };
-                                    eprintln!(
-                                        "[QUIC_TRANSFER] {peer_addr} receiving: {} ({} bytes, {} chunks)",
-                                        safe_name, file_size, total_chunks
-                                    );
-                                    emit_ipc(ipc_tx, "transfer.started", serde_json::json!({
-                                        "transfer_id": transfer_id,
-                                        "file_name": safe_name,
-                                        "file_size_bytes": file_size,
-                                        "direction": "receive",
-                                    }));
-                                    ReceiveTransfer {
-                                        filename: safe_name,
-                                        file_size,
-                                        total_chunks,
-                                        chunks: HashMap::new(),
-                                    }
-                                });
-                            rx.chunks.insert(chunk_index, data);
-
-                            let done = rx.chunks.len() as u32;
-                            let total = rx.total_chunks;
-                            if done == 1
-                                || done == total
-                                || done.is_multiple_of((total / 20).max(1))
-                            {
-                                let bytes_done = if rx.file_size > 0 {
-                                    (done as u64 * rx.file_size) / total as u64
-                                } else {
-                                    0
-                                };
-                                let progress = if total > 0 {
-                                    done as f32 / total as f32
-                                } else {
-                                    1.0
-                                };
-                                eprintln!(
-                                    "[QUIC_TRANSFER] {peer_addr} progress: {}/{} chunks ({})",
-                                    done, total, rx.filename
-                                );
-                                emit_ipc(
-                                    ipc_tx,
-                                    "transfer.progress",
-                                    serde_json::json!({
-                                        "transfer_id": transfer_id,
-                                        "bytes_transferred": bytes_done,
-                                        "total_bytes": rx.file_size,
-                                        "progress": progress,
-                                    }),
-                                );
-                            }
-
-                            if rx.chunks.len() as u32 >= rx.total_chunks {
-                                let mut file_data = Vec::with_capacity(rx.file_size as usize);
-                                for i in 0..rx.total_chunks {
-                                    if let Some(c) = rx.chunks.get(&i) {
-                                        file_data.extend_from_slice(c);
-                                    }
-                                }
-                                let save_dir = format!(
-                                    "{}/Downloads",
-                                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-                                );
-                                let save_path = format!("{}/{}", save_dir, rx.filename);
-
-                                let canonical_dir = std::path::Path::new(&save_dir);
-                                let canonical_path = std::path::Path::new(&save_path);
-                                if !canonical_path.starts_with(canonical_dir) {
-                                    eprintln!(
-                                        "[QUIC_TRANSFER] {peer_addr} PATH ESCAPE BLOCKED: {} resolves outside {}",
-                                        save_path, save_dir
-                                    );
-                                    active_receives.remove(transfer_id);
-                                    continue;
-                                }
-
-                                match std::fs::write(&save_path, &file_data) {
-                                    Ok(()) => {
-                                        eprintln!(
-                                            "[QUIC_TRANSFER] {peer_addr} saved: {} ({} bytes) -> {}",
-                                            rx.filename, file_data.len(), save_path
-                                        );
-                                        emit_ipc(
-                                            ipc_tx,
-                                            "transfer.complete",
-                                            serde_json::json!({
-                                                "transfer_id": transfer_id,
-                                                "file_name": rx.filename,
-                                                "bytes_transferred": file_data.len(),
-                                                "verified": false,
-                                                "save_path": save_path,
-                                            }),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[QUIC_TRANSFER] {peer_addr} save failed: {} - {}",
-                                            rx.filename, e
-                                        );
-                                        emit_ipc(
-                                            ipc_tx,
-                                            "transfer.error",
-                                            serde_json::json!({
-                                                "transfer_id": transfer_id,
-                                                "file_name": rx.filename,
-                                                "reason": format!("{e}"),
-                                            }),
-                                        );
-                                    }
-                                }
-                                active_receives.remove(transfer_id);
-                                if btr_receive_contexts.remove(transfer_id).is_some() {
-                                    if let Ok(mut btr) = btr_engine.lock() {
-                                        if let Some(ref mut engine) = *btr {
-                                            engine.end_transfer();
-                                            eprintln!("[BTR_TRANSFER_COMPLETE] QUIC receive transfer context cleaned up");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[QUIC_SESSION] {peer_addr} route error: {e}");
-                let error_payload = build_error_payload(e.code(), &e.to_string(), Some(session));
-                let _ = reply_tx.send(String::from_utf8_lossy(&error_payload).into_owned());
-                break;
-            }
-        }
-    }
-
-    eprintln!("[QUIC_SESSION] {peer_addr} message loop ended");
-    Ok(())
-}
-
 /// Post-HELLO envelope message loop.
 ///
 /// Set up the active session handle, spawn a writer task for outbound messages,
 /// register the global ACTIVE_SESSION, and run the read loop.
 /// Clears ACTIVE_SESSION on exit.
 async fn run_session_with_outbound(
-    mut ws_sink: impl SinkExt<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    mut ws_sink: impl FrameSink,
     mut ws_source: impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
     session: SessionContext,
     peer_addr: SocketAddr,
@@ -1707,7 +1319,7 @@ async fn run_session_with_outbound(
                 msg = outbound_rx.recv() => {
                     match msg {
                         Some(text) => {
-                            if let Err(e) = ws_sink.send(Message::Text(text)).await {
+                            if let Err(e) = ws_sink.send_text(text).await {
                                 eprintln!("[WS_SESSION] outbound send error: {e}");
                                 break;
                             }
@@ -1718,7 +1330,7 @@ async fn run_session_with_outbound(
                 reply = reply_rx.recv() => {
                     match reply {
                         Some(text) => {
-                            if let Err(e) = ws_sink.send(Message::Text(text)).await {
+                            if let Err(e) = ws_sink.send_text(text).await {
                                 eprintln!("[WS_SESSION] reply send error: {e}");
                                 break;
                             }
@@ -1728,6 +1340,7 @@ async fn run_session_with_outbound(
                 }
             }
         }
+        ws_sink.close().await;
     });
 
     // Read loop

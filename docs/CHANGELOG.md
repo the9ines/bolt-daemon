@@ -2,6 +2,20 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## Drop native-tls/OpenSSL — daemon is pure-ring and cross-compiles for Linux/Windows — 2026-07-03
+
+The daemon depended on `native-tls` (OpenSSL) via a `tungstenite` feature flag, but it was
+vestigial: the WS transport only ever speaks plain `ws://` (the Bolt envelope layer provides
+NaCl encryption; QUIC/WT carry their own rustls/ring TLS). native-tls pulled OpenSSL, which
+blocked cross-compiling the daemon for Linux from macOS (no target `libssl`) and would have
+added an OpenSSL runtime dependency to a Steam Deck Flatpak / Windows build.
+
+Removed the `native-tls` feature + direct dep. `openssl`, `openssl-sys`, and `native-tls` are
+now entirely absent from the tree — crypto is pure-ring. Behavior-preserving (plain ws://
+unchanged; 380 tests green, fmt+clippy clean). Verified: the daemon now cross-compiles for
+`x86_64-unknown-linux-gnu` (the Steam Deck arch) via cargo-zigbuild. De-risks the Linux/Windows
+release tracks.
+
 ## TRANSPORT-UNIFY-1 cleanup — neutral session-loop log tags + rename ws_endpoint.rs — 2026-07-03
 
 Finishes the transport-unification cleanup now that all three transports share one

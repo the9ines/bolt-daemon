@@ -37,8 +37,11 @@ bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }
 bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+# Plain ws:// only — the Bolt envelope layer (NaCl) provides encryption, so no
+# transport TLS. Dropping the native-tls feature removes the OpenSSL dependency,
+# which keeps the daemon pure-ring and lets it cross-compile cleanly for Linux
+# (Steam Deck) and Windows. QUIC/WT keep their own rustls/ring-based TLS.
+tungstenite = { version = "0.24" }
 rand = "0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 

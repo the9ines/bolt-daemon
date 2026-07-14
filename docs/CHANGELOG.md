@@ -2,6 +2,20 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## security: fail-closed daemon trust gate on missing trust_config — 2026-07-14
+
+Authorization hardening (trust-gate near-term item 2). `enforce_session_trust`
+returned `Ok` (allow) when `trust_config` was `None` — a silent-open a mis-wired
+transport could ride through. It now DENIES on a missing config. Production is
+unaffected: `main.rs` always builds a `SessionTrustConfig` from `--pairing-policy`
+(default `Ask`), so `None` never reaches the gate in production; only test fixtures
+passed `None` and relied on the fail-open, and they now pass an explicit
+auto-accept config. New adversarial test proves a `None` config denies for both
+roles. This is authorization hardening only: it is NOT cryptographic verification
+and introduces no verified/pin semantics. (Note: the pre-existing EA26 parallel
+test-isolation flake on `ws_transfer_pause_resume` is orthogonal and confirmed on
+the prior commit; not introduced here.)
+
 ## refactor(ipc): async, Send, concurrent-safe pairing-decision channel — 2026-07-14
 
 Foundational step of the trust-gate near-term hardening (enables the EA2/EA3/EA4

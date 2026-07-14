@@ -100,7 +100,17 @@ fn enforce_session_trust(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let identity_hex = identity_key_to_hex(remote_identity_pk);
     let Some(config) = trust_config else {
-        return Ok(identity_hex);
+        // Fail closed: a session path that reaches trust enforcement without a
+        // trust_config MUST NOT be silently allowed. Production always supplies one
+        // (main.rs builds it from --pairing-policy, defaulting to Ask); a None here
+        // means a mis-wired transport, which denies rather than opening a bypass.
+        eprintln!(
+            "[PAIRING_DENIED] {transport} {peer_addr} no trust_config — fail-closed deny for identity={identity_hex}"
+        );
+        return Err(format!(
+            "[PAIRING_DENIED] {transport} {peer_addr} missing trust_config for identity {identity_hex}"
+        )
+        .into());
     };
 
     let stage_a_decision = match role {
@@ -1739,6 +1749,22 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    /// Explicit auto-accept trust config for WS/QUIC lifecycle/handshake tests
+    /// that only need a session to establish. Replaces the old fail-open
+    /// `trust_config: None`, which now denies (fail-closed hardening). Uses a
+    /// unique temp trust_path; `Allow` yields `AllowOnce`, which never persists.
+    fn auto_accept_trust_config() -> SessionTrustConfig {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SessionTrustConfig {
+            trust_path: std::env::temp_dir().join(format!(
+                "bolt-ws-test-trust-{}-{n}.json",
+                std::process::id()
+            )),
+            pairing_policy: PairingPolicy::Allow,
+        }
+    }
+
     async fn wait_for_ipc_event(
         rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
         label: &str,
@@ -1794,6 +1820,34 @@ mod tests {
         );
 
         assert!(result.is_err(), "ask without Stage A approval must deny");
+    }
+
+    #[test]
+    fn session_trust_denies_when_trust_config_missing() {
+        // Fail-closed hardening: a session path that reaches trust enforcement
+        // without a trust_config MUST deny, not silently allow (the removed bypass).
+        let identity = generate_identity_keypair();
+
+        let answerer = enforce_session_trust(
+            None,
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        );
+        assert!(
+            answerer.is_err(),
+            "missing trust_config must deny (answerer)"
+        );
+
+        let offerer = enforce_session_trust(
+            None,
+            SessionTrustRole::Offerer,
+            "QUIC_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        );
+        assert!(offerer.is_err(), "missing trust_config must deny (offerer)");
     }
 
     #[test]
@@ -1858,7 +1912,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1895,7 +1949,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1981,7 +2035,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2099,7 +2153,7 @@ mod tests {
                 &server_identity,
                 false,
                 None,
-                None,
+                Some(auto_accept_trust_config()),
             )
             .await;
             listener.close();
@@ -2314,7 +2368,7 @@ mod tests {
                 &server_identity,
                 false,
                 Some(&ipc_tx),
-                None,
+                Some(auto_accept_trust_config()),
             )
             .await;
             listener.close();
@@ -2485,7 +2539,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2535,7 +2589,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2615,7 +2669,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: identity,
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2667,7 +2721,7 @@ mod tests {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
-            trust_config: None,
+            trust_config: Some(auto_accept_trust_config()),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

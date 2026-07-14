@@ -2,6 +2,22 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## refactor(ipc): async, Send, concurrent-safe pairing-decision channel — 2026-07-14
+
+Foundational step of the trust-gate near-term hardening (enables the EA2/EA3/EA4
+wiring; not those fixes themselves). `IpcServer` held a `std::sync::mpsc::Receiver`,
+making it `!Send` so it could not cross into async session tasks, and
+`await_decision` was a blocking 30s sleep-poll that discarded any decision whose
+`request_id` did not match the single caller (concurrent pairings cross-cancelled).
+Now a dedicated router thread owns the receiver and fans each decision by
+`request_id` to a per-request `tokio::sync::oneshot`; `await_decision` is async with
+`tokio::time::timeout`, fail-closed on timeout with waiter cleanup (no leak). The
+daemon hands out a cheap `Send` + `Clone` `ApprovalHandle` (event sender + waiter
+map + ui-connected flag) that async tasks can move across `tokio::spawn`.
+`check_pairing_approval` is now async. NO product/session behavior is wired yet and
+NO verified/pin semantics are introduced. Tests: `Send` assertion, concurrent
+routing by request_id, timeout fail-closed + no-leak.
+
 ## security: fix panic on a non-ASCII transfer_id (EA17) — 2026-07-14
 
 `parse_transfer_id_bytes` guarded on `tid.len()` (a byte count), so a non-ASCII

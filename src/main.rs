@@ -317,9 +317,18 @@ fn run_simulate(simulate_event: SimulateEvent) {
         }
     }
 
-    // Await decision with 30s timeout
+    // Await decision with 30s timeout. await_decision is async now, so drive it
+    // on a small runtime (run_simulate is a sync harness entry point).
     eprintln!("[simulate] awaiting decision for request_id={request_id} (30s timeout)...");
-    match server.await_decision(&request_id, Duration::from_secs(30)) {
+    let handle = server.approval_handle();
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[simulate] FATAL: failed to create runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    match rt.block_on(handle.await_decision(&request_id, Duration::from_secs(30))) {
         Some(decision) => {
             eprintln!(
                 "[simulate] decision received: {:?} (note: {:?})",

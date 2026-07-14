@@ -4,12 +4,15 @@
 //! New client kicks old client (no dead-UI blocking).
 //! Fail-closed: no UI connected = `await_decision` returns `None`.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::sync::oneshot;
 
 use super::transport::{self, IpcListener, IpcStream};
 use super::types::{DaemonStatusPayload, DecisionPayload, IpcMessage, VersionStatusPayload};
@@ -148,18 +151,81 @@ pub fn check_version_compatible(app_version: &str, daemon_version: &str) -> bool
 //   - Client sends secret in version.handshake payload
 //   - Daemon validates before accepting commands
 
+/// Per-request pairing-decision waiters, keyed by `request_id`.
+type PendingDecisions = Arc<Mutex<HashMap<String, oneshot::Sender<DecisionPayload>>>>;
+
 /// Handle for the IPC server. Provides channel-based API to the daemon.
 pub struct IpcServer {
     /// Send events from daemon to UI client.
     pub event_tx: Sender<IpcMessage>,
-    /// Receive decisions from UI client.
-    pub decision_rx: Receiver<IpcMessage>,
+    /// Per-request pairing-decision waiters. Populated by
+    /// `ApprovalHandle::await_decision`, drained by the decision router thread.
+    /// The `!Send` decision `Receiver` lives in that router thread, NOT here, so
+    /// `IpcServer` (and the cloned `ApprovalHandle`) are `Send`.
+    pending: PendingDecisions,
     /// Whether a UI client is currently connected.
     pub ui_connected: Arc<Mutex<bool>>,
     /// Socket path (for cleanup).
     socket_path: PathBuf,
     /// Join handle for the listener thread.
     _listener_handle: thread::JoinHandle<()>,
+    /// Join handle for the decision router thread.
+    _router_handle: thread::JoinHandle<()>,
+}
+
+/// A cheap, `Send` + `Clone` handle to the IPC approval channel. Async session
+/// tasks clone one of these to prompt the UI (`emit_event`) and await the user's
+/// pairing decision (`await_decision`) with a timeout, fail-closed on no UI or
+/// timeout. It carries no `!Send` receiver, so it can cross `tokio::spawn`.
+#[derive(Clone)]
+pub struct ApprovalHandle {
+    event_tx: Sender<IpcMessage>,
+    pending: PendingDecisions,
+    ui_connected: Arc<Mutex<bool>>,
+}
+
+impl ApprovalHandle {
+    /// True if a UI client is connected (fail-closed / false on lock poison).
+    pub fn is_ui_connected(&self) -> bool {
+        self.ui_connected.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    /// Emit an event (e.g. a `pairing.request`) to the connected UI client.
+    pub fn emit_event(&self, event: IpcMessage) {
+        if let Err(e) = self.event_tx.send(event) {
+            eprintln!("[IPC] failed to queue event: {e}");
+        }
+    }
+
+    /// Register a waiter for `request_id` and await the UI's decision, up to
+    /// `timeout`. Returns `None` (fail-closed deny) on timeout or if the channel
+    /// closes. This is an async await, not a worker-blocking poll, and concurrent
+    /// requests are routed independently by `request_id`.
+    pub async fn await_decision(
+        &self,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Option<DecisionPayload> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().ok()?;
+            pending.insert(request_id.to_string(), tx);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(dp)) => Some(dp),
+            Ok(Err(_)) => None, // router dropped the sender (channel closed)
+            Err(_) => {
+                // Timed out: remove our waiter so the map does not leak.
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(request_id);
+                }
+                eprintln!(
+                    "[IPC] await_decision timed out for request_id={request_id} — fail-closed deny"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl IpcServer {
@@ -180,16 +246,25 @@ impl IpcServer {
         let ui_connected = Arc::new(Mutex::new(false));
         let ui_connected_clone = Arc::clone(&ui_connected);
 
+        let pending: PendingDecisions = Arc::new(Mutex::new(HashMap::new()));
+        let pending_router = Arc::clone(&pending);
+
         let listener_handle = thread::spawn(move || {
             Self::listener_loop(listener, event_rx, decision_tx, ui_connected_clone);
+        });
+        // The router thread owns the (!Send) decision receiver and fans each
+        // decision out to the matching per-request async waiter.
+        let router_handle = thread::spawn(move || {
+            Self::decision_router_loop(decision_rx, pending_router);
         });
 
         Ok(Self {
             event_tx,
-            decision_rx,
+            pending,
             ui_connected,
             socket_path: path,
             _listener_handle: listener_handle,
+            _router_handle: router_handle,
         })
     }
 
@@ -202,37 +277,39 @@ impl IpcServer {
         }
     }
 
-    /// Block until a decision matching `request_id` arrives, or timeout.
-    ///
-    /// Returns `None` on timeout (fail-closed = deny).
-    pub fn await_decision(&self, request_id: &str, timeout: Duration) -> Option<DecisionPayload> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if Instant::now() >= deadline {
-                eprintln!(
-                    "[IPC] await_decision timed out for request_id={request_id} — fail-closed deny"
-                );
-                return None;
-            }
-            match self.decision_rx.try_recv() {
-                Ok(msg) => {
-                    if let Some(dp) = msg.as_decision_payload() {
-                        if dp.request_id == request_id {
-                            return Some(dp);
-                        }
-                        // Not our request — discard (could queue, but EVENT-0 is single-request)
-                        eprintln!(
-                            "[IPC] discarding decision for unmatched request_id={}",
-                            dp.request_id
-                        );
-                    }
+    /// Produce a `Send` + `Clone` handle that async session tasks use to prompt
+    /// the UI and await a pairing decision without holding `IpcServer` or blocking
+    /// a runtime worker.
+    pub fn approval_handle(&self) -> ApprovalHandle {
+        ApprovalHandle {
+            event_tx: self.event_tx.clone(),
+            pending: Arc::clone(&self.pending),
+            ui_connected: Arc::clone(&self.ui_connected),
+        }
+    }
+
+    /// Router thread body: owns the decision `Receiver` and routes each incoming
+    /// `DecisionPayload` to the matching per-request waiter. A decision with no
+    /// waiter (unknown or already-timed-out `request_id`) is dropped. Exits when
+    /// the channel closes (server shutdown).
+    fn decision_router_loop(decision_rx: Receiver<IpcMessage>, pending: PendingDecisions) {
+        while let Ok(msg) = decision_rx.recv() {
+            let Some(dp) = msg.as_decision_payload() else {
+                continue;
+            };
+            let waiter = pending
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&dp.request_id));
+            match waiter {
+                Some(tx) => {
+                    let _ = tx.send(dp);
                 }
-                Err(TryRecvError::Empty) => {
-                    thread::sleep(POLL_INTERVAL);
-                }
-                Err(TryRecvError::Disconnected) => {
-                    eprintln!("[IPC] decision channel disconnected");
-                    return None;
+                None => {
+                    eprintln!(
+                        "[IPC] decision for unknown/expired request_id={}",
+                        dp.request_id
+                    );
                 }
             }
         }
@@ -995,5 +1072,95 @@ mod tests {
         drop(read_client);
         drop(server);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Async decision channel (EA trust-gate rebuild) ──────────
+
+    #[test]
+    fn approval_handle_and_server_are_send() {
+        // The point of the rebuild: neither the handle nor the server holds the
+        // !Send decision Receiver (it lives in the router thread), so a cloned
+        // ApprovalHandle can be moved into a tokio::spawn session task.
+        fn assert_send<T: Send>() {}
+        assert_send::<ApprovalHandle>();
+        assert_send::<IpcServer>();
+    }
+
+    fn deliver(
+        pending: &PendingDecisions,
+        request_id: &str,
+        decision: crate::ipc::types::Decision,
+    ) {
+        let tx = pending
+            .lock()
+            .unwrap()
+            .remove(request_id)
+            .expect("a waiter should be registered for this request_id");
+        let _ = tx.send(DecisionPayload {
+            request_id: request_id.to_string(),
+            decision,
+            note: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn await_decision_routes_by_request_id_concurrently() {
+        use crate::ipc::types::Decision;
+        let (event_tx, _event_rx) = mpsc::channel::<IpcMessage>();
+        let pending: PendingDecisions = Arc::new(Mutex::new(HashMap::new()));
+        let handle = ApprovalHandle {
+            event_tx,
+            pending: Arc::clone(&pending),
+            ui_connected: Arc::new(Mutex::new(true)),
+        };
+
+        let h_a = handle.clone();
+        let wa =
+            tokio::spawn(async move { h_a.await_decision("req-A", Duration::from_secs(5)).await });
+        let h_b = handle.clone();
+        let wb =
+            tokio::spawn(async move { h_b.await_decision("req-B", Duration::from_secs(5)).await });
+
+        // Wait until both concurrent waiters have registered.
+        for _ in 0..200 {
+            if pending.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pending.lock().unwrap().len(), 2, "both waiters registered");
+
+        // Deliver in SWAPPED order to prove routing is by request_id, not arrival.
+        deliver(&pending, "req-B", Decision::AllowOnce);
+        deliver(&pending, "req-A", Decision::DenyOnce);
+
+        let ra = wa.await.unwrap().expect("req-A got a decision");
+        let rb = wb.await.unwrap().expect("req-B got a decision");
+        assert_eq!(
+            ra.decision,
+            Decision::DenyOnce,
+            "req-A waiter got req-A's decision, not req-B's"
+        );
+        assert_eq!(rb.decision, Decision::AllowOnce, "req-B waiter got req-B's");
+        assert!(pending.lock().unwrap().is_empty(), "no waiters leaked");
+    }
+
+    #[tokio::test]
+    async fn await_decision_times_out_fail_closed_and_cleans_up() {
+        let (event_tx, _event_rx) = mpsc::channel::<IpcMessage>();
+        let pending: PendingDecisions = Arc::new(Mutex::new(HashMap::new()));
+        let handle = ApprovalHandle {
+            event_tx,
+            pending: Arc::clone(&pending),
+            ui_connected: Arc::new(Mutex::new(true)),
+        };
+        let result = handle
+            .await_decision("req-timeout", Duration::from_millis(50))
+            .await;
+        assert!(result.is_none(), "timeout is a fail-closed deny");
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "timed-out waiter is removed (no leak)"
+        );
     }
 }

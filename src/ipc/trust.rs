@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::id::generate_request_id;
-use super::server::IpcServer;
+use super::server::ApprovalHandle;
 use super::types::{Decision, IpcMessage, PairingRequestPayload};
 
 // ── Constants ───────────────────────────────────────────────
@@ -327,8 +327,8 @@ pub fn enforce_stage_b(
 ///
 /// Stage A does NOT persist anything. Stage A does NOT consult the trust store
 /// for identity-keyed entries (identity not yet known at signaling time).
-pub fn check_pairing_approval(
-    ipc_server: Option<&IpcServer>,
+pub async fn check_pairing_approval(
+    approval: Option<&ApprovalHandle>,
     trust_path: &Path,
     from_peer: &str,
     policy: PairingPolicy,
@@ -354,8 +354,8 @@ pub fn check_pairing_approval(
     }
 
     // Policy is Ask — need IPC
-    let server = match ipc_server {
-        Some(s) if s.is_ui_connected() => s,
+    let handle = match approval {
+        Some(h) if h.is_ui_connected() => h,
         Some(_) => {
             eprintln!("[PAIRING_DENIED] no UI connected — fail-closed deny");
             return None;
@@ -385,10 +385,10 @@ pub fn check_pairing_approval(
             return None;
         }
     };
-    server.emit_event(IpcMessage::new_event("pairing.request", payload_value));
+    handle.emit_event(IpcMessage::new_event("pairing.request", payload_value));
 
     // Block for decision
-    match server.await_decision(&request_id, DECISION_TIMEOUT) {
+    match handle.await_decision(&request_id, DECISION_TIMEOUT).await {
         Some(dp) => {
             eprintln!(
                 "[PAIRING_DECISION] {:?} for peer '{from_peer}'",
@@ -559,24 +559,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    #[test]
-    fn check_approval_no_ipc_no_trust_returns_none() {
+    #[tokio::test]
+    async fn check_approval_no_ipc_no_trust_returns_none() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "unknown-peer", PairingPolicy::Ask);
+        let result = check_pairing_approval(None, &path, "unknown-peer", PairingPolicy::Ask).await;
         assert!(result.is_none(), "should return None when no IPC server");
     }
 
-    #[test]
-    fn check_approval_policy_deny_returns_none() {
+    #[tokio::test]
+    async fn check_approval_policy_deny_returns_none() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Deny);
+        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Deny).await;
         assert!(result.is_none(), "policy=deny should return None");
     }
 
-    #[test]
-    fn check_approval_policy_allow_returns_allow_once() {
+    #[tokio::test]
+    async fn check_approval_policy_allow_returns_allow_once() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Allow);
+        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Allow).await;
         assert_eq!(
             result,
             Some(Decision::AllowOnce),

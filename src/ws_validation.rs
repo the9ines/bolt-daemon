@@ -113,8 +113,15 @@ pub fn parse_transfer_id_bytes(tid: &str) -> Result<[u8; 16], String> {
     }
     let mut bytes = [0u8; 16];
     for i in 0..16 {
-        bytes[i] = u8::from_str_radix(&tid[i * 2..i * 2 + 2], 16)
-            .map_err(|e| format!("transfer_id hex parse: {e}"))?;
+        // EA17: tid.len() is a BYTE count, so a non-ASCII 32-byte transfer_id passes
+        // the length guard above, and &tid[i*2..i*2+2] could slice inside a multi-byte
+        // UTF-8 char and panic (network-reachable via decrypt_chunk_btr). Use .get(),
+        // which yields None on a non-char-boundary, and fail closed with an error.
+        let pair = tid
+            .get(i * 2..i * 2 + 2)
+            .ok_or_else(|| "transfer_id is not 32 ASCII hex characters".to_string())?;
+        bytes[i] =
+            u8::from_str_radix(pair, 16).map_err(|e| format!("transfer_id hex parse: {e}"))?;
     }
     Ok(bytes)
 }
@@ -273,5 +280,26 @@ mod tests {
     #[test]
     fn parse_transfer_id_invalid_hex() {
         assert!(parse_transfer_id_bytes("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    /// UNIT (EA17): str::len() counts bytes, so an 8-char emoji string is 32 BYTES
+    /// and passes the length guard, but it is not 32 ASCII hex chars and must be
+    /// rejected with Err (never a panic).
+    #[test]
+    fn parse_transfer_id_non_ascii_32_bytes_rejected() {
+        let tid = "\u{1F389}".repeat(8); // 8 chars x 4 bytes = 32 bytes
+        assert_eq!(tid.len(), 32);
+        assert!(parse_transfer_id_bytes(&tid).is_err());
+    }
+
+    /// ADVERSARIAL (EA17): a hostile 32-byte transfer_id whose UTF-8 boundaries fall
+    /// mid-slice previously panicked (the [0..2] slice landed inside a multi-byte
+    /// char). It must now return Err instead of panicking; reaching this assertion
+    /// at all proves no panic occurred.
+    #[test]
+    fn parse_transfer_id_non_ascii_char_boundary_no_panic() {
+        let tid = format!("\u{20AC}{}", "a".repeat(29)); // 3 + 29 = 32 bytes; [0..2] cuts the 3-byte char
+        assert_eq!(tid.len(), 32);
+        assert!(parse_transfer_id_bytes(&tid).is_err());
     }
 }

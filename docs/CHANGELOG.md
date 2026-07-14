@@ -2,6 +2,29 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## security: fix panic on a non-ASCII transfer_id (EA17) — 2026-07-14
+
+`parse_transfer_id_bytes` guarded on `tid.len()` (a byte count), so a non-ASCII
+32-byte transfer_id passed the length check, then `&tid[i*2..i*2+2]` could slice
+inside a multi-byte UTF-8 char and panic — network-reachable via
+`ws_btr::decrypt_chunk_btr`. Now uses `tid.get(range)`, which yields None on a
+non-char-boundary, and fails closed with an error. UNIT + ADVERSARIAL regression
+tests added (8-char emoji = 32 bytes; a euro-prefixed mid-boundary slice). Part of
+the 2026-07-14 EA-series audit remediation.
+
+## security: bump anyhow, rand, rustls-webpki for 6 RUSTSEC advisories (EA25) — 2026-07-14
+
+Surgical non-cascading pins (0 crates added or removed): anyhow 1.0.103, rand 0.8.6
+and 0.9.3, rustls-webpki 0.103.13. Clears RUSTSEC-2026-0190 (anyhow), -0097 (rand),
+and the rustls-webpki CRL/name-constraint advisories -0104/-0098/-0099/-0049.
+cargo-audit clean; cargo check clean.
+
+## security: bump quinn-proto to 0.11.15 for RUSTSEC-2026-0185 (EA10) — 2026-07-14
+
+quinn-proto 0.11.14 carried a remote memory-exhaustion DoS in the bundled
+QUIC/WebTransport reassembly path. Surgical `--precise 0.11.15` (avoided 0.11.16's
+rand-0.10 + 8-crate cascade). CI unaffected (default features are transport-ws).
+
 ## Drop native-tls/OpenSSL — daemon is pure-ring and cross-compiles for Linux/Windows — 2026-07-03
 
 The daemon depended on `native-tls` (OpenSSL) via a `tungstenite` feature flag, but it was

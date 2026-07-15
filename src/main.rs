@@ -809,6 +809,7 @@ fn main() {
                             identity_keypair: wt_identity_kp,
                             cert_path: cert.cert_pem_path.to_string_lossy().to_string(),
                             key_path: cert.key_pem_path.to_string_lossy().to_string(),
+                            trust_config: Some(session_trust_config.clone()),
                         };
                         let wt_shutdown_rx = _shutdown_tx.subscribe();
                         let wt_ipc_tx = ipc_event_tx.clone();

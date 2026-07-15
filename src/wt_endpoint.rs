@@ -27,7 +27,9 @@ use crate::web_hello::{
 };
 // TRANSPORT-UNIFY-1 Phase 2: WT routes through the shared session loop; the
 // envelope/BTR/transfer machinery is inherited from it, not re-owned here.
-use crate::session_loop::run_session_with_outbound;
+use crate::session_loop::{
+    enforce_session_trust, run_session_with_outbound, SessionTrustConfig, SessionTrustRole,
+};
 
 /// Copy a KeyPair (KeyPair does not impl Clone due to zeroize-on-drop).
 fn copy_keypair(kp: &KeyPair) -> KeyPair {
@@ -49,6 +51,9 @@ pub struct WtEndpointConfig {
     pub cert_path: String,
     /// Path to PEM-encoded TLS private key.
     pub key_path: String,
+    /// Session trust policy, same as WS/QUIC. `None` fails closed (EA3 / item 2):
+    /// no WT session reaches the shared loop without passing trust enforcement.
+    pub trust_config: Option<SessionTrustConfig>,
 }
 
 // ── Framing helpers (4-byte big-endian length prefix) ────────
@@ -132,6 +137,8 @@ pub async fn run_wt_endpoint(
     // Store identity key material in an Arc for sharing across tasks.
     let identity_pk = std::sync::Arc::new(config.identity_keypair.public_key);
     let identity_sk = std::sync::Arc::new(config.identity_keypair.secret_key);
+    // Trust policy shared across per-session tasks (EA3: WT is gated like WS/QUIC).
+    let trust_config = std::sync::Arc::new(config.trust_config);
 
     loop {
         tokio::select! {
@@ -139,12 +146,16 @@ pub async fn run_wt_endpoint(
                 let pk = std::sync::Arc::clone(&identity_pk);
                 let sk = std::sync::Arc::clone(&identity_sk);
                 let ipc = ipc_tx.clone();
+                let trust = std::sync::Arc::clone(&trust_config);
                 tokio::spawn(async move {
                     let identity = KeyPair {
                         public_key: *pk,
                         secret_key: *sk,
                     };
-                    if let Err(e) = handle_incoming_session(incoming, &identity, ipc).await {
+                    if let Err(e) =
+                        handle_incoming_session(incoming, &identity, ipc, trust.as_ref().clone())
+                            .await
+                    {
                         eprintln!("[WT_SESSION] error: {e}");
                     }
                 });
@@ -173,6 +184,7 @@ async fn handle_incoming_session(
     incoming: IncomingSession,
     identity: &KeyPair,
     ipc_tx: Option<std::sync::mpsc::Sender<crate::ipc::types::IpcMessage>>,
+    trust_config: Option<SessionTrustConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Step 1: Accept WebTransport session ──────────────────
     let session_request = incoming
@@ -279,6 +291,19 @@ async fn handle_incoming_session(
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[WT_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
 
+    // ── Trust gate (EA3): WebTransport now passes the SAME enforcement path as
+    // WS/QUIC, BEFORE the shared session loop. Fail-closed on a missing trust_config
+    // (item 2); Ask/Deny/Allow per the current policy. A denied peer never reaches
+    // run_session_with_outbound / transfer handling. Authorization gating only: not
+    // verification, pins nothing.
+    enforce_session_trust(
+        trust_config.as_ref(),
+        SessionTrustRole::Answerer,
+        "WT_SESSION",
+        peer_addr,
+        &remote_identity_pk,
+    )?;
+
     let session = SessionContext::new(copy_keypair(&session_kp), remote_session_pk, negotiated)
         .map_err(|e| format!("[WT_SESSION] {peer_addr} failed to create session: {e}"))?;
 
@@ -330,6 +355,21 @@ mod tests {
         port
     }
 
+    /// Explicit auto-accept trust config for WT session tests that must establish a
+    /// session (mirrors `session_loop::auto_accept_trust_config`). `Allow` yields
+    /// `AllowOnce`, which never persists. NOT verified/pin behavior.
+    fn wt_allow_trust_config() -> SessionTrustConfig {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SessionTrustConfig {
+            trust_path: std::env::temp_dir().join(format!(
+                "bolt-wt-test-trust-{}-{n}.json",
+                std::process::id()
+            )),
+            pairing_policy: crate::ipc::trust::PairingPolicy::Allow,
+        }
+    }
+
     #[tokio::test]
     async fn wt_endpoint_starts_with_self_signed_cert() {
         let port = free_port().await;
@@ -365,6 +405,7 @@ mod tests {
             identity_keypair: bolt_core::identity::generate_identity_keypair(),
             cert_path: "/tmp/test-cert.pem".to_string(),
             key_path: "/tmp/test-key.pem".to_string(),
+            trust_config: None,
         };
         assert_eq!(config.listen_addr.ip().to_string(), "127.0.0.1");
         assert_eq!(config.cert_path, "/tmp/test-cert.pem");
@@ -454,6 +495,7 @@ mod tests {
             identity_keypair: bolt_core::identity::generate_identity_keypair(),
             cert_path: cert_path.to_str().unwrap().to_string(),
             key_path: key_path.to_str().unwrap().to_string(),
+            trust_config: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -481,6 +523,7 @@ mod tests {
     /// closes the previously-untested WT post-HELLO session path.
     #[tokio::test]
     async fn wt_session_emits_ipc_transfer_events_on_receive() {
+        let _session_guard = crate::session_loop::SESSION_GLOBALS_LOCK.lock().await;
         // ── server: one WT session through handle_incoming_session with a real ipc_tx ──
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -500,7 +543,13 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let incoming = server.accept().await;
-            let _ = handle_incoming_session(incoming, &server_identity, Some(ipc_tx)).await;
+            let _ = handle_incoming_session(
+                incoming,
+                &server_identity,
+                Some(ipc_tx),
+                Some(wt_allow_trust_config()),
+            )
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -605,6 +654,98 @@ mod tests {
         let _ = send.finish().await;
         *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
+    }
+
+    /// Adversarial (EA3 / item 2): a WT session with a MISSING trust_config must be
+    /// DENIED at the trust gate and never reach the shared session loop or transfer
+    /// handling. The daemon completes the HELLO exchange (matching WS/QUIC ordering)
+    /// then denies; `handle_incoming_session` returns Err and no transfer event is
+    /// emitted. Authorization gating only; nothing is verified or pinned.
+    #[tokio::test]
+    async fn wt_session_missing_trust_config_denies_before_transfer() {
+        let _session_guard = crate::session_loop::SESSION_GLOBALS_LOCK.lock().await;
+
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let wt_identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(addr)
+                .with_identity(wt_identity)
+                .build(),
+        )
+        .unwrap();
+        let bound = server.local_addr().unwrap();
+
+        let server_identity = generate_ephemeral_keypair();
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
+
+        // trust_config = None -> fail-closed deny at the gate (after HELLO).
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            handle_incoming_session(incoming, &server_identity, Some(ipc_tx), None).await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let client = Endpoint::client(
+            wtransport::ClientConfig::builder()
+                .with_bind_default()
+                .with_no_cert_validation()
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}", bound.port());
+        let conn = client.connect(&url).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+
+        let client_identity = generate_ephemeral_keypair();
+        let client_session_kp = generate_ephemeral_keypair();
+
+        // Drive the daemon through the HELLO exchange (the gate is right after HELLO).
+        let session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        write_frame(&mut send, session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+        let server_key_frame = read_frame(&mut recv).await.unwrap().unwrap();
+        let server_key_json: serde_json::Value = serde_json::from_slice(&server_key_frame).unwrap();
+        let server_session_pk =
+            crate::web_hello::decode_public_key(server_key_json["publicKey"].as_str().unwrap())
+                .unwrap();
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        write_frame(&mut send, hello_msg.as_bytes()).await.unwrap();
+        // The daemon sends a HELLO response (before gating, like WS), then denies.
+        let _ = read_frame(&mut recv).await;
+
+        // ── assert: DENIED (Err) and NO transfer entered ──
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
+            .await
+            .expect("server task should finish within 5s")
+            .expect("server task join");
+        assert!(
+            result.is_err(),
+            "WT session with no trust_config must be denied at the gate, not established"
+        );
+        let mut saw_transfer = false;
+        while let Ok(m) = ipc_rx.try_recv() {
+            if m.msg_type == "transfer.started" {
+                saw_transfer = true;
+            }
+        }
+        assert!(
+            !saw_transfer,
+            "a denied WT session must NOT reach transfer handling"
+        );
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
     }
 
     /// Poll an IPC receiver up to ~5s for an event matching `pred`, without blocking

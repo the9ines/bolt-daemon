@@ -2,6 +2,23 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## security: gate WebTransport sessions through the trust enforcement path (item 3) — 2026-07-14
+
+Authorization gating (EA3). The WebTransport handler never called
+`enforce_session_trust`, so an inbound WT session reached the shared session loop
+and transfer handling UNGATED, while WS and QUIC already gate. Now `WtEndpointConfig`
+carries a `trust_config` (threaded from main.rs exactly like WS/QUIC), and
+`handle_incoming_session` calls the same Answerer trust gate right after the
+HELLO/identity exchange and BEFORE `run_session_with_outbound`. A missing
+`trust_config` denies (item 2 fail-closed); Ask/Deny/Allow match the current policy;
+a denied WT peer never reaches transfer. Authorization gating ONLY: not verification,
+pins nothing. `enforce_session_trust` + `SessionTrustRole` are now `pub(crate)`, and
+the EA26 test-serialization lock was promoted to a crate-visible static so the WT
+session tests share it (WT sessions also register the global `ACTIVE_SESSION`).
+Tests: adversarial (missing `trust_config` denies before transfer) and the existing
+WT session test now passes an explicit allow config. WT 6/6 single-threaded,
+native-full session+WT parallel 5/5, default WS parallel 5/5.
+
 ## test: serialize session tests to fix the EA26 parallel `cargo test` flake — 2026-07-14
 
 The WS and QUIC session tests drive the process-global `ACTIVE_SESSION` / `IPC_TX`

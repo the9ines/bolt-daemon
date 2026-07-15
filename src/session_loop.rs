@@ -86,12 +86,12 @@ fn emit_ipc(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum SessionTrustRole {
+pub(crate) enum SessionTrustRole {
     Offerer,
     Answerer,
 }
 
-fn enforce_session_trust(
+pub(crate) fn enforce_session_trust(
     trust_config: Option<&SessionTrustConfig>,
     role: SessionTrustRole,
     transport: &str,
@@ -1735,6 +1735,13 @@ async fn run_read_loop(
 
 // ── Tests ────────────────────────────────────────────────────
 
+/// Test-only serialization for tests that drive the process-global
+/// `ACTIVE_SESSION` / `IPC_TX` singletons (WS / QUIC / WT session tests, across
+/// modules). Held for a test's duration so parallel runs do not clobber the shared
+/// session slot (EA26). Production is a single native session and is unchanged.
+#[cfg(test)]
+pub(crate) static SESSION_GLOBALS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,14 +1755,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
     }
-
-    /// Serializes tests that drive the process-global `ACTIVE_SESSION` / `IPC_TX`
-    /// singletons (via `run_ws_endpoint` / `handle_quic_framed_stream` /
-    /// `send_file_to_browser`). Run in parallel they race on the single shared
-    /// session slot (EA26). Test-only serialization; production is a single native
-    /// session and is unchanged. `tokio::sync::Mutex` so the guard is held across
-    /// the tests' await points.
-    static SESSION_GLOBALS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Explicit auto-accept trust config for WS/QUIC lifecycle/handshake tests
     /// that only need a session to establish. Replaces the old fail-open

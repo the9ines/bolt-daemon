@@ -543,18 +543,19 @@ pub async fn connect_to_remote_ws(
         .unwrap_or(false);
 
     let (negotiated, remote_identity_pk, sas) = if is_legacy {
-        let legacy_caps: Vec<String> =
-            serde_json::from_str::<serde_json::Value>(&hello_response_raw)
-                .ok()
-                .and_then(|v| v.get("capabilities")?.as_array().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        let local_caps = daemon_capabilities(wt_enabled);
-        let negotiated = negotiate_capabilities(&local_caps, &legacy_caps);
-        eprintln!("[WS_CLIENT] legacy HELLO response, caps={negotiated:?}");
-        (negotiated, [0u8; 32], String::new())
+        // ── EA2 fail-closed: reject a legacy (no-identity) HELLO response ────
+        // A `legacy: true` response carries no identity key. Accepting it ran the
+        // outbound session with a zero identity, an empty SAS, and NO
+        // `enforce_session_trust` (all of which the identity branch below performs).
+        // A peer that answers legacy is downgrading; reject it with an explicit
+        // protocol error instead of silently proceeding. Authorization hardening only.
+        eprintln!(
+            "[PROTOCOL_VIOLATION] {synthetic_peer_addr} rejected legacy HELLO response — identity + trust enforcement required (EA2)"
+        );
+        return Err(format!(
+            "[PROTOCOL_VIOLATION] {synthetic_peer_addr} legacy HELLO response rejected: identity and trust enforcement required"
+        )
+        .into());
     } else {
         // Parse encrypted HELLO response
         let hello_inner = parse_hello_typed(
@@ -1061,63 +1062,21 @@ async fn handle_connection(
         .unwrap_or(false);
 
     if is_legacy {
-        // Legacy HELLO — extract capabilities from plaintext, no identity exchange
-        let legacy_caps: Vec<String> = serde_json::from_str::<serde_json::Value>(&hello_raw)
-            .ok()
-            .and_then(|v| v.get("capabilities")?.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        eprintln!("[WS_HELLO] {peer_addr} legacy HELLO (no identity), caps={legacy_caps:?}");
-
-        let local_caps = daemon_capabilities(wt_enabled);
-        let negotiated = negotiate_capabilities(&local_caps, &legacy_caps);
-        eprintln!("[WS_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
-
-        // Send a legacy HELLO response so browser knows daemon acknowledged
-        let legacy_response = serde_json::json!({
-            "type": "hello",
-            "version": 1,
-            "legacy": true,
-            "capabilities": local_caps,
-        });
-        ws_sink
-            .send(Message::Text(legacy_response.to_string()))
-            .await
-            .map_err(|e| {
-                format!("[WS_HELLO] {peer_addr} failed to send legacy HELLO response: {e}")
-            })?;
-        eprintln!("[WS_HELLO] {peer_addr} sent legacy HELLO response");
-
-        let session = SessionContext::new(
-            copy_keypair(&session_kp),
-            remote_session_pk,
-            negotiated.clone(),
-        )
-        .map_err(|e| format!("[WS_SESSION] {peer_addr} failed to create session: {e}"))?;
-
-        eprintln!("[WS_SESSION] {peer_addr} session established, entering message loop");
-
-        // Emit session.connected (legacy — no SAS)
-        emit_ipc(
-            ipc_tx,
-            "session.connected",
-            serde_json::json!({
-                "remote_peer_id": "(legacy)",
-                "negotiated_capabilities": negotiated,
-            }),
+        // ── EA2 fail-closed: reject the legacy (no-identity) HELLO ──────────
+        // A `legacy: true` HELLO carries no identity key, so it cannot be
+        // trust-enforced, SAS-verified, or attributed to a peer. Accepting it was a
+        // bypass: it built a SessionContext and entered `run_session_with_outbound`
+        // (transfer handling) with NO identity, NO SAS, and NO `enforce_session_trust`.
+        // Reject it outright — modern clients always send an identity HELLO. Fail closed
+        // with an explicit protocol error rather than a silent downgrade. Authorization
+        // hardening only: this proves nothing about the peer's identity.
+        eprintln!(
+            "[PROTOCOL_VIOLATION] {peer_addr} rejected legacy (no-identity) WS HELLO — identity + trust enforcement required (EA2)"
         );
-
-        return run_session_with_outbound(
-            crate::session_frame::WsFrameSink(ws_sink),
-            ws_source,
-            session,
-            peer_addr,
-            remote_session_pk,
-            ipc_tx,
+        return Err(format!(
+            "[PROTOCOL_VIOLATION] {peer_addr} legacy no-identity HELLO rejected: identity and trust enforcement required"
         )
-        .await;
+        .into());
     }
 
     // ── Step 4b: Parse and decrypt HELLO (identity mode) ────
@@ -2591,28 +2550,44 @@ mod tests {
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
     }
 
-    /// Legacy HELLO: browser without identity sends plaintext HELLO with legacy=true.
-    /// Daemon must accept it, send legacy HELLO response, and establish session.
+    /// Read the next text frame from a split WS source, skipping control frames.
+    /// Used by the adversarial legacy-rejection tests' fake peer.
+    async fn next_ws_text<S>(source: &mut S) -> String
+    where
+        S: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+    {
+        loop {
+            match source.next().await {
+                Some(Ok(Message::Text(t))) => return t,
+                Some(Ok(_)) => continue,
+                other => panic!("fake peer: expected a text frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// Adversarial (EA2): an inbound `legacy: true` WS HELLO (no identity) must be
+    /// REJECTED, not accepted. Accepting it was a bypass that reached the shared session
+    /// loop and transfer handling with NO identity, SAS, or trust enforcement. The daemon
+    /// must NOT send a legacy HELLO response, must NOT emit `session.connected`, and must
+    /// close the connection. Authorization hardening only; nothing is verified.
     #[tokio::test]
-    async fn ws_legacy_hello_establishes_session() {
+    async fn ws_legacy_hello_rejected_no_session() {
         let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let daemon_identity = generate_identity_keypair();
 
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
         let config = WsEndpointConfig {
             listen_addr: addr,
             identity_keypair: copy_keypair(&daemon_identity),
             wt_enabled: false,
             trust_config: Some(auto_accept_trust_config()),
         };
-
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
         let server_handle = tokio::spawn(async move {
-            let _ = run_ws_endpoint(config, shutdown_rx, None).await;
+            let _ = run_ws_endpoint(config, shutdown_rx, Some(ipc_tx)).await;
         });
-
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let url = format!("ws://127.0.0.1:{port}");
@@ -2620,8 +2595,7 @@ mod tests {
         let (mut sink, mut source) = ws_stream.split();
 
         let browser_session_kp = generate_ephemeral_keypair();
-
-        // Step 1: Send session-key
+        // Step 1: session-key exchange, so the daemon reaches the HELLO step.
         let session_key_msg = serde_json::json!({
             "type": "session-key",
             "publicKey": bolt_core::encoding::to_base64(&browser_session_kp.public_key),
@@ -2629,18 +2603,9 @@ mod tests {
         sink.send(Message::Text(session_key_msg.to_string()))
             .await
             .unwrap();
+        let _daemon_session_key = next_ws_text(&mut source).await;
 
-        // Step 2: Receive daemon's session-key
-        let daemon_sk_msg = source.next().await.unwrap().unwrap();
-        let daemon_sk_text = match daemon_sk_msg {
-            Message::Text(t) => t,
-            other => panic!("expected text, got {other:?}"),
-        };
-        let daemon_sk_value: serde_json::Value = serde_json::from_str(&daemon_sk_text).unwrap();
-        assert_eq!(daemon_sk_value["type"], "session-key");
-        assert!(daemon_sk_value["publicKey"].as_str().is_some());
-
-        // Step 3: Send legacy HELLO (no identity, no encryption)
+        // Step 2: the attack — a plaintext legacy HELLO with no identity.
         let legacy_hello = serde_json::json!({
             "type": "hello",
             "version": 1,
@@ -2651,26 +2616,114 @@ mod tests {
             .await
             .unwrap();
 
-        // Step 4: Receive daemon's legacy HELLO response
-        let response = tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next())
+        // Step 3: the daemon must reject it — close the connection, NOT answer legacy.
+        let next = tokio::time::timeout(tokio::time::Duration::from_secs(5), source.next())
             .await
-            .expect("should receive legacy HELLO response within 5s")
-            .unwrap()
-            .unwrap();
+            .expect("daemon must react to the legacy HELLO within 5s");
+        match next {
+            None | Some(Ok(Message::Close(_))) | Some(Err(_)) => { /* rejected: closed */ }
+            Some(Ok(Message::Text(t))) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&t).unwrap_or_else(|_| serde_json::json!({}));
+                assert_ne!(
+                    v["legacy"], true,
+                    "daemon must NOT answer a legacy HELLO with a legacy response"
+                );
+                panic!("daemon replied to a legacy HELLO instead of closing: {t}");
+            }
+            other => panic!("unexpected frame after legacy HELLO: {other:?}"),
+        }
 
-        let response_text = match response {
-            Message::Text(t) => t,
-            other => panic!("expected text, got {other:?}"),
-        };
-        let response_value: serde_json::Value = serde_json::from_str(&response_text).unwrap();
-        assert_eq!(response_value["type"], "hello");
-        assert_eq!(response_value["legacy"], true);
-        assert!(response_value["capabilities"].is_array());
+        // A rejected legacy peer must never surface as an established/transferring session.
+        let mut saw_session = false;
+        while let Ok(m) = ipc_rx.try_recv() {
+            if m.msg_type == "session.connected" || m.msg_type == "transfer.started" {
+                saw_session = true;
+            }
+        }
+        assert!(
+            !saw_session,
+            "a rejected legacy peer must not emit session.connected / transfer.started"
+        );
 
-        // Session is established — clean close
         let _ = sink.close().await;
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Adversarial (EA2): the outbound WS path (`connect_to_remote_ws`, offerer) must
+    /// REJECT a `legacy: true` HELLO response. A legacy response carries no identity, so
+    /// accepting it ran the session with a zero identity key, an empty SAS, and NO trust
+    /// enforcement. A malicious peer that answers legacy must get an explicit error, not a
+    /// downgraded session. Authorization hardening only; nothing is verified.
+    #[tokio::test]
+    async fn ws_client_rejects_legacy_hello_response() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Malicious peer: complete the session-key exchange, read the daemon's identity
+        // HELLO, then answer with a legacy (no-identity) HELLO response — the downgrade.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+
+            let _daemon_session_key = next_ws_text(&mut source).await;
+            let peer_session_kp = generate_ephemeral_keypair();
+            let key_msg = serde_json::json!({
+                "type": "session-key",
+                "publicKey": bolt_core::encoding::to_base64(&peer_session_kp.public_key),
+            });
+            sink.send(Message::Text(key_msg.to_string())).await.unwrap();
+
+            let _daemon_hello = next_ws_text(&mut source).await;
+            let legacy_response = serde_json::json!({
+                "type": "hello",
+                "version": 1,
+                "legacy": true,
+                "capabilities": [],
+            });
+            sink.send(Message::Text(legacy_response.to_string()))
+                .await
+                .unwrap();
+            // Hold the connection open briefly so the daemon processes the response.
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            let _ = sink.close().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let daemon_identity = generate_identity_keypair();
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
+        let url = format!("ws://127.0.0.1:{port}");
+        let result = connect_to_remote_ws(
+            &url,
+            &daemon_identity,
+            false,
+            Some(ipc_tx),
+            Some(auto_accept_trust_config()),
+        )
+        .await;
+
+        let err = result.expect_err("outbound WS must reject a legacy HELLO response");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("PROTOCOL_VIOLATION") && err_str.contains("legacy"),
+            "rejection must be an explicit legacy protocol violation, got: {err_str}"
+        );
+        let mut saw_session = false;
+        while let Ok(m) = ipc_rx.try_recv() {
+            if m.msg_type == "session.connected" || m.msg_type == "transfer.started" {
+                saw_session = true;
+            }
+        }
+        assert!(
+            !saw_session,
+            "a rejected legacy response must not emit session.connected / transfer.started"
+        );
+
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server).await;
     }
 
     /// WS endpoint stays alive after a client disconnects — can accept new connections.

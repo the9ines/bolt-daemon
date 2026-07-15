@@ -2,6 +2,31 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## security: reject legacy no-identity WS HELLO (EA2 bypass closure) — 2026-07-14
+
+Authorization hardening (EA2). A `legacy: true` WS HELLO carries no identity, so it
+cannot be trust-enforced, SAS-verified, or attributed to a peer — yet the daemon
+ACCEPTED it and entered the shared session loop and transfer handling with no identity,
+no SAS, and no `enforce_session_trust`. Both WS legacy branches now fail closed with an
+explicit `[PROTOCOL_VIOLATION]` error instead of a silent downgrade:
+- Inbound/answerer (`handle_connection`): a legacy HELLO is rejected before any legacy
+  response is sent and before any session is built. The daemon no longer emits a legacy
+  HELLO response or `session.connected`; the connection closes.
+- Outbound/offerer (`connect_to_remote_ws`): a legacy HELLO *response* is rejected
+  instead of running the session with a zero identity key and an empty SAS.
+
+Modern clients always send an identity HELLO (the web SDK was hardened under SA10), so
+no supported flow depends on legacy. No protocol crypto, wire envelope format, product
+UX, or pin semantics changed; no reliance on `ACTIVE_SESSION` (EA27 stays separate).
+
+Tests: the old `ws_legacy_hello_establishes_session` (which asserted the bypass) is
+replaced by adversarial `ws_legacy_hello_rejected_no_session` (inbound: the daemon
+closes, sends no legacy response, emits no `session.connected`) and new
+`ws_client_rejects_legacy_hello_response` (outbound: `connect_to_remote_ws` returns an
+explicit `PROTOCOL_VIOLATION` and emits no session). Mutation-verified: restoring either
+legacy-accept makes the corresponding test fail. Full daemon lib 259/259 (default),
+290/290 (native-full). Authorization gating only: nothing is verified or pinned.
+
 ## test: pin the WebTransport trust gate with mutation-verified deny tests — 2026-07-14
 
 Follow-up to the item-3 WT gate (`2ae6af7`). A code red-team found the WT enforcement

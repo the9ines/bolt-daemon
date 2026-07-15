@@ -2,6 +2,19 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## test: serialize session tests to fix the EA26 parallel `cargo test` flake — 2026-07-14
+
+The WS and QUIC session tests drive the process-global `ACTIVE_SESSION` / `IPC_TX`
+singletons; run in parallel they clobbered each other's session slot, so
+`cargo test` flaked intermittently (`ws_transfer_pause_resume` failed ~5/6 under
+default parallel; QUIC session tests failed ~6/6 under `transport-quic`). Test-only
+fix: a shared `tokio::sync::Mutex` (`SESSION_GLOBALS_LOCK`) that the 10
+session-establishing tests (7 WS + 3 QUIC) hold for their duration, serializing
+them. NO production code changed (the daemon runs a single native session), and no
+protocol / trust / crypto / product behavior changed. Verified: default WS parallel
+10/10 green (was ~5/6), `transport-quic` session parallel 5/5 green (was ~6/6 fail).
+Closes EA26.
+
 ## security: fail-closed daemon trust gate on missing trust_config — 2026-07-14
 
 Authorization hardening (trust-gate near-term item 2). `enforce_session_trust`

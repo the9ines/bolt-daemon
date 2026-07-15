@@ -1749,6 +1749,14 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    /// Serializes tests that drive the process-global `ACTIVE_SESSION` / `IPC_TX`
+    /// singletons (via `run_ws_endpoint` / `handle_quic_framed_stream` /
+    /// `send_file_to_browser`). Run in parallel they race on the single shared
+    /// session slot (EA26). Test-only serialization; production is a single native
+    /// session and is unchanged. `tokio::sync::Mutex` so the guard is held across
+    /// the tests' await points.
+    static SESSION_GLOBALS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Explicit auto-accept trust config for WS/QUIC lifecycle/handshake tests
     /// that only need a session to establish. Replaces the old fail-open
     /// `trust_config: None`, which now denies (fail-closed hardening). Uses a
@@ -1904,6 +1912,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_endpoint_starts_and_accepts_connection() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let identity = generate_identity_keypair();
@@ -1941,6 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_hello_handshake_succeeds() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let daemon_identity = generate_identity_keypair();
@@ -2027,6 +2037,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_envelope_roundtrip_over_ws() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let daemon_identity = generate_identity_keypair();
@@ -2131,6 +2142,7 @@ mod tests {
     #[cfg(feature = "transport-quic")]
     #[tokio::test]
     async fn quic_session_adapter_exchanges_hello_and_encrypted_ping() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
         pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
@@ -2242,6 +2254,7 @@ mod tests {
     #[cfg(feature = "transport-quic")]
     #[tokio::test]
     async fn quic_session_adapter_rejects_denied_identity_pin() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
         pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
@@ -2343,6 +2356,7 @@ mod tests {
     #[cfg(feature = "transport-quic")]
     #[tokio::test]
     async fn quic_session_emits_ipc_transfer_events_for_send_and_receive() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let pin_set = crate::quic_transport::QuicClientCertPinSet::new();
         let client_cert = crate::quic_transport::QuicPeerCertificate::generate_reference().unwrap();
         pin_set.allow_hash_hex(client_cert.cert_hash_hex()).unwrap();
@@ -2531,6 +2545,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_connection_close_is_clean() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let identity = generate_identity_keypair();
@@ -2581,6 +2596,7 @@ mod tests {
     /// Daemon must accept it, send legacy HELLO response, and establish session.
     #[tokio::test]
     async fn ws_legacy_hello_establishes_session() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let daemon_identity = generate_identity_keypair();
@@ -2661,6 +2677,7 @@ mod tests {
     /// WS endpoint stays alive after a client disconnects — can accept new connections.
     #[tokio::test]
     async fn ws_endpoint_survives_client_disconnect() {
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let identity = generate_identity_keypair();
@@ -2712,6 +2729,8 @@ mod tests {
     #[tokio::test]
     async fn ws_transfer_pause_resume() {
         use std::io::Write;
+
+        let _session_guard = SESSION_GLOBALS_LOCK.lock().await;
 
         let port = free_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();

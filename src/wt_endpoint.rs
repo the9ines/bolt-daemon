@@ -370,6 +370,110 @@ mod tests {
         }
     }
 
+    /// Explicit DENY trust config: a VALID config (contrast with `None`) whose policy
+    /// refuses every answerer pairing. Lets a deny-path test drive the daemon through a
+    /// FULL, well-formed handshake and still be rejected — so the test fails if the WT
+    /// gate is deleted OR wired to the wrong role (Offerer would fall through to Allow),
+    /// not only if trust_config is missing.
+    fn wt_deny_trust_config() -> SessionTrustConfig {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SessionTrustConfig {
+            trust_path: std::env::temp_dir()
+                .join(format!("bolt-wt-test-deny-{}-{n}.json", std::process::id())),
+            pairing_policy: crate::ipc::trust::PairingPolicy::Deny,
+        }
+    }
+
+    /// Drive a freshly-opened WT bidi stream through the full client handshake
+    /// (session-key exchange, then HELLO exchange including parsing the daemon's HELLO
+    /// response to prove Step 7 was reached) and send one well-formed encrypted file
+    /// chunk. Returns the chunk's filename. The caller keeps the `Connection` alive so
+    /// the daemon reaches the trust gate rather than failing an earlier read on a
+    /// premature connection close; a working gate rejects the peer and this chunk is
+    /// never turned into a transfer.
+    async fn wt_drive_handshake_and_send_chunk(
+        send: &mut wtransport::stream::SendStream,
+        recv: &mut wtransport::stream::RecvStream,
+    ) -> String {
+        let client_identity = generate_ephemeral_keypair();
+        let client_session_kp = generate_ephemeral_keypair();
+
+        let session_key_msg = serde_json::json!({
+            "type": "session-key",
+            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
+        });
+        write_frame(send, session_key_msg.to_string().as_bytes())
+            .await
+            .unwrap();
+        let server_key_frame = read_frame(recv).await.unwrap().unwrap();
+        let server_key_json: serde_json::Value = serde_json::from_slice(&server_key_frame).unwrap();
+        let server_session_pk =
+            crate::web_hello::decode_public_key(server_key_json["publicKey"].as_str().unwrap())
+                .unwrap();
+
+        let hello_msg = build_hello_message(
+            &client_identity.public_key,
+            &client_session_kp,
+            &server_session_pk,
+        )
+        .unwrap();
+        write_frame(send, hello_msg.as_bytes()).await.unwrap();
+        // The daemon answers HELLO (matching WS ordering) BEFORE the gate; a response
+        // that parses proves the client reached the exact point the gate defends.
+        let hello_resp = read_frame(recv).await.unwrap().unwrap();
+        let hello_inner =
+            parse_hello_typed(&hello_resp, &server_session_pk, &client_session_kp).unwrap();
+        let negotiated =
+            negotiate_capabilities(&daemon_capabilities(true), &hello_inner.capabilities);
+        let client_session = SessionContext::new(
+            copy_keypair(&client_session_kp),
+            server_session_pk,
+            negotiated,
+        )
+        .unwrap();
+
+        let filename = format!("wt-denied-{}.txt", rand::random::<u64>());
+        let payload = b"this chunk must never become a transfer on a denied WT session";
+        let encrypted = bolt_core::crypto::seal_box_payload(
+            payload,
+            &client_session.remote_public_key,
+            &client_session.local_keypair.secret_key,
+        )
+        .unwrap();
+        let chunk = crate::dc_messages::DcMessage::FileChunk {
+            transfer_id: format!("{:032x}", rand::random::<u128>()),
+            filename: filename.clone(),
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk: encrypted,
+            file_size: payload.len() as u64,
+            file_hash: None,
+        };
+        let inner = crate::dc_messages::encode_dc_message(&chunk).unwrap();
+        let envelope = crate::envelope::encode_envelope(&inner, &client_session).unwrap();
+        // Tolerate a write error: a correct gate may already have dropped the stream.
+        let _ = write_frame(send, &envelope).await;
+        filename
+    }
+
+    /// Drain an IPC receiver and report whether any transfer for `filename` began or
+    /// completed. Makes a denied-session assertion non-vacuous: a real chunk was sent,
+    /// so a removed/mis-wired gate would surface `transfer.started` here.
+    fn wt_saw_transfer_for(
+        rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
+        filename: &str,
+    ) -> bool {
+        while let Ok(m) = rx.try_recv() {
+            if (m.msg_type == "transfer.started" || m.msg_type == "transfer.complete")
+                && m.payload["file_name"].as_str() == Some(filename)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[tokio::test]
     async fn wt_endpoint_starts_with_self_signed_cert() {
         let port = free_port().await;
@@ -656,11 +760,13 @@ mod tests {
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await;
     }
 
-    /// Adversarial (EA3 / item 2): a WT session with a MISSING trust_config must be
-    /// DENIED at the trust gate and never reach the shared session loop or transfer
-    /// handling. The daemon completes the HELLO exchange (matching WS/QUIC ordering)
-    /// then denies; `handle_incoming_session` returns Err and no transfer event is
-    /// emitted. Authorization gating only; nothing is verified or pinned.
+    /// Adversarial (EA3 / item 2): a WT peer that completes a FULL, well-formed HELLO
+    /// handshake and then sends a real encrypted file chunk must STILL be denied when
+    /// `trust_config` is missing (`None`) — the fail-closed path. Proves the gate fires
+    /// after Step 7 (the daemon's HELLO response parses), the denial is the trust gate's
+    /// (`[PAIRING_DENIED] ... WT_SESSION`), the chunk is NEVER turned into a transfer,
+    /// and no session registers. Not vacuous: a real chunk is sent, so a removed gate
+    /// would drive `transfer.started`. Authorization gating only; nothing is pinned.
     #[tokio::test]
     async fn wt_session_missing_trust_config_denies_before_transfer() {
         let _session_guard = crate::session_loop::SESSION_GLOBALS_LOCK.lock().await;
@@ -689,6 +795,8 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
+        // Connection stays in scope through the server_handle wait, so the daemon
+        // reaches the gate instead of failing an earlier read on a premature close.
         let client = Endpoint::client(
             wtransport::ClientConfig::builder()
                 .with_bind_default()
@@ -699,52 +807,120 @@ mod tests {
         let url = format!("https://127.0.0.1:{}", bound.port());
         let conn = client.connect(&url).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+        let filename = wt_drive_handshake_and_send_chunk(&mut send, &mut recv).await;
 
-        let client_identity = generate_ephemeral_keypair();
-        let client_session_kp = generate_ephemeral_keypair();
-
-        // Drive the daemon through the HELLO exchange (the gate is right after HELLO).
-        let session_key_msg = serde_json::json!({
-            "type": "session-key",
-            "publicKey": bolt_core::encoding::to_base64(&client_session_kp.public_key),
-        });
-        write_frame(&mut send, session_key_msg.to_string().as_bytes())
-            .await
-            .unwrap();
-        let server_key_frame = read_frame(&mut recv).await.unwrap().unwrap();
-        let server_key_json: serde_json::Value = serde_json::from_slice(&server_key_frame).unwrap();
-        let server_session_pk =
-            crate::web_hello::decode_public_key(server_key_json["publicKey"].as_str().unwrap())
-                .unwrap();
-        let hello_msg = build_hello_message(
-            &client_identity.public_key,
-            &client_session_kp,
-            &server_session_pk,
-        )
-        .unwrap();
-        write_frame(&mut send, hello_msg.as_bytes()).await.unwrap();
-        // The daemon sends a HELLO response (before gating, like WS), then denies.
-        let _ = read_frame(&mut recv).await;
-
-        // ── assert: DENIED (Err) and NO transfer entered ──
+        // ── assert: DENIED by the trust gate (Err), and NO transfer entered ──
         let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
             .await
             .expect("server task should finish within 5s")
             .expect("server task join");
-        assert!(
-            result.is_err(),
-            "WT session with no trust_config must be denied at the gate, not established"
+        let err = result.expect_err(
+            "WT session with no trust_config must be denied at the gate, not established",
         );
-        let mut saw_transfer = false;
-        while let Ok(m) = ipc_rx.try_recv() {
-            if m.msg_type == "transfer.started" {
-                saw_transfer = true;
-            }
-        }
+        let err_str = err.to_string();
         assert!(
-            !saw_transfer,
+            err_str.contains("[PAIRING_DENIED]") && err_str.contains("WT_SESSION"),
+            "denial must come from the WT trust gate, got: {err_str}"
+        );
+        assert!(
+            !wt_saw_transfer_for(&ipc_rx, &filename),
             "a denied WT session must NOT reach transfer handling"
         );
+        assert!(
+            crate::session_loop::ACTIVE_SESSION
+                .lock()
+                .unwrap()
+                .is_none(),
+            "a denied WT session must not register as the active session"
+        );
+
+        let _ = send.finish().await;
+        drop(conn);
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
+    }
+
+    /// Adversarial (EA3): the differential twin of
+    /// `wt_session_emits_ipc_transfer_events_on_receive`. Identical, fully-valid client
+    /// handshake + encrypted chunk, but the daemon runs a VALID DENY policy
+    /// (`wt_deny_trust_config`) instead of Allow. The gate must reject the peer:
+    /// `handle_incoming_session` returns `[PAIRING_DENIED] ... WT_SESSION policy denied`,
+    /// no transfer fires, and no session registers. Because the ONLY difference from the
+    /// passing Allow test is the policy, this fails if the WT gate is deleted or wired to
+    /// the wrong role — the regressions a missing-config test alone cannot catch (a
+    /// missing config denies regardless of role; an Offerer role with this Deny policy
+    /// would fall through Stage B to Allow). Authorization gating only; nothing is pinned.
+    #[tokio::test]
+    async fn wt_session_deny_policy_blocks_established_peer() {
+        let _session_guard = crate::session_loop::SESSION_GLOBALS_LOCK.lock().await;
+
+        let port = free_port().await;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let wt_identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(addr)
+                .with_identity(wt_identity)
+                .build(),
+        )
+        .unwrap();
+        let bound = server.local_addr().unwrap();
+
+        let server_identity = generate_ephemeral_keypair();
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<crate::ipc::types::IpcMessage>();
+        *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
+
+        // VALID config, policy = Deny -> the gate rejects every answerer pairing.
+        let server_handle = tokio::spawn(async move {
+            let incoming = server.accept().await;
+            handle_incoming_session(
+                incoming,
+                &server_identity,
+                Some(ipc_tx),
+                Some(wt_deny_trust_config()),
+            )
+            .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let client = Endpoint::client(
+            wtransport::ClientConfig::builder()
+                .with_bind_default()
+                .with_no_cert_validation()
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}", bound.port());
+        let conn = client.connect(&url).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+        let filename = wt_drive_handshake_and_send_chunk(&mut send, &mut recv).await;
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle)
+            .await
+            .expect("server task should finish within 5s")
+            .expect("server task join");
+        let err = result.expect_err("a Deny policy must reject the WT peer at the gate");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("[PAIRING_DENIED]")
+                && err_str.contains("WT_SESSION")
+                && err_str.contains("policy denied"),
+            "denial must be the Deny-policy arm of the WT trust gate, got: {err_str}"
+        );
+        assert!(
+            !wt_saw_transfer_for(&ipc_rx, &filename),
+            "a policy-denied WT session must NOT reach transfer handling"
+        );
+        assert!(
+            crate::session_loop::ACTIVE_SESSION
+                .lock()
+                .unwrap()
+                .is_none(),
+            "a policy-denied WT session must not register as the active session"
+        );
+
+        let _ = send.finish().await;
+        drop(conn);
         *crate::session_loop::ACTIVE_SESSION.lock().unwrap() = None;
     }
 

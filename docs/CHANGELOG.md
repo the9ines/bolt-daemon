@@ -2,6 +2,37 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## test: pin the WebTransport trust gate with mutation-verified deny tests — 2026-07-14
+
+Follow-up to the item-3 WT gate (`2ae6af7`). A code red-team found the WT enforcement
+was not actually pinned by any test: the deny test discarded the daemon's HELLO
+response, sent no file chunk, and never asserted the denial came from the gate — it
+tripped only on a 5s timeout; the "allow" test used `PairingPolicy::Allow`
+(pass-through), so it would have stayed green even if the gate were deleted. No test
+exercised a policy-driven denial, so a wrong-role regression (Answerer->Offerer, which
+routes an unpinned peer through Stage B to Allow) would have shipped green.
+
+Strengthened tests, NO production change:
+- `wt_session_missing_trust_config_denies_before_transfer` now completes a full,
+  well-formed handshake (parsing the HELLO response to prove Step 7 is reached), sends
+  a real encrypted `FileChunk`, and asserts the returned error is the gate's
+  (`[PAIRING_DENIED] ... WT_SESSION`), that no `transfer.started/complete` fires, and
+  that `ACTIVE_SESSION` stays `None`.
+- NEW `wt_session_deny_policy_blocks_established_peer`: the differential twin of the
+  allow test — identical valid handshake + chunk, but a VALID `Deny` policy. Because the
+  ONLY difference from the passing allow test is the policy, it fails if the gate is
+  deleted or wired to the wrong role.
+- Shared `wt_drive_handshake_and_send_chunk` / `wt_saw_transfer_for` test helpers.
+
+Mutation-verified (temporary gate breaks, reverted): role Answerer->Offerer makes the
+deny-policy test FAIL while the missing-config test still passes (it structurally cannot
+catch a role bug — the gap the new test closes); making the gate non-blocking makes BOTH
+deny tests FAIL. Restored: WT lib 3/3, full daemon lib suite 265/265, `wt_endpoint.rs`
+clippy-clean. Clears the code-red-team test-quality blocker on EA3. Also registers the
+pre-existing `ACTIVE_SESSION` single-global production race (EA27) and the WT
+`session.connected`/`session.sas` observability gap (EA28) the review surfaced — both
+out of scope for this change.
+
 ## security: gate WebTransport sessions through the trust enforcement path (item 3) — 2026-07-14
 
 Authorization gating (EA3). The WebTransport handler never called

@@ -29,7 +29,7 @@ legacy-accept makes the corresponding test fail. Full daemon lib 259/259 (defaul
 
 ## test: pin the WebTransport trust gate with mutation-verified deny tests — 2026-07-14
 
-Follow-up to the item-3 WT gate (`2ae6af7`). A code red-team found the WT enforcement
+Follow-up to the item-3 WT gate (`2ae6af7`). A code review found the WT enforcement
 was not actually pinned by any test: the deny test discarded the daemon's HELLO
 response, sent no file chunk, and never asserted the denial came from the gate — it
 tripped only on a 5s timeout; the "allow" test used `PairingPolicy::Allow`
@@ -53,7 +53,7 @@ Mutation-verified (temporary gate breaks, reverted): role Answerer->Offerer make
 deny-policy test FAIL while the missing-config test still passes (it structurally cannot
 catch a role bug — the gap the new test closes); making the gate non-blocking makes BOTH
 deny tests FAIL. Restored: WT lib 3/3, full daemon lib suite 265/265, `wt_endpoint.rs`
-clippy-clean. Clears the code-red-team test-quality blocker on EA3. Also registers the
+clippy-clean. Clears the test-quality blocker on EA3. Also registers the
 pre-existing `ACTIVE_SESSION` single-global production race (EA27) and the WT
 `session.connected`/`session.sas` observability gap (EA28) the review surfaced — both
 out of scope for this change.
@@ -266,7 +266,7 @@ box when BTR is not negotiated. WT receive also emits
 
 Validation: `cargo test --features native-full -- --test-threads=1` → 378
 passed, 0 failed (incl. `wti5_btr_over_wt`); `cargo fmt --check` clean; clippy
-no warnings. Automated-test-validated per `os/rules/validation-protocol.md`.
+no warnings.
 
 ## LOCALBOLT-NATIVE-QUIT-TEARDOWN-1 — Parent-Death Watchdog (`bffbc02`) — 2026-04-26
 

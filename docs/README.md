@@ -1,11 +1,10 @@
-# bolt-daemon — Documentation
+# Bolt Daemon Docs
 
-## Doc Routing
+Public docs for the native daemon.
 
-- **Canonical routing table:** [`bolt-ecosystem/os/rules/doc-routing.md`](https://github.com/the9ines/bolt-ecosystem/blob/main/os/rules/doc-routing.md)
-- **Canonical audit tracker:** [`bolt-ecosystem/docs/AUDIT_TRACKER.md`](https://github.com/the9ines/bolt-ecosystem/blob/main/docs/AUDIT_TRACKER.md)
+| File | Purpose |
+|------|---------|
+| `DAEMON_CONTRACT.md` | Daemon IPC and behavior contract |
+| `CHANGELOG.md` | Public daemon changelog |
 
-## Update Rules
-
-- Only update this repo's `docs/CHANGELOG.md` (append-only). `docs/STATE.md` is retired — current state is generated at the ecosystem root (`os/bin/status.sh` → `os/DASHBOARD.md`).
-- All other governance docs are routed via `os/rules/doc-routing.md` in the ecosystem repo.
+Internal governance and audit trackers are not part of the public daemon docs.

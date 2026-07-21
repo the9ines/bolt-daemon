@@ -3,206 +3,152 @@
 Normative surface contract for bolt-daemon. Downstream tooling, CI scripts,
 and operator procedures MAY depend on the behavior documented here. Changes
 to this surface MUST be versioned and documented in `docs/CHANGELOG.md`.
+`scripts/contract_smoke.sh` verifies the checkable parts of this contract.
 
 Keywords: RFC 2119 (MUST, MUST NOT, REQUIRED, SHALL, SHOULD, MAY).
 
-## Signal Modes
+## Runtime Modes
 
-bolt-daemon supports two signaling modes, selected via `--signal`:
+bolt-daemon has two runtime modes, selected via `--mode`:
 
 | Mode | Value | Description |
 |------|-------|-------------|
-| File | `file` (default) | Exchange offer/answer via JSON files on disk |
-| Rendezvous | `rendezvous` | Exchange offer/answer via bolt-rendezvous WebSocket server |
+| WsEndpoint | `ws-endpoint` (default) | WS server for browser/native↔desktop direct transport. Optional WT and QUIC endpoints alongside when compiled in. Runs until killed. |
+| Simulate | `simulate` | IPC-only harness: emits one simulated pairing/transfer event, awaits a UI decision, exits. |
 
-The mode MUST be selected at startup. There is no runtime fallback between modes.
+Any other `--mode` value MUST exit 1. The pre-DEWEBRTC-2 WebRTC modes no
+longer exist.
 
 ## CLI Flags
 
-### Required
+### Common
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--mode` | `ws-endpoint` | `ws-endpoint` or `simulate`. Invalid value → exit 1. |
+| `--socket-path` | `/tmp/bolt-daemon.sock` | IPC Unix socket path (Windows: named pipe). |
+| `--data-dir` | identity `~/.bolt`, trust `~/.config/bolt-daemon` | Unified data directory. When set: identity at `<dir>/identity.key`, trust at `<dir>/pins/trust.json`, signal files and endpoint metadata in `<dir>`. |
+| `--pairing-policy` | `ask` | `ask`, `allow`, or `deny`. Invalid value → exit 1. |
+| `--phase-timeout-secs` | `30` | Per-phase timeout in seconds. Unparseable values are ignored and the default applies (the flag is not validated). |
+
+### WsEndpoint Mode
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--ws-listen` | — | REQUIRED. `ip:port` (e.g. `127.0.0.1:9557`). Missing → exit 1. Unparseable address → exit 1. |
+
+WebTransport flags (`--wt-listen`, `--wt-cert`, `--wt-key`, `--no-wt`) exist
+only in builds with the `transport-webtransport` feature. QUIC
+(`transport-quic` feature) adds no flags: the QUIC endpoint starts on the
+port adjacent to the WS port and advertises itself via `quic_info.json` in
+the data dir.
+
+### Simulate Mode
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--role` | `offerer`, `answerer` | REQUIRED. No default. Missing → exit 1. |
+| `--simulate-event` | `pairing-request`, `incoming-transfer` | REQUIRED in simulate mode. Missing or invalid → exit 1. |
 
-### File Mode Flags
+### Legacy Flags (Retired)
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--offer` | `/tmp/bolt-spike/offer.json` | Path or `-` for stdin/stdout |
-| `--answer` | `/tmp/bolt-spike/answer.json` | Path or `-` for stdin/stdout |
+`--role`, `--signal`, `--offer`, `--answer`, and `--interop*` belonged to the
+pre-DEWEBRTC-2 WebRTC architecture. Passing any of them MUST exit 1 (stderr:
+`Legacy flag '<flag>' requires --features legacy-webrtc`; no such feature is
+shipped — these flags are permanently retired).
 
-### Rendezvous Mode Flags
+### Unknown Flags
 
-| Flag | Default | Required | Notes |
-|------|---------|----------|-------|
-| `--signal` | `file` | No | Set to `rendezvous` to enable rendezvous mode |
-| `--rendezvous-url` | `ws://127.0.0.1:3001` | No | WebSocket URL of bolt-rendezvous server |
-| `--room` | — | YES | Room discriminator. Missing → exit 1. |
-| `--session` | — | YES | Session discriminator. Missing → exit 1. |
-| `--to` | — | Offerer only | Target peer code. Missing for offerer → exit 1. |
-| `--expect-peer` | — | Answerer only | Expected peer code. Missing for answerer → exit 1. |
-| `--peer-id` | auto-generated | No | 8-char hex if omitted |
+Unknown non-legacy flags are ignored (the parser is tolerant; a following
+non-flag token is consumed as the ignored flag's value). There is no `--help`
+flag. Tooling MUST NOT rely on unknown flags being rejected.
 
-### Common Flags
+## Startup Sequence (WsEndpoint)
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--phase-timeout-secs` | `30` | Positive integer. Controls all phase deadlines. |
-| `--network-scope` | `lan` | Values: `lan`, `overlay`, `global` |
-| `--socket-path` | `/tmp/bolt-daemon.sock` | IPC Unix socket path. Non-empty string required. |
-| `--data-dir` | `~/.bolt` (identity), `~/.config/bolt-daemon` (trust) | Unified data directory. When set: identity at `<path>/identity.key`, trust at `<path>/pins/trust.json`. |
+1. Startup banner on stderr: `[bolt-daemon] mode=... pairing=... timeout=...s socket_path=... data_dir=...`
+2. Parent-death watchdog starts when the daemon has a real parent process
+   (sidecar deployment): if the parent exits, the daemon exits 0.
+3. IPC server binds `--socket-path`. Bind failure is a WARNING, not fatal.
+4. Identity keypair is loaded or created (`identity.key`, owner-only).
+5. `--ws-listen` is validated (missing/invalid → FATAL, exit 1).
+6. Ephemeral WT certificate is generated; when a data dir is set, WT metadata
+   is written to `wt_info.json` (WT port = WS port + 1).
+7. WS endpoint serves until the process is killed.
 
-### Fail-Closed Rules (Rendezvous)
-
-When `--signal rendezvous` is set, the following MUST be present or the
-daemon MUST exit 1 before any network activity:
-
-- `--room` REQUIRED
-- `--session` REQUIRED
-- `--to` REQUIRED (offerer only)
-- `--expect-peer` REQUIRED (answerer only)
-
-Unknown flags MUST cause exit 1. There is no `--help` flag.
-
-Running with no arguments prints a usage line and exits 1:
-```
-Usage: bolt-daemon --role offerer|answerer [--signal file|rendezvous] [options]
-```
+The IPC socket is bound and the identity file may be created BEFORE
+`--ws-listen` validation. Isolated runs (tests, smoke checks) SHOULD pass
+`--socket-path` and `--data-dir` pointing at a scratch directory.
 
 ## Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success. Payload exchange completed. |
-| 1 | Fatal error. Includes: arg validation failure, server unreachable, timeout, scope/version/peer mismatch. |
-
-The daemon MUST NOT exit 0 unless the full payload exchange succeeded.
+| Mode | Code | Meaning |
+|------|------|---------|
+| ws-endpoint | runs | Serves until killed; exits 0 when the parent process dies (watchdog). |
+| ws-endpoint | 1 | Fatal startup error: missing/invalid `--ws-listen`, identity failure, runtime failure. |
+| simulate | 0 | Decision received from the connected UI client. |
+| simulate | 1 | Fail-closed: no IPC client within 10s, no decision within 30s, or internal error. |
 
 ## Log Tokens
 
-Stable substrings that downstream tooling MAY match. These tokens appear on
-stderr. The daemon MUST NOT change these strings without a version bump.
+Stable stderr substrings that downstream tooling MAY match. The daemon MUST
+NOT change these without a `docs/CHANGELOG.md` entry.
 
 | Token | Context | Meaning |
 |-------|---------|---------|
-| `[bolt-daemon] exit 0` | Both modes | Clean exit after successful exchange |
-| `[bolt-daemon] FATAL:` | Both modes | Fatal error, exit 1 follows |
-| `SUCCESS` | Both modes | Payload verified (offerer: `received matching payload`, answerer: `echoed matching payload`) |
-| `DataChannel open` | Both modes | WebRTC DataChannel established |
-| `phase timeout expired` | Both modes | Deadline exceeded for a signaling/data phase |
-| `[rendezvous] hello/ack complete` | Rendezvous | Hello/ack handshake succeeded |
-| `[rendezvous] ignoring signal` | Rendezvous | Signal filtered (wrong session, room, peer, or msg_type) |
-| `[rendezvous] hello retry:` | Rendezvous | Offerer retrying hello (target peer not yet registered) |
-| `unsupported payload_version` | Rendezvous | Remote peer sent incompatible payload version (fatal) |
-| `network_scope mismatch` | Rendezvous | Hello declared a scope that does not match local (fatal) |
-| `ICE candidate accepted` | Both modes | Candidate passed scope filter |
-| `ICE candidate REJECTED` | Both modes | Candidate blocked by scope filter |
+| `[bolt-daemon] mode=` | Startup | Banner; mode/pairing/timeout/paths echo |
+| `[bolt-daemon] FATAL:` | Any | Fatal error, exit 1 follows |
+| `[bolt-daemon] parent-death watchdog active` | Sidecar | Watchdog armed against parent PID |
+| `[IPC] listening on` | Startup | IPC server bound |
+| `[WS_ENDPOINT] starting on` | Startup | WS endpoint about to serve |
+| `[WT_CERT] hash=` | Startup | Ephemeral WT certificate generated |
+| `[WT_INFO] wrote` | Startup | WT metadata written to data dir |
+| `[QUIC_INFO] wrote` | Startup (QUIC builds) | QUIC metadata written to data dir |
+| `[simulate]` | Simulate | All simulate-mode progress lines |
+| `[IPC_VERSION_COMPATIBLE]` | IPC | Version handshake succeeded |
+| `[IPC_VERSION_INCOMPATIBLE]` | IPC | Version mismatch — closing |
+| `[IPC_HANDSHAKE_FAIL]` | IPC | Handshake failed (malformed/missing/wrong type) — fail-closed |
 
-## Data Plane vs Control Plane
+## Signal Files
 
-bolt-daemon's architecture separates control plane from data plane:
+The native shell drives the daemon by writing signal files into the data
+dir. The daemon polls at 250–500ms intervals.
 
-- **Control plane (signaling):** bolt-rendezvous relays opaque signaling
-  payloads (SDP, ICE candidates, hello/ack) between peers. It is coordination
-  infrastructure only. No file payload bytes transit the rendezvous server.
-- **Data plane (payload):** File payload bytes flow directly between peers
-  over a WebRTC DataChannel (P2P). In the default architecture, no payload
-  bytes traverse any server operated by us.
+| Signal File | Purpose |
+|-------------|---------|
+| `send_file.signal` | File path → daemon sends it to the connected peer |
+| `connect_remote.signal` | Legacy WS URL or structured JSON (`wsUrl`, optional `quicAddr`/`quicCertHash`) → daemon connects outbound |
+| `disconnect_session.signal` | Touch → disconnect the active session |
+| `transfer_pause.signal` | Touch → pause the active transfer |
+| `transfer_resume.signal` | Touch → resume a paused transfer |
 
-This separation is by design. The rendezvous server is untrusted and sees
-only opaque signaling metadata. All encryption and payload integrity are
-enforced at the peer level by the Bolt protocol layer.
+## IPC Version Handshake
 
-## IPC Version Handshake Contract (B-DEP-N2-2)
+The IPC socket enforces a strict version handshake as the first message
+exchange after client connection. No grace mode exists. Full message schemas
+live in [docs/IPC_CONTRACT.md](IPC_CONTRACT.md).
 
-The IPC Unix socket enforces a strict version handshake as the first
-message exchange after client connection. No grace mode exists.
+1. Client MUST send `version.handshake` (kind: `decision`) first, carrying
+   `app_version` (`major.minor.patch`).
+2. Daemon replies `version.status` with `daemon_version` and `compatible`.
+3. Compatible (`major.minor` equal, patch free): daemon emits `daemon.status`,
+   then enters the normal event/decision loop.
+4. Incompatible, malformed, wrong-type, or missing handshake: `version.status`
+   with `compatible: false`, then disconnect (fail-closed). Handshake timeout:
+   disconnect without response.
 
-### Sequence
+`daemon.status` (`{"connected_peers": <u32>, "ui_connected": <bool>, "version": "<string>"}`)
+is emitted in both runtime modes immediately after a successful handshake.
+The app SHOULD NOT enable transfer UI until `daemon.status` is received.
 
-1. Client connects to Unix socket.
-2. Client MUST send `version.handshake` (kind: `decision`) as its first message:
-   ```json
-   {"id":"...","kind":"decision","type":"version.handshake","ts_ms":<u64>,"payload":{"app_version":"<major.minor.patch>"}}
-   ```
-3. Daemon replies with `version.status` (kind: `event`):
-   ```json
-   {"id":"...","kind":"event","type":"version.status","ts_ms":<u64>,"payload":{"daemon_version":"<major.minor.patch>","compatible":<bool>}}
-   ```
-4. If `compatible: true`: daemon emits `daemon.status` event, then enters
-   normal event/decision loop.
-5. If `compatible: false`: daemon closes the connection immediately after
-   sending `version.status`.
+## Data Plane
 
-### Compatibility Rule
-
-`major.minor` of app version MUST equal `major.minor` of daemon version.
-Patch version MAY differ. Malformed versions are treated as incompatible.
-
-### Fail-Closed Semantics
-
-| Condition | Behavior |
-|-----------|----------|
-| First message is not `version.handshake` | `version.status` with `compatible: false`, then disconnect |
-| First message is malformed JSON | `version.status` with `compatible: false`, then disconnect |
-| `app_version` field missing from payload | `version.status` with `compatible: false`, then disconnect |
-| Version incompatible (major.minor mismatch) | `version.status` with `compatible: false`, then disconnect |
-| Handshake timeout (5 seconds) | Disconnect without response |
-
-### Event Ordering Lock
-
-- Before handshake completion: daemon MUST NOT emit any events except
-  `version.status`.
-- After compatible handshake: `daemon.status` is emitted immediately,
-  followed by normal event flow.
-- `ui_connected` flag is only set to `true` after successful handshake
-  and `daemon.status` emission.
-
-### Log Tokens
-
-| Token | Meaning |
-|-------|---------|
-| `[IPC_VERSION_COMPATIBLE]` | Handshake succeeded, versions match |
-| `[IPC_VERSION_INCOMPATIBLE]` | Handshake failed, version mismatch — closing |
-| `[IPC_HANDSHAKE_FAIL]` | Handshake failed (malformed, missing, wrong type) — fail-closed |
-
-## daemon.status Emission (B-DEP-N2-1)
-
-The `daemon.status` event is emitted in **all daemon modes** (default,
-smoke, simulate) immediately after a successful IPC version handshake.
-
-Payload schema:
-```json
-{"connected_peers": <u32>, "ui_connected": <bool>, "version": "<string>"}
-```
-
-This event signals daemon readiness to the app. The app SHOULD NOT enable
-transfer UI until `daemon.status` is received.
-
-## Compatibility Contract
-
-- **payload_version**: MUST be `1`. Any other value is fatal (exit 1).
-- **session**: REQUIRED in rendezvous mode. Session mismatch between peers is
-  non-fatal (signals silently ignored). Missing `--session` flag is fatal.
-- **Peer targeting**: Deterministic. Offerer MUST specify `--to`, answerer MUST
-  specify `--expect-peer`. Signals from unexpected peers are ignored.
-- **Rendezvous server**: Untrusted relay. Does not inspect payloads. Version
-  and session gating are enforced by the daemon, not the server.
-- **Version pinning**: See [docs/COMPATIBILITY.md](COMPATIBILITY.md) for the
-  daemon-to-rendezvous tag pairing matrix.
-
-## Network Scope Policy
-
-| Scope | Accepts |
-|-------|---------|
-| `lan` | Private (RFC 1918), link-local, loopback. Rejects public, CGNAT, mDNS. |
-| `overlay` | Everything `lan` accepts, plus CGNAT `100.64.0.0/10`. Rejects public, mDNS. |
-| `global` | All valid IPs (private + public + CGNAT). Rejects mDNS, malformed. |
-
-Scope is enforced at two points:
-1. Outbound: `on_candidate` callback filters local ICE candidates.
-2. Inbound: `apply_remote_signal` filters remote ICE candidates.
-
-Both peers MUST use the same `--network-scope`. Mismatch is detected during
-hello/ack (rendezvous mode) and causes exit 1.
+- **Transports:** WS (default feature), WebTransport and QUIC optional
+  feature-gated endpoints. Zero WebRTC at runtime.
+- **Session protection:** NaCl-box encrypted HELLO with capability
+  negotiation, Profile Envelope v1 framing post-HELLO, BTR-encrypted
+  transfers when negotiated. Protocol violations fail closed.
+- **Discovery/signaling** is an app-layer concern. The daemon takes direct
+  connect instructions (`connect_remote.signal`) and serves inbound
+  connections; it does not talk to a rendezvous server at runtime.
+- **Trust:** TOFU identity pinning plus pairing approval via the trust store
+  and `--pairing-policy`. Approval gates sessions; it is authorization only,
+  not verified-device identity.

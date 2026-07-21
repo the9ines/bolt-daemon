@@ -2,6 +2,30 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## docs: retire WebRTC-era operator docs/scripts, rewrite contract for current CLI — 2026-07-21
+
+Public-tree cleanup; no protocol or runtime behavior change.
+
+- `docs/DAEMON_CONTRACT.md` rewritten for the current CLI surface: ws-endpoint
+  (default) and simulate modes, legacy `--role`/`--signal`/`--offer`/`--answer`/
+  `--interop*` flags exit 1, unknown non-legacy flags tolerated, current exit
+  codes, log tokens, signal files, and IPC handshake summary.
+- `scripts/contract_smoke.sh` rewritten against the current CLI (20 checks,
+  isolated scratch data-dir/socket; verified passing).
+- Removed pre-DEWEBRTC-2 E2E material that cannot run against the current
+  daemon: `docs/E2E_LAN_TEST.md`, `docs/TWO_MACHINE_SMOKE.md`,
+  `docs/COMPATIBILITY.md` (v0.0.x rendezvous-signaling matrix),
+  `docs/NSTREAM_TIMEOUT_EVIDENCE.md` (evidence for removed `src/rendezvous.rs`),
+  `interop/browser/index.html`, and scripts `e2e_interop_4_local.sh`,
+  `e2e_rendezvous_local.sh`, `e2e_rendezvous_smoke_local.sh`,
+  `print_two_machine_commands.sh`, `print_two_machine_smoke_commands.sh`,
+  `run_rendezvous_pinned.sh`. The WS/WT harnesses (`tests/ts-harness/`,
+  `tests/e2e-browser/`) remain.
+- `README.md` refreshed: removed retired `docs/STATE.md` and `src/ws_endpoint.rs`
+  references, architecture tree matches current `src/`, stale tag line dropped.
+- Lint: `ws_validation.rs` transfer-id loop rewritten iterator-style
+  (clippy `needless_range_loop`); identical behavior, EA17 guard unchanged.
+
 ## security: reject legacy no-identity WS HELLO (EA2 bypass closure) — 2026-07-14
 
 Authorization hardening (EA2). A `legacy: true` WS HELLO carries no identity, so it

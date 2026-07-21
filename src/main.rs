@@ -432,7 +432,7 @@ fn main() {
                 pairing_policy: args.pairing_policy,
             };
 
-            // File send signal: bolt-ui writes file path to data_dir/send_file.signal
+            // File send signal: the native shell writes a file path to data_dir/send_file.signal
             // The WS endpoint runtime polls for this file and sends it.
             let send_signal_path = data_dir_path
                 .as_ref()

@@ -112,8 +112,8 @@ UI client. Exits 0 on decision received, 1 on timeout (fail-closed deny).
 cargo test
 ```
 
-See `docs/STATE.md` for current test breakdown (lib, integration, IPC, session,
-relay, cross-impl E2E).
+Coverage spans lib unit tests, integration tests (BTR, QUIC, WS, WT,
+identity, IPC), golden vectors, and the cross-impl E2E harnesses.
 
 ### Test Harness Note
 
@@ -121,8 +121,8 @@ The cross-impl E2E harness (`tests/ts-harness/`) uses `node-datachannel` for
 browser-fidelity testing. This is **test-only** — no WebRTC code runs in the
 daemon at runtime.
 
-Legacy E2E scripts in `scripts/` (e.g. `e2e_rendezvous_local.sh`) exercise
-pre-DEWEBRTC-2 code paths and require `--features legacy-webrtc`.
+`scripts/contract_smoke.sh` verifies the operator contract
+(`docs/DAEMON_CONTRACT.md`) against the built binary.
 
 ## Lint
 
@@ -142,7 +142,8 @@ bolt-daemon/
 ├── src/
 │   ├── main.rs             # CLI, mode dispatch, boot diagnostics
 │   ├── lib.rs              # Module exports for integration-test access
-│   ├── ws_endpoint.rs      # WS server, session lifecycle, file transfer
+│   ├── session_loop.rs     # Shared WS/QUIC/WT session lifecycle, trust enforcement
+│   ├── session_frame.rs    # Session frame parsing/encoding helpers
 │   ├── wt_endpoint.rs      # WebTransport/HTTP3 server (feature-gated)
 │   ├── wt_cert.rs          # Ephemeral TLS cert generation for WT
 │   ├── ws_btr.rs           # BTR key derivation + chunk encrypt/decrypt
@@ -159,15 +160,15 @@ bolt-daemon/
 │   ├── relay.rs            # Relay protocol
 │   ├── relay_main.rs       # bolt-relay binary entry point
 │   ├── ipc_client_main.rs  # bolt-ipc-client dev harness
+│   ├── quic_endpoint_info.rs # QUIC endpoint metadata for native shell
 │   └── quic_transport.rs   # QUIC transport (feature-gated)
 ├── tests/
 │   ├── ts-harness/         # Node.js cross-impl E2E (node-datachannel, test-only)
 │   ├── e2e-browser/        # Browser E2E tests
 │   ├── vectors/            # Golden test vectors
 │   └── *.rs                # Integration tests (BTR, QUIC, WS, identity, etc.)
-├── scripts/                # E2E regression scripts (some legacy, pre-DEWEBRTC-2)
-├── interop/browser/        # Legacy WebRTC interop page (pre-DEWEBRTC-2, not runtime)
-└── docs/                   # Contracts, changelog, state, test procedures
+├── scripts/                # Contract smoke + no-panic check
+└── docs/                   # Contracts, changelog, specs
 ```
 
 Key dependencies:
@@ -180,9 +181,7 @@ Key dependencies:
 
 ## Tag Convention
 
-Per ecosystem governance: `daemon-vX.Y.Z[-suffix]`
-
-Current: `daemon-v0.2.49-dewebrtc2-docs-reconcile`
+`daemon-vX.Y.Z[-suffix]`. Release history lives in `docs/CHANGELOG.md`.
 
 ## License
 

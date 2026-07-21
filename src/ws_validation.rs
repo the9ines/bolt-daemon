@@ -112,7 +112,7 @@ pub fn parse_transfer_id_bytes(tid: &str) -> Result<[u8; 16], String> {
         return Err(format!("transfer_id hex length {} != 32", tid.len()));
     }
     let mut bytes = [0u8; 16];
-    for i in 0..16 {
+    for (i, byte) in bytes.iter_mut().enumerate() {
         // EA17: tid.len() is a BYTE count, so a non-ASCII 32-byte transfer_id passes
         // the length guard above, and &tid[i*2..i*2+2] could slice inside a multi-byte
         // UTF-8 char and panic (network-reachable via decrypt_chunk_btr). Use .get(),
@@ -120,8 +120,7 @@ pub fn parse_transfer_id_bytes(tid: &str) -> Result<[u8; 16], String> {
         let pair = tid
             .get(i * 2..i * 2 + 2)
             .ok_or_else(|| "transfer_id is not 32 ASCII hex characters".to_string())?;
-        bytes[i] =
-            u8::from_str_radix(pair, 16).map_err(|e| format!("transfer_id hex parse: {e}"))?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|e| format!("transfer_id hex parse: {e}"))?;
     }
     Ok(bytes)
 }

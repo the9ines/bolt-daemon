@@ -166,7 +166,8 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             EXT=".exe"
           fi
-          # bolt-daemon requires --role; exits non-zero without it — proves binary loads
+          # bolt-daemon exits non-zero without --ws-listen in ws-endpoint mode;
+          # that still proves the binary loads and reaches CLI validation.
           "${BIN_DIR}/bolt-daemon${EXT}" 2>&1 && EXIT_OK=true || EXIT_OK=false
           echo "Smoke: bolt-daemon binary loads and executes (exit_ok=${EXIT_OK})"
 
@@ -295,7 +296,7 @@ jobs:
             | Linux aarch64 | `bolt-daemon-${{ steps.version.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz` |
 
             ### Binaries included
-            - `bolt-daemon` — headless WebRTC transport daemon
+            - `bolt-daemon` — headless WS/WT/QUIC transport daemon
             - `bolt-relay` — self-hosted relay server
 
             ### Verification

@@ -34,7 +34,7 @@ libc = "0.2"
 bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr" }
 bolt-transfer-core = { path = "../bolt-core-sdk/rust/bolt-transfer-core" }
-bolt-rendezvous-protocol = { git = "https://github.com/the9ines/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
+bolt-rendezvous-protocol = { git = "https://github.com/bolt-ecosystem/bolt-rendezvous.git", tag = "rendezvous-v0.2.6-clean-1", package = "bolt-rendezvous-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Plain ws:// only — the Bolt envelope layer (NaCl) provides encryption, so no

@@ -16,7 +16,7 @@ jobs:
       - name: Checkout bolt-core-sdk (path dependency)
         uses: actions/checkout@v4
         with:
-          repository: the9ines/bolt-core-sdk
+          repository: bolt-ecosystem/bolt-core-sdk
           path: bolt-core-sdk
 
       - name: Install stable toolchain

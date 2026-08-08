@@ -426,6 +426,10 @@ fn main() {
             };
 
             let ipc_event_tx = ipc_server.as_ref().map(|s| s.event_tx.clone());
+            // Approval channel for `--pairing-policy ask`: session tasks prompt the
+            // connected UI through this and await the user's decision. None when the
+            // IPC server failed to start, which keeps `ask` fail-closed (deny).
+            let approval = ipc_server.as_ref().map(|s| s.approval_handle());
             let _ipc_server = ipc_server;
 
             let data_dir_path = args.data_dir.as_ref().map(std::path::PathBuf::from);
@@ -436,6 +440,7 @@ fn main() {
             let session_trust_config = session_loop::SessionTrustConfig {
                 trust_path,
                 pairing_policy: args.pairing_policy,
+                approval,
             };
 
             // File send signal: the native shell writes a file path to data_dir/send_file.signal

@@ -62,8 +62,10 @@ pub use crate::ws_validation::validate_send_file_path;
 use crate::ws_validation::{parse_transfer_id_bytes, sanitize_filename, MAX_TRANSFER_SIZE};
 
 // BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
+use crate::ipc::server::ApprovalHandle;
 use crate::ipc::trust::{
-    enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult, TrustStore,
+    check_pairing_approval, enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult,
+    TrustStore,
 };
 use crate::ipc::types::Decision;
 use crate::ws_btr::{compute_x25519_shared_secret, copy_keypair, decrypt_chunk_btr};
@@ -91,7 +93,7 @@ pub(crate) enum SessionTrustRole {
     Answerer,
 }
 
-pub(crate) fn enforce_session_trust(
+pub(crate) async fn enforce_session_trust(
     trust_config: Option<&SessionTrustConfig>,
     role: SessionTrustRole,
     transport: &str,
@@ -125,10 +127,37 @@ pub(crate) fn enforce_session_trust(
                 PairingPolicy::Ask => {
                     let store = TrustStore::load(&config.trust_path);
                     if store.get(&identity_hex).is_some() {
+                        // Already pinned: Stage B enforces the pin. Never re-prompt.
                         None
                     } else {
-                        eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask has no Stage A decision for identity={identity_hex}");
-                        return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} missing Stage A approval for identity {identity_hex}").into());
+                        // Unpinned peer under `ask`: consult the connected UI (Stage A).
+                        // Previously this denied outright, which made `ask` mean "always
+                        // deny" because nothing else could ever produce a decision.
+                        //
+                        // Still fail-closed: no UI, a dropped channel, a serialize
+                        // failure, or no answer before the timeout all yield None here
+                        // and deny. Only an explicit user decision proceeds.
+                        match check_pairing_approval(
+                            config.approval.as_ref(),
+                            &config.trust_path,
+                            &peer_addr.to_string(),
+                            PairingPolicy::Ask,
+                        )
+                        .await
+                        {
+                            None => {
+                                eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask no Stage A decision for identity={identity_hex}");
+                                return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} missing Stage A approval for identity {identity_hex}").into());
+                            }
+                            // DenyOnce aborts at Stage A: deny this session, persist nothing.
+                            Some(Decision::DenyOnce) => {
+                                eprintln!("[PAIRING_DENIED] {transport} {peer_addr} policy=ask user denied once identity={identity_hex}");
+                                return Err(format!("[PAIRING_DENIED] {transport} {peer_addr} user denied identity {identity_hex}").into());
+                            }
+                            // AllowOnce (no persistence), AllowAlways / DenyAlways
+                            // (persisted by Stage B) all thread through below.
+                            Some(decision) => Some(decision),
+                        }
                     }
                 }
             }
@@ -455,10 +484,27 @@ pub struct WsEndpointConfig {
 }
 
 /// Shared identity trust configuration for WS and QUIC app sessions.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionTrustConfig {
     pub trust_path: PathBuf,
     pub pairing_policy: PairingPolicy,
+    /// Channel to the connected UI, used to prompt for a Stage A decision under
+    /// `PairingPolicy::Ask`. `None` in headless and test paths, where `ask` stays
+    /// fail-closed: no channel means no approval, which means deny.
+    pub approval: Option<ApprovalHandle>,
+}
+
+// Manual Debug: ApprovalHandle holds channels that are not usefully printable, so
+// only its presence is reported. Kept manual rather than deriving Debug on
+// ApprovalHandle so its public surface is unchanged.
+impl std::fmt::Debug for SessionTrustConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTrustConfig")
+            .field("trust_path", &self.trust_path)
+            .field("pairing_policy", &self.pairing_policy)
+            .field("approval", &self.approval.is_some())
+            .finish()
+    }
 }
 
 // ── Public entry point: outbound client connect ─────────────
@@ -576,7 +622,8 @@ pub async fn connect_to_remote_ws(
             "WS_CLIENT",
             synthetic_peer_addr,
             &remote_identity_pk,
-        )?;
+        )
+        .await?;
 
         let sas = bolt_core::sas::compute_sas(
             &identity.public_key,
@@ -712,7 +759,8 @@ pub async fn connect_to_remote_quic(
         "QUIC_CLIENT",
         remote,
         &remote_identity_pk,
-    )?;
+    )
+    .await?;
 
     let sas = bolt_core::sas::compute_sas(
         &identity.public_key,
@@ -832,7 +880,8 @@ pub async fn handle_quic_framed_stream(
         "QUIC_SESSION",
         peer_addr,
         &remote_identity_pk,
-    )?;
+    )
+    .await?;
 
     let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
         .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
@@ -1122,7 +1171,8 @@ async fn handle_connection(
         "WS_SESSION",
         peer_addr,
         &remote_identity_pk,
-    )?;
+    )
+    .await?;
 
     let session = SessionContext::new(
         copy_keypair(&session_kp),
@@ -1728,6 +1778,7 @@ mod tests {
                 std::process::id()
             )),
             pairing_policy: PairingPolicy::Allow,
+            approval: None,
         }
     }
 
@@ -1768,12 +1819,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_trust_answerer_ask_without_pin_fails_closed() {
+    #[tokio::test]
+    async fn session_trust_answerer_ask_without_pin_fails_closed() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let trust = SessionTrustConfig {
             trust_path: tmp_dir.path().join("trust.json"),
             pairing_policy: PairingPolicy::Ask,
+            approval: None,
         };
         let identity = generate_identity_keypair();
 
@@ -1783,13 +1835,14 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
-        );
+        )
+        .await;
 
         assert!(result.is_err(), "ask without Stage A approval must deny");
     }
 
-    #[test]
-    fn session_trust_denies_when_trust_config_missing() {
+    #[tokio::test]
+    async fn session_trust_denies_when_trust_config_missing() {
         // Fail-closed hardening: a session path that reaches trust enforcement
         // without a trust_config MUST deny, not silently allow (the removed bypass).
         let identity = generate_identity_keypair();
@@ -1800,7 +1853,8 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
-        );
+        )
+        .await;
         assert!(
             answerer.is_err(),
             "missing trust_config must deny (answerer)"
@@ -1812,12 +1866,13 @@ mod tests {
             "QUIC_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
-        );
+        )
+        .await;
         assert!(offerer.is_err(), "missing trust_config must deny (offerer)");
     }
 
-    #[test]
-    fn session_trust_answerer_ask_allows_existing_pin() {
+    #[tokio::test]
+    async fn session_trust_answerer_ask_allows_existing_pin() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let trust_path = tmp_dir.path().join("trust.json");
         let identity = generate_identity_keypair();
@@ -1829,6 +1884,7 @@ mod tests {
         let trust = SessionTrustConfig {
             trust_path,
             pairing_policy: PairingPolicy::Ask,
+            approval: None,
         };
 
         let result = enforce_session_trust(
@@ -1837,13 +1893,14 @@ mod tests {
             "QUIC_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
-        );
+        )
+        .await;
 
         assert_eq!(result.unwrap(), identity_hex);
     }
 
-    #[test]
-    fn session_trust_offer_rejects_existing_deny_pin() {
+    #[tokio::test]
+    async fn session_trust_offer_rejects_existing_deny_pin() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let trust_path = tmp_dir.path().join("trust.json");
         let identity = generate_identity_keypair();
@@ -1855,6 +1912,7 @@ mod tests {
         let trust = SessionTrustConfig {
             trust_path,
             pairing_policy: PairingPolicy::Allow,
+            approval: None,
         };
 
         let result = enforce_session_trust(
@@ -1863,9 +1921,329 @@ mod tests {
             "QUIC_CLIENT",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
-        );
+        )
+        .await;
 
         assert!(result.is_err(), "persistent deny pin must block offerer");
+    }
+
+    // ── Ask actually asks: Stage A wired to the IPC approval channel ──────
+    //
+    // Before this wiring, `ask` on the answerer path denied unconditionally for any
+    // unpinned peer, because nothing ever produced a Stage A decision and nothing
+    // ever wrote a pin. These pin the prompt-and-persist loop end to end.
+
+    /// Drive `enforce_session_trust` while answering the emitted `pairing.request`
+    /// with `decision`. Returns the enforcement result and the request_id observed on
+    /// the IPC event channel, so callers can assert the event actually fired.
+    async fn ask_with_ui_decision(
+        trust: &SessionTrustConfig,
+        handle: &ApprovalHandle,
+        event_rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
+        identity_pk: &[u8; 32],
+        decision: Decision,
+    ) -> (
+        Result<String, Box<dyn std::error::Error + Send + Sync>>,
+        Option<String>,
+    ) {
+        let mut observed_request_id = None;
+
+        let enforce = enforce_session_trust(
+            Some(trust),
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            identity_pk,
+        );
+
+        // Answer as the UI decision router would. The request is emitted before the
+        // await point, so it is already queued by the time this runs.
+        let respond = async {
+            for _ in 0..200 {
+                if let Ok(msg) = event_rx.try_recv() {
+                    if msg.msg_type == "pairing.request" {
+                        let request_id = msg.payload["request_id"].as_str().unwrap().to_string();
+                        observed_request_id = Some(request_id.clone());
+                        for _ in 0..200 {
+                            if handle.test_deliver(&request_id, decision) {
+                                return;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+        };
+
+        let (result, ()) = tokio::join!(enforce, respond);
+        (result, observed_request_id)
+    }
+
+    fn ask_trust_config(trust_path: PathBuf, handle: &ApprovalHandle) -> SessionTrustConfig {
+        SessionTrustConfig {
+            trust_path,
+            pairing_policy: PairingPolicy::Ask,
+            approval: Some(handle.clone()),
+        }
+    }
+
+    /// 1. AllowAlways from the UI allows the session AND persists the pin.
+    #[tokio::test]
+    async fn ask_ui_allow_always_allows_and_persists() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        let (result, request_id) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::AllowAlways,
+        )
+        .await;
+
+        assert!(request_id.is_some(), "a pairing.request must be emitted");
+        assert_eq!(
+            result.expect("AllowAlways must allow the session"),
+            identity_hex
+        );
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            Some(Decision::AllowAlways),
+            "AllowAlways must reach Stage B and persist a pin"
+        );
+    }
+
+    /// 2. AllowOnce allows the session and persists nothing.
+    #[tokio::test]
+    async fn ask_ui_allow_once_allows_without_persisting() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        let (result, _) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::AllowOnce,
+        )
+        .await;
+
+        assert!(result.is_ok(), "AllowOnce must allow the session");
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            None,
+            "AllowOnce must not persist a pin"
+        );
+    }
+
+    /// 3. DenyAlways denies the session AND persists the denial.
+    #[tokio::test]
+    async fn ask_ui_deny_always_denies_and_persists() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        let (result, _) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::DenyAlways,
+        )
+        .await;
+
+        assert!(result.is_err(), "DenyAlways must deny the session");
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            Some(Decision::DenyAlways),
+            "DenyAlways must reach Stage B and persist the denial"
+        );
+    }
+
+    /// DenyOnce denies without persisting anything (aborts at Stage A).
+    #[tokio::test]
+    async fn ask_ui_deny_once_denies_without_persisting() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        let (result, _) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::DenyOnce,
+        )
+        .await;
+
+        assert!(result.is_err(), "DenyOnce must deny the session");
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            None,
+            "DenyOnce must not persist anything"
+        );
+    }
+
+    /// 4. No UI connected still denies, and must not even prompt.
+    #[tokio::test]
+    async fn ask_without_connected_ui_still_denies() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(false); // no UI attached
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        )
+        .await;
+
+        assert!(result.is_err(), "no connected UI must remain fail-closed");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must not emit a pairing.request with no UI to answer it"
+        );
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            None,
+            "a denied-for-no-UI peer must not be pinned"
+        );
+    }
+
+    /// 5. UI connected but no decision before the timeout still denies.
+    #[tokio::test(start_paused = true)]
+    async fn ask_ui_timeout_still_denies() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path.clone(), &handle);
+
+        // Never answer. Paused time lets the internal DECISION_TIMEOUT elapse
+        // instantly rather than making the suite wait on a wall-clock timeout.
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        )
+        .await;
+
+        assert!(result.is_err(), "no decision before timeout must deny");
+        let emitted = event_rx.try_recv();
+        assert!(emitted.is_ok(), "the prompt should have been emitted");
+        assert_eq!(
+            TrustStore::load(&trust_path).get(&identity_hex),
+            None,
+            "a timed-out peer must not be pinned"
+        );
+    }
+
+    /// 6. The prompt is emitted from the real session-trust path, not just --simulate.
+    #[tokio::test]
+    async fn ask_emits_pairing_request_from_session_trust_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path, &handle);
+
+        let (_result, request_id) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::AllowOnce,
+        )
+        .await;
+
+        assert!(
+            request_id.is_some(),
+            "enforce_session_trust must emit pairing.request under ask with no pin"
+        );
+        assert!(
+            !request_id.unwrap().is_empty(),
+            "pairing.request must carry a request_id"
+        );
+    }
+
+    /// An existing pin must short-circuit: no prompt, no UI consultation.
+    #[tokio::test]
+    async fn ask_with_existing_pin_does_not_prompt() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let identity_hex = identity_key_to_hex(&identity.public_key);
+        let mut store = TrustStore::new();
+        assert!(store.set(&identity_hex, Decision::AllowAlways));
+        store.save(&trust_path).unwrap();
+
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path, &handle);
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Answerer,
+            "WS_SESSION",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), identity_hex);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an existing pin must not prompt the UI"
+        );
+    }
+
+    /// The offerer path must never start asking, whatever the policy.
+    #[tokio::test]
+    async fn ask_does_not_prompt_on_offerer_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path, &handle);
+
+        let result = enforce_session_trust(
+            Some(&trust),
+            SessionTrustRole::Offerer,
+            "WS_CLIENT",
+            "127.0.0.1:1".parse().unwrap(),
+            &identity.public_key,
+        )
+        .await;
+
+        assert!(result.is_ok(), "offerer behavior must be unchanged");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "offerer must not prompt for pairing approval"
+        );
     }
 
     #[tokio::test]
@@ -2236,6 +2614,7 @@ mod tests {
         let trust_config = SessionTrustConfig {
             trust_path,
             pairing_policy: PairingPolicy::Allow,
+            approval: None,
         };
 
         let server_handle = tokio::spawn(async move {

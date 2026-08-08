@@ -302,7 +302,8 @@ async fn handle_incoming_session(
         "WT_SESSION",
         peer_addr,
         &remote_identity_pk,
-    )?;
+    )
+    .await?;
 
     let session = SessionContext::new(copy_keypair(&session_kp), remote_session_pk, negotiated)
         .map_err(|e| format!("[WT_SESSION] {peer_addr} failed to create session: {e}"))?;
@@ -367,6 +368,7 @@ mod tests {
                 std::process::id()
             )),
             pairing_policy: crate::ipc::trust::PairingPolicy::Allow,
+            approval: None,
         }
     }
 
@@ -382,6 +384,7 @@ mod tests {
             trust_path: std::env::temp_dir()
                 .join(format!("bolt-wt-test-deny-{}-{n}.json", std::process::id())),
             pairing_policy: crate::ipc::trust::PairingPolicy::Deny,
+            approval: None,
         }
     }
 

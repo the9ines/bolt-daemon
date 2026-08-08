@@ -86,7 +86,9 @@ bolt-core = { path = "../bolt-core-sdk/rust/bolt-core" }
 bolt-btr = { path = "../bolt-core-sdk/rust/bolt-btr", features = ["test-support"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# test-util: paused-clock tests, so the 30s pairing DECISION_TIMEOUT can be
+# exercised without a wall-clock wait. Dev-only; production tokio is unchanged.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "test-util"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 

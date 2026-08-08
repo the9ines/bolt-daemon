@@ -228,6 +228,42 @@ impl ApprovalHandle {
     }
 }
 
+#[cfg(test)]
+impl ApprovalHandle {
+    /// Test-only handle backed by caller-owned channels, so session-level tests can
+    /// drive pairing approvals without starting a real IPC server or socket.
+    ///
+    /// Returns the handle plus the event receiver, which is how a test discovers the
+    /// internally generated `request_id` from the emitted `pairing.request`.
+    pub(crate) fn for_test(ui_connected: bool) -> (Self, Receiver<IpcMessage>) {
+        let (event_tx, event_rx) = mpsc::channel::<IpcMessage>();
+        let handle = ApprovalHandle {
+            event_tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            ui_connected: Arc::new(Mutex::new(ui_connected)),
+        };
+        (handle, event_rx)
+    }
+
+    /// Test-only: deliver a decision as the UI's decision router would. Returns false
+    /// if no waiter is registered for `request_id` yet, so callers can retry.
+    pub(crate) fn test_deliver(&self, request_id: &str, decision: super::types::Decision) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        match pending.remove(request_id) {
+            Some(tx) => tx
+                .send(DecisionPayload {
+                    request_id: request_id.to_string(),
+                    decision,
+                    note: None,
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+}
+
 impl IpcServer {
     /// Start the IPC server on the given path.
     ///
